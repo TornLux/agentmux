@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target/
+
+# Local broker / viewer test logs (gitignored regardless of where they land)
+broker-test.stdout.log
+broker-test.stderr.log
+attach-debug.log
+*.pid
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/

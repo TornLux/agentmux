@@ -1,0 +1,10 @@
+{
+  "name": "agentmux",
+  "commandline": "<INSTALL_DIR>\\target\\release\\claude-attach.exe",
+  "startingDirectory": "<INSTALL_DIR>",
+  "icon": "ms-appx:///ProfileIcons/{61c54bbd-c2c6-5271-96e7-009a87ff44bf}.png",
+  "hidden": false,
+  "suppressApplicationTitle": true,
+  "closeOnExit": "graceful",
+  "antialiasingMode": "grayscale"
+}

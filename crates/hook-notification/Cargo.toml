@@ -1,0 +1,13 @@
+[package]
+name = "hook-notification"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "hook-notification"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+serde_json = "1"
+anyhow = "1"
