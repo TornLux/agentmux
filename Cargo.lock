@@ -213,10 +213,13 @@ name = "claude-attach"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "serde",
  "serde_json",
  "shared",
  "tokio",
+ "tokio-tungstenite 0.24.0",
+ "url",
  "uuid",
  "windows",
 ]

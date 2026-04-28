@@ -22,9 +22,9 @@ In a PowerShell window opened in the extracted folder:
 The wizard walks you through:
 
 1. **Prerequisite check** — confirms binaries are present and `claude` is on PATH
-2. **Hooks** — wires Claude Code's Stop / Notification hooks into `~\.claude\settings.json` so agentmux can see when claude finishes a turn (idempotent; skip if you've installed before)
+2. **Hooks** — wires Claude Code's `Stop`, `Notification`, and `PreToolUse` hooks into `~\.claude\settings.json` so agentmux can see turn completions, permission prompts, and (optionally) ask you to approve risky tool calls. Idempotent; the wizard re-detects already-installed hooks and skips
 3. **Broker config** — writes `%LOCALAPPDATA%\agentmux\config.toml` if missing (all defaults; you'll rarely need to edit)
-4. **Discord IM** *(optional)* — prompts for bot token, channel ID, and your user ID. The token is verified against Discord before being saved to a User-scope environment variable
+4. **Discord IM** *(optional)* — prompts for bot token, channel ID, and your user ID. The token is verified against Discord before being saved to a User-scope environment variable. Wizard re-detects an already-configured Discord and skips
 5. **Start broker** — launches the daemon as a background process
 
 After that, you have a running agentmux. Type:
@@ -59,7 +59,30 @@ Inside `claude-attach`:
 | Ctrl+C ×2 within 1.5 s | Restart claude in this session (history preserved) |
 | Ctrl+C ×3 within 1.5 s | ⚠️ Shut down the entire broker |
 
-## Updating Discord settings later
+## Discord — what to do once the bot is online
+
+In any whitelisted channel:
+
+```
+hello                       → forward to this channel's bound session (lazy-binds to "default" the first time)
+!attach <name>              → switch this channel's binding (or use /attach with autocomplete)
+!new myproj -cwd D:\repos\x → create a new session and bind this channel to it
+!ls                         → list sessions, see which channel is bound to which session
+!cwd                        → show the bound session's working directory
+!logs [n]                   → last n lines of the session's TUI output (max 100)
+!persist on | off           → make this session survive broker restart (default: ephemeral)
+!interrupt | !restart | !hibernate
+!kill <name>                → destroy a session
+!help                       → all of the above
+```
+
+**React on any bot message with 🛑 / 💤 / 🔄** to interrupt / hibernate / restart that session — no typing needed.
+
+**Reply** (Discord's UI) to a bot message to forward your new turn to *that* session, regardless of the channel binding.
+
+**Drop an image** into the chat with a caption and the bot saves it locally and tells claude to read it via the `Read` tool.
+
+### Tweaking Discord settings later
 
 ```powershell
 .\agentmux discord setup                  # add channels/users interactively
@@ -67,6 +90,27 @@ Inside `claude-attach`:
 .\agentmux discord users add <id>         # whitelist a user
 .\agentmux discord channels remove <id>   # un-whitelist a channel
 ```
+
+A few config flags worth knowing about (in `discord.toml`):
+
+| Flag | Default | Effect |
+|---|---|---|
+| `allow_dm` | `false` | Accept 1:1 DMs from whitelisted users (no need to share a server) |
+| `respond_to_mentions` | `false` | Bot also replies in non-whitelisted channels when you `@`-mention it |
+| `notify_on_idle` | `false` | Forward the noisy "Claude is waiting for your input" pings |
+| `slash_command_guild_id` | `0` | Pin slash commands to one server for instant updates (else ~1h propagation) |
+| `reply_quote_in_prompt` | `true` | Discord-replies prepend `[replying to: "..."]` so claude sees the context |
+| `react_with_actions` | `true` | 🛑 / 💤 / 🔄 reactions trigger broker actions |
+
+Edit any with `.\agentmux config set discord <key> <value>` then restart the bot.
+
+## Tool-use approval (PreToolUse)
+
+Whenever claude wants to run a "risky" tool (e.g. `Bash` with `rm -rf` / `curl`, or `Write` / `Edit` outside the session's working directory), the bot posts a Discord message with `✅ Allow` / `❌ Deny` buttons. The hook waits up to 5 minutes; on timeout it returns `deny` and claude moves on.
+
+Most turns trigger **zero** prompts — `Read` / `Glob` / `Grep` / `cargo` / `git status` / `ls` and 30-odd other dev verbs auto-allow. The classifier's logic lives in `crates/hook-pretool/src/main.rs` if you want to read or tweak the rules.
+
+When the broker is unreachable, the hook fails *open* (allows the tool) so a busted Discord doesn't grind claude to a halt — the tradeoff is "approval surface degrades to no-op when the broker is down".
 
 ## Editing config files
 
@@ -80,14 +124,43 @@ Inside `claude-attach`:
 
 `config check` is the friend you call after hand-editing — it parses the file, reports any TOML / JSON issues with line numbers, and confirms semantic invariants (e.g. `allowed_user_ids` non-empty).
 
+## Attach from another machine (optional)
+
+```powershell
+# On the broker host:
+.\agentmux config token --set                                # generate + save random token
+.\agentmux config set broker http_addr "0.0.0.0:8765"        # bind LAN
+.\agentmux stop ; .\agentmux start
+# Open firewall port 8765 inbound (limit to your subnet).
+
+# On the second machine — the token printed above:
+$env:AGENT_ATTACH_TOKEN = "<paste-token>"
+.\claude-attach.exe --broker http://192.168.X.Y:8765 --session default
+```
+
+Loopback callers (the Discord bot on the broker host, hooks, local `claude-attach`) bypass the auth check, so existing local setups keep working without touching the token.
+
+To revert to loopback-only:
+
+```powershell
+.\agentmux config unset broker http_addr
+.\agentmux stop ; .\agentmux start
+```
+
 ## When things go wrong
 
-- **Discord bot doesn't reply.** First message after a hibernate takes ~3-5 s while claude resumes. If it never replies: `.\agentmux logs discord` and `.\agentmux logs broker` — usually the issue is the `MESSAGE CONTENT INTENT` toggle in the Discord developer portal, or hooks not installed (`.\agentmux hooks check`).
+- **Discord bot doesn't reply.** First message after a hibernate takes ~3-5 s while claude resumes. If it never replies: `.\agentmux logs discord` and `.\agentmux logs broker` — usual culprits are the `MESSAGE CONTENT INTENT` toggle in the Discord developer portal, or hooks not installed (`.\agentmux hooks check`).
+- **Bot replies but the message gets stuck in claude's TUI.** Was an issue with multi-line Discord messages and long input lines; broker now writes the text and `\r` separately with a 30 ms gap so paste-bursts submit cleanly. If you still see this on a fresh build, file a bug with the broker log.
+- **`💭 working…` placeholder never finishes.** The bot crashed mid-turn. On its next start the orphan placeholder is auto-edited to `❌ this turn was interrupted by a bot restart`; the file `discord-pending.toml` under `%LOCALAPPDATA%\agentmux\` carries the recovery list.
+- **Slash commands don't show up in Discord.** Global registration takes up to 1 hour to propagate. Pin them to your guild for instant updates: `.\agentmux config set discord slash_command_guild_id <your-guild-id>`, then restart the bot.
+- **PreToolUse asks too often / not enough.** The classifier is hardcoded in `crates/hook-pretool/src/main.rs` (`AUTO_ALLOW_TOOLS`, `BASH_ALLOW_PREFIXES`, `BASH_ALWAYS_ASK`). Tweak and `cargo build --release -p hook-pretool`.
 - **Broker won't start, says "already running".** A previous broker exited without cleaning up. Run `.\agentmux stop` then `.\agentmux start` — the start script self-heals stale PID files.
 - **Need to debug the broker's stdio.** `.\agentmux start --foreground` runs it inline so panics and `tracing` lines stream to the current shell.
+- **Remote attach hangs / 401s.** Check `.\agentmux config check broker` — `attach_token` must be set and `http_addr` must bind to a non-loopback interface (`0.0.0.0:8765`). Verify with `Get-NetTCPConnection -LocalPort 8765`.
 
 ## Going further
 
 The full architecture and design rationale live in [PLAN.md](PLAN.md). The
-[README](README.md) covers the HTTP control plane, the wire protocol between
-viewer and broker, and how to add new IM platforms.
+[README](README.md) covers the HTTP control plane, configuration tables for
+broker and Discord configs, the wire protocol between viewer and broker, and
+how to add new IM platforms.

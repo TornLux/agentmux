@@ -78,6 +78,13 @@ $content = @'
 # the `/sessions/:k/persist` endpoint, e.g. Discord `!persist on`)
 # always wins over this default.
 # auto_resume_default = false
+
+# Bearer token required for **non-loopback** HTTP / WebSocket
+# requests. Loopback (127.0.0.1, ::1) is always exempt so existing
+# local tooling continues to work without any token. Empty = the
+# broker rejects every non-loopback connection (default; safe).
+# Generate one with:  .\agentmux config token --set
+# attach_token = ""
 '@
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

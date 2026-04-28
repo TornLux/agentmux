@@ -26,9 +26,9 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use shared::config::Config;
 use shared::frame::{
-    decode_control, decode_hello, decode_resize, read_frame, write_frame, HelloPayload,
-    CTRL_INTERRUPT, CTRL_RESTART, CTRL_SHUTDOWN, TAG_CONTROL, TAG_HELLO, TAG_PTY_DATA,
-    TAG_REPLAY_END, TAG_RESIZE,
+    decode_control, decode_frame, decode_hello, decode_resize, encode_frame, read_frame,
+    write_frame, HelloPayload, CTRL_INTERRUPT, CTRL_RESTART, CTRL_SHUTDOWN, TAG_CONTROL,
+    TAG_HELLO, TAG_PTY_DATA, TAG_REPLAY_END, TAG_RESIZE,
 };
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{broadcast, watch};
@@ -502,6 +502,11 @@ async fn run_http_server(app_state: AppState) {
         .route("/tool-request", post(http_tool_request))
         .route("/tool-decision/:request_id", post(http_tool_decision))
         .route("/ws", get(http_ws_upgrade))
+        .route("/attach", get(http_attach_upgrade))
+        .layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            auth_middleware,
+        ))
         .with_state(app_state);
 
     let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -512,9 +517,71 @@ async fn run_http_server(app_state: AppState) {
         }
     };
     info!("http control plane on http://{addr}");
-    if let Err(e) = axum::serve(listener, app).await {
+    // ConnectInfo lets the auth middleware see each peer's IP so it
+    // can distinguish loopback (always allowed) from non-loopback
+    // (must present `Authorization: Bearer <attach_token>`).
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    {
         error!("axum serve: {e}");
     }
+}
+
+/// Token-gated middleware. Loopback peers (127.0.0.1, ::1) skip the
+/// check entirely so existing localhost tooling (claude-attach via
+/// pipe, platform-discord on the same host, hooks) keeps working
+/// with no token configured. Non-loopback peers must:
+///   1. have a non-empty `attach_token` configured in the broker, AND
+///   2. send `Authorization: Bearer <token>` with a constant-time
+///      match.
+/// Failure logs source IP at warn level (never the attempted token).
+async fn auth_middleware(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, StatusCode> {
+    if addr.ip().is_loopback() {
+        return Ok(next.run(req).await);
+    }
+    let token = s.config.attach_token.as_str();
+    if token.is_empty() {
+        warn!(
+            "denied non-loopback request from {addr}: broker has no attach_token configured"
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !ct_eq_str(presented, token) {
+        warn!("denied non-loopback request from {addr}: invalid token");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(req).await)
+}
+
+/// Length-checked, byte-by-byte XOR-OR comparison. Constant time
+/// in the length of the longer string (the early `len() != len()`
+/// short-circuit is fine — knowing the token's length doesn't
+/// meaningfully reduce its 256-bit search space).
+fn ct_eq_str(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn run_pipe_server(manager: Arc<Manager>, app_state: AppState) -> Result<()> {
@@ -1219,6 +1286,179 @@ async fn http_ws_upgrade(
 ) -> impl IntoResponse {
     let rx = s.event_bus.subscribe();
     ws.on_upgrade(move |socket| handle_ws_socket(socket, rx))
+}
+
+/// WebSocket-flavoured viewer attach. Mirrors the named-pipe path
+/// (handle_client) but with each broker↔viewer frame riding on one
+/// WebSocket Binary message instead of being length-framed over a
+/// raw byte stream. Same protocol, different transport.
+async fn http_attach_upgrade(
+    ws: WebSocketUpgrade,
+    State(s): State<AppState>,
+) -> impl IntoResponse {
+    let manager = s.manager.clone();
+    let app_state = s.clone();
+    ws.on_upgrade(move |socket| handle_ws_attach(socket, manager, app_state))
+}
+
+async fn handle_ws_attach(
+    mut socket: WebSocket,
+    manager: Arc<Manager>,
+    app_state: AppState,
+) {
+    static NEXT_VIEWER_ID: AtomicU64 = AtomicU64::new(1_000_000);
+    let viewer_id = NEXT_VIEWER_ID.fetch_add(1, Ordering::Relaxed);
+
+    // Wait for HELLO frame (must be the first inbound binary message).
+    let hello_payload = loop {
+        match socket.recv().await {
+            Some(Ok(WsMessage::Binary(b))) => match decode_frame(&b) {
+                Ok((TAG_HELLO, payload)) => break payload.to_vec(),
+                Ok((tag, _)) => {
+                    warn!("ws-attach #{viewer_id} first frame must be HELLO, got tag={tag:#x}");
+                    return;
+                }
+                Err(e) => {
+                    warn!("ws-attach #{viewer_id} decode HELLO: {e}");
+                    return;
+                }
+            },
+            Some(Ok(WsMessage::Text(_))) => {
+                warn!("ws-attach #{viewer_id} unexpected text frame as HELLO");
+                return;
+            }
+            Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => return,
+            Some(Ok(_)) => continue, // Ping/Pong/etc.
+        }
+    };
+    let hello = decode_hello(&hello_payload).unwrap_or_default();
+    let target = hello.session.as_deref().unwrap_or(DEFAULT_SESSION_NAME);
+    let session = match manager.get_by_id_or_name(target) {
+        Some(s) => s,
+        None => {
+            warn!("ws-attach #{viewer_id} unknown session: {target}");
+            return;
+        }
+    };
+    if matches!(
+        session.state(),
+        SessionState::Hibernated | SessionState::Crashed
+    ) {
+        info!(
+            "ws-attach #{viewer_id} attaching {:?} session {} ({}) — auto-resuming",
+            session.state(),
+            session.id,
+            session.name
+        );
+        let to_resume = session.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = to_resume.resume() {
+                error!("auto-resume on ws-attach: {e}");
+            }
+        });
+    }
+
+    info!(
+        "ws-attach #{viewer_id} connected ({}) → session {} ({})",
+        hello.client_kind, session.id, session.name
+    );
+
+    session.register_viewer(ClientInfo {
+        viewer_id,
+        client_id: hello.client_id.clone(),
+        client_kind: hello.client_kind.clone(),
+    });
+    session.touch_activity();
+
+    let (snapshot, mut out_rx) = {
+        let ring = session.pty_out.ring.lock().unwrap();
+        let snap = ring.snapshot();
+        let rx = session.pty_out.tx.subscribe();
+        (snap, rx)
+    };
+    let cleanup_size_table = session.size_table.clone();
+    let cleanup_session_id = session.id.clone();
+    let inbound_session = session.clone();
+    let inbound_app = app_state;
+
+    // Replay snapshot first, then REPLAY_END marker.
+    if !snapshot.is_empty() {
+        info!(
+            "ws-attach #{viewer_id} replaying {} bytes (session {})",
+            snapshot.len(),
+            session.name
+        );
+        if let Ok(buf) = encode_frame(TAG_PTY_DATA, &snapshot) {
+            if socket.send(WsMessage::Binary(buf)).await.is_err() {
+                return;
+            }
+        }
+    }
+    if let Ok(buf) = encode_frame(TAG_REPLAY_END, &[]) {
+        let _ = socket.send(WsMessage::Binary(buf)).await;
+    }
+
+    // Single-task select loop — no need to split read/write halves
+    // because WebSocket recv/send are already independent on
+    // axum's WebSocket type.
+    loop {
+        tokio::select! {
+            inbound = socket.recv() => {
+                match inbound {
+                    Some(Ok(WsMessage::Binary(b))) => match decode_frame(&b) {
+                        Ok((TAG_PTY_DATA, payload)) => {
+                            if inbound_session
+                                .input_tx
+                                .send(Bytes::copy_from_slice(payload))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok((TAG_RESIZE, payload)) => match decode_resize(payload) {
+                            Some((c, r)) => inbound_session.size_table.update(viewer_id, c, r),
+                            None => warn!("ws-attach #{viewer_id} bad RESIZE"),
+                        },
+                        Ok((TAG_CONTROL, payload)) => match decode_control(payload) {
+                            Some(cmd) => {
+                                handle_control_cmd(viewer_id, &inbound_session, cmd, &inbound_app)
+                                    .await
+                            }
+                            None => warn!("ws-attach #{viewer_id} bad CONTROL"),
+                        },
+                        Ok((TAG_HELLO, _)) => warn!("ws-attach #{viewer_id} unexpected second HELLO"),
+                        Ok((tag, _)) => warn!("ws-attach #{viewer_id} unknown tag {tag:#x}"),
+                        Err(e) => warn!("ws-attach #{viewer_id} decode: {e}"),
+                    },
+                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {} // Ping/Pong/Text — ignore.
+                }
+            }
+            ev = out_rx.recv() => match ev {
+                Ok(bytes) => {
+                    let buf = match encode_frame(TAG_PTY_DATA, &bytes) {
+                        Ok(b) => b,
+                        Err(e) => { warn!("ws-attach encode: {e}"); break; }
+                    };
+                    if socket.send(WsMessage::Binary(buf)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("ws-attach #{viewer_id} lagged: dropped {n}");
+                    continue;
+                }
+            },
+        }
+    }
+
+    if let Some(s) = manager.get_by_id_or_name(&cleanup_session_id) {
+        s.deregister_viewer(viewer_id);
+    }
+    cleanup_size_table.remove(viewer_id);
+    info!("ws-attach #{viewer_id} disconnected");
 }
 
 async fn handle_ws_socket(

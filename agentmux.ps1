@@ -150,7 +150,7 @@ Usage: .\agentmux <command> [args]
 
 Setup
   init                  Run the first-time setup wizard
-  hooks install         Wire Claude Code hooks (also runs during init)
+  hooks install         Wire Claude Code Stop / Notification / PreToolUse hooks
   hooks uninstall       Remove hooks from ~\.claude\settings.json
   hooks check           Validate hooks configuration
 
@@ -159,7 +159,8 @@ Daily ops
   start --foreground    Start broker in the current shell (Ctrl+C to stop)
   stop                  Stop broker and Discord bot
   status                Show what's running and active sessions
-  attach [name]         Open a terminal viewer (wraps claude-attach.exe)
+  attach [name]         Open a local terminal viewer (named pipe)
+                        --broker http://host:port --token <t>: connect over LAN
   logs [broker|discord|events]
                         Tail a log stream
 
@@ -171,6 +172,8 @@ Configuration
   config check                            Validate all configs
   config set <broker|discord> <key> <val> Set a scalar field
   config unset <broker|discord> <key>     Remove a field
+  config token [--set]                    Generate a 32-byte attach token
+                                          (with --set, writes to broker.toml)
 
 Discord bridge
   discord setup                  Walk through token + channel + user setup
@@ -196,9 +199,11 @@ Usage: .\agentmux init
 
   Interactive first-time wizard. Five steps:
     1. prerequisite check (binaries, claude on PATH)
-    2. install Claude Code hooks (idempotent)
+    2. install Claude Code hooks (Stop + Notification + PreToolUse)
+       — idempotent; already-installed entries are detected and skipped
     3. write broker config template (skipped if exists)
     4. optional Discord setup (token + channels + users)
+       — re-detects an already-configured Discord and skips
     5. start broker in the background
 
   Re-runnable; already-done steps are skipped.
@@ -236,12 +241,17 @@ Usage: .\agentmux status
         "attach" {
             @"
 Usage: .\agentmux attach [name | --new [name] | --session name | --debug]
+                        [--broker http://host:port [--token <t>]]
 
   No args:           interactive picker menu
   <name>:            shorthand for --session <name>
   --new [name]:      create a new session and attach (auto-named s1/s2/.. if omitted)
   --session <name>:  attach directly without the menu
   --debug:           log stdin bytes to stderr (diagnostic)
+  --broker <url>:    connect over WebSocket to a remote broker on the LAN
+                     (default omits this and uses the local named pipe)
+  --token  <token>:  Bearer token for non-loopback brokers
+                     (also picked up from `$env:AGENT_ATTACH_TOKEN)
 
   Detach with Ctrl+Q or Ctrl+]. Ctrl+C escalation:
     1×           interrupt claude's current turn
@@ -273,6 +283,11 @@ Usage: .\agentmux config <subcommand> [args]
   set   <broker|discord> <key> <value>
                                   Set a scalar field, preserving comments/format
   unset <broker|discord> <key>    Remove a field (falls back to default)
+  token [--set]                   Generate a 32-byte URL-safe Bearer token.
+                                  Without --set: print to stdout for copying.
+                                  With --set:    write to broker.toml's
+                                                 attach_token field
+                                                 (restart broker to apply).
 
   Default kind for sub-commands that take one is broker.
 "@
@@ -296,10 +311,16 @@ Usage: .\agentmux discord <subcommand> [args]
             @"
 Usage: .\agentmux hooks <install|uninstall|check>
 
-  install     Wire Stop + Notification hooks into ~\.claude\settings.json.
-              Idempotent; original is backed up to settings.json.bak first.
+  install     Wire Stop + Notification + PreToolUse hooks into
+              ~\.claude\settings.json. Idempotent; original is backed up
+              to settings.json.bak first.
   uninstall   Remove agentmux hook entries (other hooks untouched).
   check       Validate the current hooks setup (paths exist, JSON parses).
+
+  PreToolUse drives the Discord tool-use approval flow. Risky tool calls
+  (Bash with rm -rf / curl / sudo, Edit outside the session cwd, …)
+  long-poll the broker; the bot prompts you with [✅] / [❌] buttons.
+  Safe verbs (Read / Glob / Grep / cargo / git status / …) auto-allow.
 "@
         }
         default {
@@ -358,14 +379,16 @@ function Cmd-Init([string[]]$Argv) {
     # 2 — hooks
     Write-Host "[2/5] Claude Code hooks" -ForegroundColor Cyan
     if (Test-HooksInstalled) {
-        Write-Host "  ✓ Stop and Notification hooks already installed in $hooksCfg"
+        Write-Host "  ✓ Stop / Notification / PreToolUse hooks already installed in $hooksCfg"
         $ans = Read-Host "  Reinstall (e.g. after moving the agentmux folder)? [y/N]"
         if ($ans -eq "y" -or $ans -eq "Y") {
             & (Join-Path $scriptsDir "install-hooks.ps1")
         }
     } else {
-        Write-Host "  Hooks let agentmux receive 'turn complete' events. Without them,"
-        Write-Host "  Discord won't get replies and auto-resume can't detect 'ready'."
+        Write-Host "  Three hooks plug into ~\.claude\settings.json:"
+        Write-Host "    Stop         → 'turn complete' events for IM replies"
+        Write-Host "    Notification → permission prompts / idle pings"
+        Write-Host "    PreToolUse   → Discord tool-use approval (auto-allows safe verbs)"
         $ans = Read-Host "  Install hooks now? [Y/n]"
         if ($ans -ne "n" -and $ans -ne "N") {
             & (Join-Path $scriptsDir "install-hooks.ps1")
@@ -545,11 +568,39 @@ function Cmd-Config([string[]]$Argv) {
         "check"  { Cmd-ConfigCheck $rest }
         "set"    { Cmd-ConfigSet   $rest }
         "unset"  { Cmd-ConfigUnset $rest }
+        "token"  { Cmd-ConfigToken $rest }
         default  {
             Write-Host "unknown config subcommand: $sub" -ForegroundColor Red
             Write-Host ""
             Show-VerbHelp "config"
         }
+    }
+}
+
+function Cmd-ConfigToken([string[]]$Argv) {
+    # Generate 32 cryptographically-random bytes, URL-safe base64 (no
+    # padding) so the result is shell-safe. With --set, write directly
+    # to the broker config.toml's `attach_token` field.
+    $bytes = New-Object byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $token = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+','-').Replace('/','_')
+    $set = $Argv -and ($Argv -contains '--set')
+    if ($set) {
+        Require-Binary $agentmuxCli "agentmux-cli.exe"
+        if (-not (Test-Path $brokerCfg)) {
+            Write-Host "broker config does not exist — creating from template" -ForegroundColor Yellow
+            & (Join-Path $scriptsDir "init-config.ps1")
+        }
+        & $agentmuxCli config set $brokerCfg attach_token $token | Out-Null
+        Write-Host "✓ wrote attach_token to $brokerCfg" -ForegroundColor Green
+        Write-Host "  Restart broker for the change to take effect:" -ForegroundColor Yellow
+        Write-Host "    .\agentmux stop && .\agentmux start"
+        Write-Host ""
+        Write-Host "Use this token from a remote viewer:"
+        Write-Host "  `$env:AGENT_ATTACH_TOKEN = '$token'"
+        Write-Host "  claude-attach.exe --broker http://<broker-host>:8765 --session default"
+    } else {
+        Write-Output $token
     }
 }
 

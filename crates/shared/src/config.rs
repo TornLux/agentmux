@@ -45,6 +45,13 @@ pub struct Config {
     /// Set `false` for "ephemeral by default — opt in to persist";
     /// `true` (legacy behaviour) for "always persist by default".
     pub auto_resume_default: bool,
+    /// Bearer token required on **non-loopback** HTTP/WS requests.
+    /// Loopback (127.0.0.1, ::1) is always exempt so existing
+    /// localhost tooling (claude-attach, platform-discord on the
+    /// same host, hooks) keeps working without any token. Empty =
+    /// LAN access disabled (non-loopback connections rejected with
+    /// 401). Generate via `agentmux config token`.
+    pub attach_token: String,
 }
 
 impl Default for Config {
@@ -62,6 +69,7 @@ impl Default for Config {
             pid_file_path: String::new(),
             log_dir: String::new(),
             auto_resume_default: false,
+            attach_token: String::new(),
         }
     }
 }
@@ -179,6 +187,7 @@ sessions_toml_path = "C:\\custom\\sessions.toml"
 pid_file_path = "C:\\custom\\broker.pid"
 log_dir = "C:\\custom\\logs"
 auto_resume_default = true
+attach_token = "k7Rj9_secrettoken"
 "#;
         let c: Config = toml::from_str(toml_src).unwrap();
         assert_eq!(c.http_addr, "0.0.0.0:1234");
@@ -190,6 +199,7 @@ auto_resume_default = true
         assert_eq!(c.pid_file_path, "C:\\custom\\broker.pid");
         assert_eq!(c.log_dir, "C:\\custom\\logs");
         assert!(c.auto_resume_default);
+        assert_eq!(c.attach_token, "k7Rj9_secrettoken");
     }
 
     #[test]

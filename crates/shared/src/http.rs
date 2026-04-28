@@ -40,13 +40,25 @@ fn connect(host_port: &str) -> io::Result<TcpStream> {
 /// validates a 2xx status, and returns the body as a String. For
 /// localhost-only use; no chunked-decode, no redirect handling.
 pub fn get(url: &str) -> io::Result<String> {
+    get_with_auth(url, None)
+}
+
+/// Same as [`get`] but allows an optional `Authorization: Bearer <…>`
+/// header. Used by claude-attach when talking to a remote broker
+/// over the LAN — loopback callers leave `token = None`.
+pub fn get_with_auth(url: &str, token: Option<&str>) -> io::Result<String> {
     let (host_port, path) = split_url(url)?;
     let mut stream = connect(host_port)?;
 
+    let auth = match token {
+        Some(t) if !t.is_empty() => format!("Authorization: Bearer {t}\r\n"),
+        _ => String::new(),
+    };
     let req = format!(
         "GET {path} HTTP/1.1\r\n\
          Host: {host_port}\r\n\
          Accept: application/json\r\n\
+         {auth}\
          Connection: close\r\n\
          \r\n",
     );
@@ -76,14 +88,23 @@ pub fn get(url: &str) -> io::Result<String> {
 }
 
 pub fn post_json(url: &str, body: &str) -> io::Result<()> {
+    post_json_with_auth(url, body, None)
+}
+
+pub fn post_json_with_auth(url: &str, body: &str, token: Option<&str>) -> io::Result<()> {
     let (host_port, path) = split_url(url)?;
     let mut stream = connect(host_port)?;
 
+    let auth = match token {
+        Some(t) if !t.is_empty() => format!("Authorization: Bearer {t}\r\n"),
+        _ => String::new(),
+    };
     let req = format!(
         "POST {path} HTTP/1.1\r\n\
          Host: {host_port}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {len}\r\n\
+         {auth}\
          Connection: close\r\n\
          \r\n\
          {body}",

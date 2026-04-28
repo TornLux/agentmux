@@ -19,33 +19,54 @@ agentmux 把 Claude Code 改造成一个常驻的多会话后台服务。一个�
 
 - **Session 比 viewer 活得久。** 每个 session 拥有自己的 ConPTY 和环形缓冲区；关掉 Windows Terminal 窗口只是断开 viewer，broker、PTY 和 `claude` 子进程毫发无伤。下次 attach 回来，环形缓冲区把最后一屏回放出来，TUI 就停在对话中——不需要 `--resume`，也不用翻 scrollback。
 - **多会话，菜单切换。** 同时跑 N 个 `claude` 实例，每个有独立的 cwd、历史和 Claude session id。`claude-attach.exe` 启动时弹出会话选择菜单（`--new [NAME]` 创建，`--session NAME` 跳过菜单）。同一个 session 可以被多个 viewer 同时 attach —— 输入按到达顺序合流，resize 协调到最小窗口尺寸，避免 claude 在小窗口里溢出。
-- **Ctrl+C 升级机制。** 在 raw 终端模式下，viewer 在 1.5 秒滑动窗口内统计 Ctrl+C 次数：**1 次** → 转发 `0x03` 给 claude（中断当前回合）；**2 次** → 重启底层 claude 进程；**3 次** → 关闭整个 broker。**Ctrl+Q** / **Ctrl+]** 仅断开当前 viewer。不需要记 `!stop` / `!kill` 这类自定义语法。
-- **HTTP 控制面。** `127.0.0.1:8765` 暴露 sessions 的 CRUD 以及 `/state`、`/interrupt`、`/restart`、`/hibernate`、`/shutdown` —— 外部自动化无需通过 TUI 即可驱动 session。
-- **Hook 驱动的事件流。** `hook-stop.exe` 与 `hook-notification.exe` 接入 Claude Code 用户级 `settings.json`，把 `assistant_message` / `notification` 事件 POST 给 broker，broker 把它们追加到 `events.jsonl`，供下游消费（IM 桥、Dashboard 等）。Hook 通过 `AGENT_SESSION_ID` 哨兵识别非 broker 启动的 claude 直接静默退出；当本地有 viewer 已 attach 时也跳过通知 —— 不会重复打扰。
-- **休眠与恢复。** 空闲超过 `hibernate_idle_secs` 的 session 会关闭 `claude` 子进程释放内存，但元信息保留在 `sessions.toml`，下次 attach 通过 `claude --resume <session-id>` 拉回原样。
-- **单实例 broker、按天滚动日志。** `%LOCALAPPDATA%\agentmux\` 下的 PID 文件阻止两个 broker 抢同一个管道；日志在 `%LOCALAPPDATA%\agentmux\logs\` 下按天滚动，保留 7 天。
+- **Ctrl+C 升级机制。** 在 raw 终端模式下，viewer 在 1.5 秒滑动窗口内统计 Ctrl+C 次数：**1 次** → 转发 `0x03` 给 claude（中断当前回合）；**2 次** → 重启底层 claude 进程；**3 次** → 关闭整个 broker。**Ctrl+Q** / **Ctrl+]** 仅断开当前 viewer。
+- **HTTP 控制面 + WS 事件总线。** `127.0.0.1:8765` 暴露完整生命周期（`/sessions` CRUD、`/interrupt` `/restart` `/hibernate` `/input` `/persist`）、`/event` hook 摄入端点、`/ws` 事件订阅、`/tool-request` PreToolUse 同步审批长轮询，以及 `/attach` 远程 viewer 接入（详见下文 *局域网远程接入*）。
+- **内建 Discord IM 桥。** `platform-discord.exe` 订阅 WS 事件总线，把 Discord 消息回送 `/sessions/:id/input`。包括：
+  - **每频道独立 session 绑定** —— 一个 Discord 频道映射一个 session，绑定关系持久化到磁盘，bot 重启不丢
+  - **就地编辑式回复** —— 每条 forward 消息立即收到 `💭 working…` 占位回复，claude 完成 turn 后**就地编辑**成最终回答（其间显示 typing indicator）
+  - **Reply 路由** —— Discord 引用某条旧的 assistant message 发新消息，本轮自动转给*那条消息所属的 session*；可选附带引用文本作为上下文
+  - **Reaction 命令** —— 给 bot 任意消息加 🛑 / 💤 / 🔄，立即 interrupt / hibernate / restart 对应 session
+  - **`@mention` 唤醒** —— 可选开启，让 bot 在白名单外的频道也能通过 @ 唤起
+  - **DM 模式** —— 可选开启，与白名单用户 1:1 私聊
+  - **附件转发** —— Discord 拖图进聊天，bot 落到本地 temp 并提示 claude 用 `Read` 工具看图；文本附件同理
+  - **12 个 slash 命令**，session 名自动补全：`/ls /attach /new /persist /kill /interrupt /restart /hibernate /logs /cwd /status /help`
+  - **Idle ping 默认抑制**（claude 的"等待输入"通知不打扰；权限提示等其它 notification 仍正常转发）
+- **Hook 驱动的事件流。** 三个 hook 接入 Claude Code 用户级 `settings.json`：
+  - `hook-stop` —— claude 完成 turn 时 POST `assistant_message`
+  - `hook-notification` —— 权限提示 / idle ping → POST `notification`
+  - `hook-pretool` —— 工具调用**前**同步触发；放行安全工具（Read / Glob / Grep / `cargo` / `git status` / …），高危操作（`rm -rf`、`curl | sh`、session cwd 外的 Edit / Write 等）走 Discord 审批
+  三个 hook 都通过 `AGENT_SESSION_ID` 哨兵识别非 broker 启动的 claude 直接静默退出；本地有 viewer 已 attach 时也跳过 —— 不重复打扰。
+- **Discord 工具审批。** `hook-pretool` 决定要问时，Discord 会推一条带 `✅ Allow` / `❌ Deny` 按钮的消息。hook 在 `/tool-request` 上长轮询最长 5 分钟；按钮按下的瞬间 broker 解开长轮询返回决策，超时则按 deny 处理。绝大多数 turn 触发零个审批；只有真正高危操作才打扰你。
+- **Hibernate / resume + 持久化开关。** 空闲超过 `hibernate_idle_secs` 的 session 关掉 `claude` 子进程释放内存，元信息留在 `sessions.toml`，下次 `/input`（或 attach）通过 `claude --resume <session-id>` 拉回。auto-resume 等 TUI 画面稳定后再注入输入，避免休眠后第一条 IM 消息被启动期吞掉。新建 session 默认是*短暂*的（broker 重启后忘记）—— 用 `!persist on` / `/persist` / `-persist` 标志切换。
+- **局域网远程接入（可选开启）。** 设置 `attach_token` 并把 `http_addr` 绑到 `0.0.0.0:8765`，第二台机器就能用 `claude-attach --broker http://host:8765 --token <…>` 通过 WebSocket 接入。回环调用方（同机现有工具）跳过鉴权；非回环调用方必须带 `Authorization: Bearer <token>`。
+- **一行命令安装。** `.\agentmux init` 走交互式向导。日常用 `.\agentmux start | stop | status | attach | logs | config | discord` 一套子命令；配置编辑通过 `agentmux-cli` 保留注释和格式。`.\agentmux config token --set` 一键生成 32 字节随机 token 并写入 `broker.toml`。
+- **broker 单实例 + 按天日志 + 审计日志。** PID 文件防止两个 broker 抢同一根管道；`broker.YYYY-MM-DD.log` 和 `events.YYYY-MM-DD.jsonl` 在 `%LOCALAPPDATA%\agentmux\` 下按天滚动，保留 7 天。
 
 ## 架构
 
 ```mermaid
 flowchart LR
     Term["Windows Terminal"]
-    Hooks["Claude Code hooks<br/>(hook-stop / hook-notification)"]
-    Attach["claude-attach.exe"]
+    Hooks["Claude Code hooks<br/>(hook-stop, hook-notification, hook-pretool)"]
+    Attach["claude-attach.exe<br/>(本机: 命名管道 / LAN: WS+token)"]
+    Discord["platform-discord.exe<br/>(IM 适配器)"]
     Broker["broker.exe<br/>(单实例守护进程)"]
     Sess["session × N<br/>ConPTY + 环形缓冲区"]
     Claude["claude<br/>(每 session 一个子进程)"]
-    Events["events.jsonl"]
+    Events["events.YYYY-MM-DD.jsonl"]
 
     Term -- "spawn" --> Attach
-    Attach -- "命名管道" --> Broker
-    Hooks -- "HTTP POST /event :8765" --> Broker
+    Attach -- "命名管道<br/>或 WS /attach" --> Broker
+    Hooks -- "POST /event<br/>POST /tool-request (长轮询)" --> Broker
+    Discord -- "WS /ws<br/>POST /input + /tool-decision/:id" --> Broker
     Broker --> Sess
     Sess --> Claude
     Broker --> Events
 ```
 
 ## 快速开始
+
+终端用户路径详见 **[QUICKSTART.md](QUICKSTART.md)** —— 下载 release zip、解压、跑 `.\agentmux init`。下面是开发 / 源码构建路径。
 
 ### 1. 构建
 
@@ -55,41 +76,93 @@ cd agentmux
 cargo build --release
 ```
 
-产物：`target/release/{broker,claude-attach,hook-stop,hook-notification}.exe`。
+产物：`target\release\` 下 7 个 binary —— `broker`、`claude-attach`、`hook-stop`、`hook-notification`、`hook-pretool`、`platform-discord`、`agentmux-cli`。
 
-### 2. 启动 broker
-
-```powershell
-.\scripts\start-broker.ps1
-# broker started: pid 12345
-#   cwd:    G:\Claude\agentmux
-#   pid:    C:\Users\<you>\AppData\Local\agentmux\broker.pid
-#   logs:   C:\Users\<you>\AppData\Local\agentmux\logs
-```
-
-broker 的工作目录会成为 `claude` 的 cwd —— 决定"trust this directory?"提示的对象，以及模型看到的项目。要切换目录，先停掉 broker（`.\scripts\stop-broker.ps1`），再用 `-WorkingDirectory <路径>` 重启。
-
-### 3. 安装 hooks（一次性，可选）
+### 2. 首次设置
 
 ```powershell
-.\scripts\install-hooks.ps1
+.\agentmux init
 ```
 
-幂等地合并进 `~\.claude\settings.json`（首次会备份到 `settings.json.bak`）。装完之后，机器上任意位置启动的 `claude` 都会触发 hooks —— 但只有 broker 启动的 session（设置了 `AGENT_SESSION_ID`）才会真正上报，其他静默退出。卸载用 `.\scripts\install-hooks.ps1 -Uninstall`。
+交互式向导：先决条件检查 → 装 hooks → 写 broker config 模板 → 可选 Discord 设置 → 启动 broker。幂等的，可随时重跑，已完成的步骤会跳过。
 
-### 4. 添加 Windows Terminal profile（可选）
-
-`scripts/terminal-profile.json` 是一段 profile 模板 —— 把里面的 `<INSTALL_DIR>` 替换为你的 agentmux 仓库绝对路径，再把整个对象粘进 Windows Terminal 的 `settings.json` 的 `profiles.list` 数组。选择 "agentmux" profile 即可一键启动 `claude-attach.exe` 进入会话菜单。
-
-### 5. 接入 session
+### 3. 日常运维
 
 ```powershell
-.\target\release\claude-attach.exe                # 弹菜单选
-.\target\release\claude-attach.exe --session foo  # 直接 attach 到 "foo"
-.\target\release\claude-attach.exe --new bar      # 创建 "bar" 并 attach
+.\agentmux start             # broker（如已配置则同时拉起 Discord bot）
+.\agentmux stop
+.\agentmux status            # 一行健康摘要
+.\agentmux attach [name]     # 进 TUI；不传名字走菜单选择
+.\agentmux logs broker       # tail 今天的 broker 日志
+.\agentmux help              # 完整命令列表
 ```
 
-按 **Ctrl+Q** 或 **Ctrl+]** 断开 viewer，或直接关掉终端窗口 —— session 继续跑。下次 attach 回来，环形缓冲区会把最后一屏重新画出来。
+`.\agentmux start --foreground` 让 broker 直接在当前 shell 里跑（Ctrl+C 退出），方便调试 —— panic 和 tracing 输出直接在终端里看到，不去日志文件。
+
+### 4. 配置助手
+
+```powershell
+.\agentmux config check                     # 校验所有配置
+.\agentmux config edit [broker|discord|hooks]
+.\agentmux config dir                       # 在 Explorer 里打开 %LOCALAPPDATA%\agentmux
+.\agentmux config set broker http_addr 127.0.0.1:9000
+.\agentmux config token --set               # 生成 + 写入 LAN 接入 token
+.\agentmux discord users add  123456789012345678
+.\agentmux discord channels remove 987654321098765432
+```
+
+TOML 编辑通过 `agentmux-cli` 进行，保留原有注释和格式。`config check` 解析每份配置并报告 `✓` / `⚠` / `✗`，方便复制到 bug report 里。
+
+### 5. Discord 命令速查
+
+任何 bot 能读到的频道里（纯文本或 `!`-前缀；slash 命令也能用，session 名自动补全）：
+
+```
+纯文本                       → 转发到本频道绑定的 session
+!attach <name>               → 把本频道绑到指定 session（/attach 自带补全）
+!new [name] [-cwd path]      → 创建 session 并绑（-ephemeral / -persist 覆盖默认）
+!persist on | off            → 切换本频道 session 的"broker 重启后是否恢复"
+!cwd                         → 显示绑定 session 的工作目录
+!logs [n]                    → 末 n 行 session 输出（默认 30，最大 100）
+!ls                          → 列出所有 session；▶ 标记本频道绑的；下面列出其它频道→session 映射
+!status                      → 显示本频道当前绑定
+!interrupt | !restart | !hibernate
+!kill <name>                 → 销毁 session（/kill 自带补全），相关频道失去绑定
+!help                        → 上面所有命令
+```
+
+给 bot 任意消息加 **🛑** (interrupt) / **💤** (hibernate) / **🔄** (restart) 反应，等同于对应命令但不用打字。
+
+回复 (Discord 的 reply UI) bot 的某条消息，本轮 forward 自动指向那条消息当时对应的 session，与本频道当前绑定无关。
+
+### 6. 局域网远程接入
+
+```powershell
+# 在 broker 主机上：
+.\agentmux config token --set                                # 生成并保存 token
+.\agentmux config set broker http_addr "0.0.0.0:8765"        # 监听 LAN
+.\agentmux stop ; .\agentmux start                           # 应用
+# Windows Defender 防火墙允许 8765 入站，限制到本子网即可。
+
+# 在第二台机器上（用上面生成的 token）：
+$env:AGENT_ATTACH_TOKEN = "rjVBS19l...43字符..."
+.\claude-attach.exe --broker http://192.168.0.42:8765 --session default
+```
+
+回环调用方（broker 同机的 Discord bot、hooks、本地 `claude-attach`）跳过 token 校验，所以现有本地工具一行配置不动也照常工作。
+
+### 7. 切版本
+
+```powershell
+.\scripts\build-release.ps1
+# → dist\agentmux-vX.Y.Z-windows-x86_64.zip
+```
+
+推 `v*` tag 触发 `.github/workflows/release.yml`，在 Windows runner 上跑同一份 packaging 脚本，把 zip + `.sha256` 校验和上传到 GitHub Release。（也支持 `workflow_dispatch` 手动触发。）
+
+### 8. Windows Terminal 配置（可选）
+
+`scripts/terminal-profile.json` 是一段 profile 模板 —— 把 `<INSTALL_DIR>` 替换为你的 agentmux 仓库绝对路径，整个对象粘进 Windows Terminal 的 `settings.json` 的 `profiles.list`。选中 "agentmux" profile 即可一键拉起 `claude-attach.exe` 进入会话菜单。
 
 ## 配置
 
@@ -99,75 +172,123 @@ broker 的工作目录会成为 `claude` 的 cwd —— 决定"trust this direct
 2. `%LOCALAPPDATA%\agentmux\config.toml`
 3. 内建默认值
 
-`.\scripts\init-config.ps1` 会在默认路径写一份注释齐全的模板。所有字段都可选 —— 不写就用默认。
+`.\scripts\init-config.ps1` 在默认路径写一份注释齐全的模板。所有字段都可选 —— 不写就用默认。
+
+### `broker` 配置（`config.toml`）
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `http_addr` | `127.0.0.1:8765` | broker HTTP 控制面绑定地址 |
-| `pipe_name` | `\\.\pipe\claude-broker` | broker 与 viewer 之间的命名管道 |
+| `http_addr` | `127.0.0.1:8765` | Broker HTTP / WS 绑定地址。设为 `0.0.0.0:8765` 开 LAN（**此时 `attach_token` 必须设置**）。 |
+| `pipe_name` | `\\.\pipe\claude-broker` | broker 与本地 viewer 之间的命名管道 |
 | `default_command` | `["claude", "--dangerously-skip-permissions"]` | 启动新 session 用的 argv |
 | `ring_cap_bytes` | `524288` | 每个 session 的回放缓冲区大小 |
 | `hibernate_idle_secs` | `86400` | 空闲超过多少秒自动休眠（0 = 关闭） |
+| `auto_resume_default` | `false` | 为 `true` 时新 session 默认持久化；per-session 标志仍优先 |
+| `attach_token` | (空) | 非回环 HTTP/WS 的 Bearer token。空 = 禁用 LAN 接入。用 `.\agentmux config token --set` 生成 |
 | `sessions_toml_path` | `%LOCALAPPDATA%\agentmux\sessions.toml` | session 持久化文件路径 |
 | `pid_file_path` | `%LOCALAPPDATA%\agentmux\broker.pid` | 单实例锁文件路径 |
 | `log_dir` | `%LOCALAPPDATA%\agentmux\logs` | 按天滚动日志目录 |
 
+### `discord` 配置（`discord.toml`）
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `token_env` | `DISCORD_BOT_TOKEN` | 存放 bot token 的环境变量名（token 永不写盘） |
+| `broker_http_url` | `http://127.0.0.1:8765` | broker HTTP 基址；跨机部署时改 host |
+| `broker_ws_url` | `ws://127.0.0.1:8765/ws` | broker WS 事件流 |
+| `channel_ids` | `[]` | 白名单 server 频道 ID（空 = 监听所有可见 server 频道） |
+| `allowed_user_ids` | `[]` | **必填、非空。** bot 接受其消息的 Discord 用户 ID 白名单 |
+| `default_session` | `default` | 新频道首次说话时自动绑到的 session |
+| `max_message_chars` | `1900` | Discord 单条 2000 字符上限的拆分点（留 100 给装饰） |
+| `allow_dm` | `false` | 是否接受白名单用户的 1:1 私信 |
+| `notify_on_idle` | `false` | 是否转发 "Claude is waiting for your input" 这类 idle ping（多数人嫌吵） |
+| `respond_to_mentions` | `false` | 非白名单频道里 `@bot` 也能唤醒 bot |
+| `slash_command_guild_id` | `0` | 把 slash 命令 pin 到某 guild 实现即时刷新（0 = 全局，最多 1h 传播） |
+| `reply_quote_in_prompt` | `true` | Discord reply 前置 `[replying to: "..."]` 让 claude 看到引用上下文 |
+| `react_with_actions` | `true` | 给 bot 消息加 🛑 / 💤 / 🔄 反应触发 interrupt / hibernate / restart |
+
 ## HTTP API
+
+所有 endpoint 默认仅回环可达。当 `attach_token` 设置且 `http_addr` 绑定到非回环地址时，非回环调用方必须带 `Authorization: Bearer <attach_token>`。
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| `GET` | `/sessions` | 列出所有 session（id、name、cwd、viewers、state） |
-| `POST` | `/sessions` | 创建 session（`{"name", "cwd"?, "command"?}`） |
+| `GET` | `/sessions` | 列出所有 session（id、name、cwd、viewers、state、auto_resume） |
+| `POST` | `/sessions` | 创建 session（`{"name", "cwd"?, "auto_resume"?}`）；`auto_resume` 缺省取 `auto_resume_default` |
 | `GET` | `/sessions/:key` | 查询单个 session（key 可以是 id 或 name） |
 | `DELETE` | `/sessions/:key?force=true` | 杀掉 session |
 | `GET` | `/sessions/:key/state` | 轻量探针：存活 / 空闲 / viewer 数 |
 | `POST` | `/sessions/:key/interrupt` | 给 session 的 PTY 写 `0x03`（等同于在 claude 里按 Ctrl+C） |
 | `POST` | `/sessions/:key/restart` | 杀掉并重启 claude 子进程，保留 session id |
 | `POST` | `/sessions/:key/hibernate` | 关闭 claude 子进程但保留元信息，待下次 resume |
-| `POST` | `/event` | hook 摄入端点 —— 追加一行到 `events.jsonl` |
-| `POST` | `/shutdown` | broker 优雅关闭（给所有 claude 发 SIGTERM、排空、退出） |
+| `POST` | `/sessions/:key/input` | 注入文本到 session 的 PTY stdin（`{"text", "append_enter"?}`）。`Hibernated/Crashed` 自动 resume；末尾 `\r` 与文本分两次写、间隔 30ms，避免 claude TUI 把它们当成 paste-burst 而不 submit |
+| `POST` | `/sessions/:key/persist` | 切换 session 的 `auto_resume` 标志（`{"auto_resume": bool}`），重写 sessions.toml |
+| `GET` | `/sessions/:key/ring` | 诊断：环形缓冲区原始字节快照 —— 配合 `xxd` / `od -c` 看 |
+| `POST` | `/event` | hook 摄入端点 —— 追加到 `events.YYYY-MM-DD.jsonl`，并 tee 到 `/ws` |
+| `POST` | `/tool-request` | **长轮询，最长 5 分钟。** hook-pretool 发 `{ session_id, tool_name, tool_input }`；broker 生成 UUID、广播 `tool_request` 事件，等待 `/tool-decision/:id`，返回 `{ allow, reason }`。超时返回 `{ allow: false, reason: "no human decision within 300s" }` |
+| `POST` | `/tool-decision/:request_id` | 解开一条挂起的 `/tool-request`（`{"allow": bool, "reason"?}`） |
+| `GET` | `/ws` | WebSocket 事件总线 —— 每个标注好的 hook 事件以一行 JSON 推给订阅者 |
+| `GET` | `/attach` | WebSocket viewer 接入。每条帧（HELLO / PTY_DATA / RESIZE / CONTROL）作为一个 Binary 消息。`claude-attach --broker` 走的就是这条 |
+| `POST` | `/shutdown` | broker 优雅关闭（杀光所有 claude、排空、退出） |
 
 ## Crate 一览
 
 | Crate | 职责 |
 |---|---|
-| `broker` | 多会话守护进程。负责 ConPTY 池、环形缓冲区、命名管道服务、HTTP 控制面、休眠扫描、崩溃看护、`events.jsonl` 写入 |
-| `claude-attach` | 终端 viewer。基于命名管道的帧协议客户端，含会话选择菜单、raw 模式 stdin 转发、Ctrl+C 升级、resize 协调 |
-| `hook-stop` | Claude Code `Stop` hook。读 transcript，向 broker POST `assistant_message`。本地 viewer 已 attach 时静默 |
-| `hook-notification` | Claude Code `Notification` hook。向 broker POST `notification` 事件 |
-| `shared` | 帧协议（HELLO / RESIZE / CONTROL / PTY_DATA 等 tag）、配置加载器、最小阻塞式 HTTP 客户端 |
+| `broker` | 多会话守护进程。负责 ConPTY 池、环形缓冲区、命名管道服务、HTTP 控制面（带 auth 中间件保护）、WS 事件总线、WS attach 端点、休眠扫描、PreToolUse 决策通道注册表、按天滚动审计日志 |
+| `claude-attach` | 终端 viewer。基于帧协议的客户端，两条 transport：命名管道（默认本机）+ WebSocket（`--broker http://host:port --token …` 走 LAN）。会话选择菜单、raw 模式 stdin 转发、Ctrl+C 升级、resize 协调 |
+| `platform-discord` | Discord IM 适配器。每频道独立 session 绑定（持久化），就地编辑式 placeholder + typing 指示、Reply 路由 + 引用上下文、附件转发、12 个 slash 命令带补全、reaction 命令、工具审批按钮、idle ping 抑制、@mention 唤醒、DM 模式、孤儿 placeholder 恢复 |
+| `hook-stop` | Claude Code `Stop` hook。读 transcript、向 broker POST `assistant_message`。本地 viewer 已 attach 时静默 |
+| `hook-notification` | Claude Code `Notification` hook。POST `notification` 事件 |
+| `hook-pretool` | Claude Code `PreToolUse` hook。本地分类器自动放行安全工具 + 开发流的 `Bash` 模式；其余长轮询 `/tool-request` 走 Discord 审批。broker 不可达时**失败放行**，避免基础设施故障让 claude 工作中断 |
+| `agentmux-cli` | 被 `agentmux.ps1` 调用的小工具：保留格式的 TOML 编辑器 + 各类配置校验 |
+| `shared` | 帧协议（HELLO / RESIZE / CONTROL / PTY_DATA 等 tag、用于 WS 的 encode/decode-frame）、配置加载器、最小阻塞式 HTTP 客户端（含可选 Bearer 鉴权 + 长轮询版） |
 
 ## 仓库结构
 
 ```
 agentmux/
+├── agentmux.ps1            # 统一入口 —— 包装下面那些 scripts
+├── QUICKSTART.md           # 一页用户向导
 ├── crates/
 │   ├── broker/             # 多会话守护进程
-│   ├── claude-attach/      # 终端 viewer
+│   ├── claude-attach/      # 终端 viewer (pipe + WS)
+│   ├── platform-discord/   # Discord IM 适配器
 │   ├── hook-stop/          # Stop hook → assistant_message
 │   ├── hook-notification/  # Notification hook → notification
+│   ├── hook-pretool/       # PreToolUse hook → tool_request (同步审批)
+│   ├── agentmux-cli/       # TOML 助手 (config set/check/array-add 等)
 │   └── shared/             # 帧协议 + 配置 + HTTP 客户端
 ├── scripts/
-│   ├── start-broker.ps1
+│   ├── start-broker.ps1    # 也支持 -Foreground
+│   ├── start-discord.ps1
 │   ├── stop-broker.ps1
 │   ├── install-hooks.ps1
 │   ├── init-config.ps1
+│   ├── init-discord-config.ps1
 │   ├── open-config-dir.ps1
-│   └── terminal-profile.json   # Windows Terminal profile 模板
+│   ├── build-release.ps1   # 产出 dist\agentmux-vX.Y.Z-windows-x86_64.zip
+│   └── terminal-profile.json
+├── .github/workflows/
+│   └── release.yml         # tag 触发的自动构建 + GitHub release
 └── PLAN.md                 # 设计文档 + 阶段实施日志
 ```
 
 ## 系统要求
 
 - **Windows 10/11** —— 依赖 ConPTY 与 Win32 命名管道，不可移植到 Unix
-- **Rust 1.75+** 用于编译
-- **Claude Code CLI** 已加入 `PATH` —— broker 默认拉起 `claude`
+- **Rust 1.75+** + MSVC 工具链（Visual Studio 2022 Build Tools，"Desktop development with C++"），仅构建时需要；release zip 已自包含
+- **Claude Code CLI** 在 `PATH` 上 —— broker 默认拉起 `claude`
 
 ## 安全
 
-- HTTP 控制面与命名管道**仅绑 loopback / 本机**，外网不可达。
-- 默认启动命令是 `claude --dangerously-skip-permissions`。如不希望跳过权限，编辑 `config.toml` 里的 `default_command`。
-- PID 文件单实例锁防止两个 broker 抢同一根管道。
+- **默认仅回环。** HTTP 控制面与命名管道开箱即用绑定到 `127.0.0.1`，外网不可达。LAN 接入需要显式开启：`http_addr = "0.0.0.0:8765"` **且** `attach_token` 非空；token 没设的话每个非回环请求都被 401 拒绝（带 source IP 上日志）。
+- **Token 比较走 constant-time** 防止时序攻击。
+- **回环豁免**：auth 中间件对 127.0.0.1 / ::1 直接放行，所以同机现有工具（同主机的 Discord bot、hooks、命名管道 attach）不需要任何 token 配置仍正常工作。
+- **PreToolUse 失败放行。** broker 不可达时，`hook-pretool` 选择放行而不是阻塞 claude。设置 `AGENT_HOOK_DEBUG` 可在 stderr 看到失败原因（人看，claude 看不到）。
+- **默认启动命令** 是 `claude --dangerously-skip-permissions`。PreToolUse 审批流的设计目标是用更灵活的正则规则**替代** claude 自己的权限提示；如果你更想用 claude 内置的权限对话框，就在 `config.toml` 里改 `default_command` 并卸载 PreToolUse hook。
+- **PID 文件单实例锁**防止两个 broker 抢同一根管道。
+- **Discord token 永不写盘。** bot token 存在 User-scope 环境变量里（默认 `DISCORD_BOT_TOKEN`），`discord.toml` 里只放变量*名*。
 
 ## 许可证
 

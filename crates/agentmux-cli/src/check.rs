@@ -106,6 +106,19 @@ fn check_broker(path: &Path, had_failure: &mut bool) -> Result<()> {
     } else {
         println!("✓ auto_resume_default = false (new sessions are ephemeral by default)");
     }
+
+    let token = doc
+        .get("attach_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if token.is_empty() {
+        println!("✓ attach_token = (unset — LAN access disabled; loopback only)");
+    } else {
+        println!(
+            "✓ attach_token = (set, {} chars — non-loopback requests require Bearer)",
+            token.chars().count()
+        );
+    }
     Ok(())
 }
 

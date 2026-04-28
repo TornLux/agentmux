@@ -76,6 +76,55 @@ where
     Ok(())
 }
 
+/// Pack a frame into a freshly-allocated `Vec<u8>` for transports
+/// that prefer self-contained byte buffers (e.g. WebSocket binary
+/// messages). Mirrors `write_frame`'s wire format exactly so the
+/// receiver can `decode_frame` regardless of which writer was used.
+pub fn encode_frame(tag: u8, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+    if payload.len() > MAX_PAYLOAD {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame payload too large: {} > {MAX_PAYLOAD}", payload.len()),
+        ));
+    }
+    let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
+    buf.push(tag);
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(payload);
+    Ok(buf)
+}
+
+/// Parse a single frame out of a self-contained byte buffer
+/// (`encode_frame`'s inverse). Used on the receive side of
+/// transports where each delivered chunk IS one whole frame.
+pub fn decode_frame(buf: &[u8]) -> std::io::Result<(u8, &[u8])> {
+    if buf.len() < HEADER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "short frame",
+        ));
+    }
+    let tag = buf[0];
+    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    if len > MAX_PAYLOAD {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame payload too large: {len} > {MAX_PAYLOAD}"),
+        ));
+    }
+    if buf.len() != HEADER_LEN + len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "frame length mismatch: declared {} bytes, message has {}",
+                len,
+                buf.len() - HEADER_LEN
+            ),
+        ));
+    }
+    Ok((tag, &buf[HEADER_LEN..]))
+}
+
 pub fn encode_resize(cols: u16, rows: u16) -> [u8; 4] {
     let mut p = [0u8; 4];
     p[0..2].copy_from_slice(&cols.to_be_bytes());
