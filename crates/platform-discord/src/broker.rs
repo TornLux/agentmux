@@ -87,6 +87,65 @@ impl BrokerClient {
         }
         Ok(())
     }
+
+    pub async fn create_session(&self, name: &str, cwd: Option<&str>) -> Result<()> {
+        let url = format!("{}/sessions", self.base_http);
+        let body = match cwd {
+            Some(c) => json!({ "name": name, "cwd": c }),
+            None => json!({ "name": name }),
+        };
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        check_ok(resp, "/sessions").await
+    }
+
+    pub async fn delete_session(&self, name: &str) -> Result<()> {
+        let url = format!("{}/sessions/{}?force=true", self.base_http, name);
+        let resp = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .with_context(|| format!("DELETE {url}"))?;
+        check_ok(resp, "DELETE /sessions/:k").await
+    }
+
+    pub async fn interrupt_session(&self, name: &str) -> Result<()> {
+        self.post_action(name, "interrupt").await
+    }
+
+    pub async fn restart_session(&self, name: &str) -> Result<()> {
+        self.post_action(name, "restart").await
+    }
+
+    pub async fn hibernate_session(&self, name: &str) -> Result<()> {
+        self.post_action(name, "hibernate").await
+    }
+
+    async fn post_action(&self, name: &str, action: &str) -> Result<()> {
+        let url = format!("{}/sessions/{}/{}", self.base_http, name, action);
+        let resp = self
+            .http
+            .post(&url)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        check_ok(resp, action).await
+    }
+}
+
+async fn check_ok(resp: reqwest::Response, label: &str) -> Result<()> {
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    anyhow::bail!("{label} → {status}: {body}");
 }
 
 /// Run the WebSocket subscriber until cancelled. On any error the loop
