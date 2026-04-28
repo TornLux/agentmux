@@ -104,7 +104,7 @@ Usage: .\agentmux <command> [args]
 
 Setup
   init                  Run the first-time setup wizard
-  hooks install         Wire Claude Code hooks (also runs in `init`)
+  hooks install         Wire Claude Code hooks (also runs during init)
   hooks uninstall       Remove hooks from ~\.claude\settings.json
   hooks check           Validate hooks configuration
 
@@ -135,10 +135,144 @@ Discord bridge
   discord channels remove <id>   Remove from channel_ids
 
   help                  Print this message
+  help <verb>           Print help for a specific verb (also: <verb> --help)
 "@ | Write-Host
 }
 
-function Cmd-Init {
+# Per-verb help blocks. Called when a verb is invoked with `--help`,
+# `-h`, no args (where that doesn't make sense), or via `agentmux help
+# <verb>`.
+function Show-VerbHelp([string]$verb) {
+    switch ($verb) {
+        "init" {
+            @"
+Usage: .\agentmux init
+
+  Interactive first-time wizard. Five steps:
+    1. prerequisite check (binaries, claude on PATH)
+    2. install Claude Code hooks (idempotent)
+    3. write broker config template (skipped if exists)
+    4. optional Discord setup (token + channels + users)
+    5. start broker in the background
+
+  Re-runnable; already-done steps are skipped.
+"@
+        }
+        "start" {
+            @"
+Usage: .\agentmux start [--no-discord | --foreground]
+
+  Default: starts broker as a detached background process, then the
+  Discord bot if discord.toml exists and DISCORD_BOT_TOKEN is set.
+
+  --no-discord    Skip the bot even if configured.
+  --foreground    Run broker inline (Ctrl+C to stop). Skips the bot;
+                  use a separate shell if you need both.
+"@
+        }
+        "stop" {
+            @"
+Usage: .\agentmux stop
+
+  Stops platform-discord (any matching pid) and broker (via the PID
+  file under %LOCALAPPDATA%\agentmux\). Safe to run when nothing is
+  running — exits cleanly.
+"@
+        }
+        "status" {
+            @"
+Usage: .\agentmux status
+
+  Prints broker pid + sessions list + Discord adapter state. Read-
+  only; no side effects.
+"@
+        }
+        "attach" {
+            @"
+Usage: .\agentmux attach [name | --new [name] | --session name | --debug]
+
+  No args:           interactive picker menu
+  <name>:            shorthand for --session <name>
+  --new [name]:      create a new session and attach (auto-named s1/s2/.. if omitted)
+  --session <name>:  attach directly without the menu
+  --debug:           log stdin bytes to stderr (diagnostic)
+
+  Detach with Ctrl+Q or Ctrl+]. Ctrl+C escalation:
+    1×           interrupt claude's current turn
+    2× in 1.5 s  restart this session's claude (history kept)
+    3× in 1.5 s  shut down the entire broker
+"@
+        }
+        "logs" {
+            @"
+Usage: .\agentmux logs [broker | discord | events]
+
+  broker  (default)  tail today's broker.YYYY-MM-DD.log
+  discord            tail platform-discord.stdout.log
+  events             tail events.jsonl (audit trail of hook events)
+
+  Live follow (Get-Content -Wait); Ctrl+C to exit.
+"@
+        }
+        "config" {
+            @"
+Usage: .\agentmux config <subcommand> [args]
+
+  edit  [broker|discord|hooks]    Open in `$env:EDITOR / VS Code / notepad
+                                  (notepad blocks; on close auto-runs check)
+  dir                             Open %LOCALAPPDATA%\agentmux in Explorer
+  path  [broker|discord|hooks]    Print the absolute path (pipe-friendly)
+  show  [broker|discord]          Print file contents to stdout
+  check [broker|discord|hooks]    Validate (default: all three)
+  set   <broker|discord> <key> <value>
+                                  Set a scalar field, preserving comments/format
+  unset <broker|discord> <key>    Remove a field (falls back to default)
+
+  Default kind for sub-commands that take one is broker.
+"@
+        }
+        "discord" {
+            @"
+Usage: .\agentmux discord <subcommand> [args]
+
+  setup                          Interactive: token + channels + users
+  token                          Re-prompt + verify the bot token; saves to
+                                 User-scope env var (default DISCORD_BOT_TOKEN)
+  users    add|remove <id>       Edit allowed_user_ids in discord.toml
+  channels add|remove <id>       Edit channel_ids in discord.toml
+  start                          Just launch the bot (no other side effects)
+
+  Token is read from env var; never written to disk. allowed_user_ids
+  must be non-empty — the bot refuses to start with an empty whitelist.
+"@
+        }
+        "hooks" {
+            @"
+Usage: .\agentmux hooks <install|uninstall|check>
+
+  install     Wire Stop + Notification hooks into ~\.claude\settings.json.
+              Idempotent; original is backed up to settings.json.bak first.
+  uninstall   Remove agentmux hook entries (other hooks untouched).
+  check       Validate the current hooks setup (paths exist, JSON parses).
+"@
+        }
+        default {
+            Write-Host "no verb-level help for `"$verb`" — try .\agentmux help" -ForegroundColor Yellow
+            return
+        }
+    }
+    Write-Host ""
+}
+
+# Returns $true if Argv requests help (--help, -h, or `help`).
+function Wants-Help([string[]]$Argv) {
+    if (-not $Argv) { return $false }
+    $first = $Argv[0]
+    return ($first -eq "--help" -or $first -eq "-h" -or $first -eq "help")
+}
+
+function Cmd-Init([string[]]$Argv) {
+    if (Wants-Help $Argv) { Show-VerbHelp "init"; return }
     Write-Host ""
     Write-Host "agentmux setup wizard" -ForegroundColor Cyan
     Write-Host "─────────────────────"
@@ -221,6 +355,7 @@ function Cmd-Init {
 }
 
 function Cmd-Start([string[]]$Argv) {
+    if (Wants-Help $Argv) { Show-VerbHelp "start"; return }
     Require-Binary $brokerExe "broker.exe"
 
     $foreground = ($Argv -contains "--foreground")
@@ -247,7 +382,8 @@ function Cmd-Start([string[]]$Argv) {
     & (Join-Path $scriptsDir "start-discord.ps1")
 }
 
-function Cmd-Stop {
+function Cmd-Stop([string[]]$Argv) {
+    if (Wants-Help $Argv) { Show-VerbHelp "stop"; return }
     Get-Process -Name platform-discord -ErrorAction SilentlyContinue | ForEach-Object {
         Stop-Process -Id $_.Id -Force
         Write-Host "stopped platform-discord (pid $($_.Id))"
@@ -255,7 +391,8 @@ function Cmd-Stop {
     & (Join-Path $scriptsDir "stop-broker.ps1")
 }
 
-function Cmd-Status {
+function Cmd-Status([string[]]$Argv) {
+    if (Wants-Help $Argv) { Show-VerbHelp "status"; return }
     $bp = Get-BrokerPid
     if ($bp) {
         Write-Host "broker:  running (pid $bp)" -ForegroundColor Green
@@ -284,6 +421,7 @@ function Cmd-Status {
 }
 
 function Cmd-Attach([string[]]$Argv) {
+    if (Wants-Help $Argv) { Show-VerbHelp "attach"; return }
     Require-Binary $attachExe "claude-attach.exe"
     if ($Argv -and $Argv.Count -gt 0) {
         # Treat first positional as session name unless it already starts with --
@@ -297,6 +435,7 @@ function Cmd-Attach([string[]]$Argv) {
 }
 
 function Cmd-Logs([string[]]$Argv) {
+    if (Wants-Help $Argv) { Show-VerbHelp "logs"; return }
     $which = if ($Argv -and $Argv.Count -gt 0) { $Argv[0] } else { "broker" }
     switch ($which) {
         "broker" {
@@ -325,7 +464,10 @@ function Cmd-Logs([string[]]$Argv) {
 # --- config subcommands -------------------------------------------------
 
 function Cmd-Config([string[]]$Argv) {
-    if (-not $Argv -or $Argv.Count -eq 0) { $Argv = @("show") }
+    if (-not $Argv -or $Argv.Count -eq 0 -or (Wants-Help $Argv)) {
+        Show-VerbHelp "config"
+        return
+    }
     $sub = $Argv[0]
     $rest = if ($Argv.Count -gt 1) { $Argv[1..($Argv.Count - 1)] } else { @() }
     switch ($sub) {
@@ -336,7 +478,11 @@ function Cmd-Config([string[]]$Argv) {
         "check"  { Cmd-ConfigCheck $rest }
         "set"    { Cmd-ConfigSet   $rest }
         "unset"  { Cmd-ConfigUnset $rest }
-        default  { Write-Host "Usage: .\agentmux config <edit|dir|path|show|check|set|unset> [...]" }
+        default  {
+            Write-Host "unknown config subcommand: $sub" -ForegroundColor Red
+            Write-Host ""
+            Show-VerbHelp "config"
+        }
     }
 }
 
@@ -436,8 +582,8 @@ function Cmd-ConfigUnset([string[]]$Argv) {
 # --- discord subcommands ------------------------------------------------
 
 function Cmd-Discord([string[]]$Argv) {
-    if (-not $Argv -or $Argv.Count -eq 0) {
-        Write-Host "Usage: .\agentmux discord <setup|token|users|channels|start>"
+    if (-not $Argv -or $Argv.Count -eq 0 -or (Wants-Help $Argv)) {
+        Show-VerbHelp "discord"
         return
     }
     $sub = $Argv[0]
@@ -448,7 +594,11 @@ function Cmd-Discord([string[]]$Argv) {
         "users"    { Cmd-DiscordList "allowed_user_ids" $rest }
         "channels" { Cmd-DiscordList "channel_ids"      $rest }
         "start"    { & (Join-Path $scriptsDir "start-discord.ps1") }
-        default    { Write-Host "unknown discord subcommand: $sub" }
+        default    {
+            Write-Host "unknown discord subcommand: $sub" -ForegroundColor Red
+            Write-Host ""
+            Show-VerbHelp "discord"
+        }
     }
 }
 
@@ -540,29 +690,44 @@ function Cmd-DiscordList([string]$key, [string[]]$Argv) {
 # --- hooks subcommands --------------------------------------------------
 
 function Cmd-Hooks([string[]]$Argv) {
-    $action = if ($Argv -and $Argv.Count -gt 0) { $Argv[0] } else { "install" }
-    switch ($action) {
+    if (-not $Argv -or $Argv.Count -eq 0 -or (Wants-Help $Argv)) {
+        Show-VerbHelp "hooks"
+        return
+    }
+    switch ($Argv[0]) {
         "install"   { & (Join-Path $scriptsDir "install-hooks.ps1") }
         "uninstall" { & (Join-Path $scriptsDir "install-hooks.ps1") -Uninstall }
         "check"     { Cmd-ConfigCheck @("hooks") }
-        default     { Write-Host "usage: .\agentmux hooks <install|uninstall|check>" }
+        default     {
+            Write-Host "unknown hooks subcommand: $($Argv[0])" -ForegroundColor Red
+            Write-Host ""
+            Show-VerbHelp "hooks"
+        }
     }
 }
 
 # --- dispatch -----------------------------------------------------------
 
+function Dispatch-Help([string[]]$Argv) {
+    if ($Argv -and $Argv.Count -gt 0) {
+        Show-VerbHelp $Argv[0]
+    } else {
+        Cmd-Help
+    }
+}
+
 switch ($Command) {
     ""        { Cmd-Help }
-    "help"    { Cmd-Help }
-    "--help"  { Cmd-Help }
-    "-h"      { Cmd-Help }
+    "help"    { Dispatch-Help $Rest }
+    "--help"  { Dispatch-Help $Rest }
+    "-h"      { Dispatch-Help $Rest }
 
-    "init"    { Cmd-Init }
-    "start"   { Cmd-Start  $Rest }
-    "stop"    { Cmd-Stop }
-    "status"  { Cmd-Status }
-    "attach"  { Cmd-Attach $Rest }
-    "logs"    { Cmd-Logs   $Rest }
+    "init"    { Cmd-Init    $Rest }
+    "start"   { Cmd-Start   $Rest }
+    "stop"    { Cmd-Stop    $Rest }
+    "status"  { Cmd-Status  $Rest }
+    "attach"  { Cmd-Attach  $Rest }
+    "logs"    { Cmd-Logs    $Rest }
 
     "config"  { Cmd-Config  $Rest }
     "discord" { Cmd-Discord $Rest }
