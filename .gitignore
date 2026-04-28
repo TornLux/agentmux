@@ -1,6 +1,10 @@
 # Rust build artifacts
 /target/
 
+# Release packaging output (build-release.ps1)
+/dist/
+/.release-staging/
+
 # Local broker / viewer test logs (gitignored regardless of where they land)
 broker-test.stdout.log
 broker-test.stderr.log
