@@ -2,7 +2,7 @@
 #
 # Layout produced:
 #   agentmux-vX.Y.Z-windows-x86_64/
-#     bin/{broker,claude-attach,hook-stop,hook-notification,platform-discord,agentmux-cli}.exe
+#     bin/{broker,claude-attach,hook-stop,hook-notification,hook-pretool,platform-discord,agentmux-cli}.exe
 #     scripts/        (all .ps1 + terminal-profile.json)
 #     agentmux.ps1
 #     README.md
@@ -77,6 +77,7 @@ try {
         "claude-attach.exe",
         "hook-stop.exe",
         "hook-notification.exe",
+        "hook-pretool.exe",
         "platform-discord.exe",
         "agentmux-cli.exe"
     )
