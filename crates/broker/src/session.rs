@@ -313,6 +313,14 @@ impl Session {
         cmd.cwd(&self.cwd);
         cmd.env("AGENT_SESSION_ID", &self.id);
         cmd.env("AGENT_BROKER_URL", self.config.http_url());
+        // Trusted roots for hook-pretool's path-based auto-allow on
+        // Edit/Write — the session's own cwd is implicitly safe to
+        // edit. Future enhancement: add config.toml override allowing
+        // additional roots system-wide.
+        cmd.env(
+            "AGENT_TRUSTED_ROOTS",
+            self.cwd.to_string_lossy().to_string(),
+        );
 
         let child = pair
             .slave

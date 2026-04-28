@@ -7,6 +7,7 @@
 //! which session the viewer attaches to (defaults to `default` if
 //! unspecified).
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write as IoWrite;
 use std::path::{Path as StdPath, PathBuf};
@@ -46,29 +47,52 @@ const DEFAULT_SESSION_NAME: &str = "default";
 /// Append-only JSONL sink for hook events. The Mutex protects file
 /// ordering across concurrent /event requests; once a write fails we
 /// drop the handle and stop trying rather than spam log noise.
+/// Daily-rolling JSONL audit log. Files are written to
+/// `<dir>/<stem>.YYYY-MM-DD.jsonl` (UTC dates). Files older than
+/// `retention_days` are pruned at each day rollover.
 struct EventsLog {
-    path: PathBuf,
-    file: Mutex<Option<File>>,
+    dir: PathBuf,
+    stem: String,
+    inner: Mutex<EventsLogInner>,
+    retention_days: u32,
 }
 
+struct EventsLogInner {
+    file: Option<File>,
+    current_date: String,
+}
+
+const EVENTS_RETENTION_DAYS: u32 = 7;
+
 impl EventsLog {
-    fn open(path: PathBuf) -> Self {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| {
-                warn!("cannot open events log {:?}: {e}", path);
-                e
-            })
-            .ok();
-        Self {
-            path,
-            file: Mutex::new(file),
-        }
+    /// Open / create today's events file. The legacy single-file
+    /// path (`events.jsonl`) is preserved on disk if it existed but
+    /// new appends roll into dated siblings (`events.YYYY-MM-DD.jsonl`).
+    fn open(legacy_path: PathBuf) -> Self {
+        let dir = legacy_path
+            .parent()
+            .map(StdPath::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let stem = legacy_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("events")
+            .to_string();
+        let _ = std::fs::create_dir_all(&dir);
+
+        let date = today_utc_date();
+        let file = open_dated(&dir, &stem, &date);
+        let log = Self {
+            dir,
+            stem,
+            inner: Mutex::new(EventsLogInner {
+                file,
+                current_date: date,
+            }),
+            retention_days: EVENTS_RETENTION_DAYS,
+        };
+        log.prune();
+        log
     }
 
     fn append(&self, mut event: serde_json::Value) {
@@ -82,16 +106,145 @@ impl EventsLog {
             });
         }
         let line = format!("{event}\n");
-        let mut g = self.file.lock().unwrap();
-        if let Some(f) = g.as_mut() {
+
+        // Detect day rollover and reopen if needed. Cheap: compares
+        // a 10-byte string per event, no per-event stat() of the file.
+        let today = today_utc_date();
+        let mut g = self.inner.lock().unwrap();
+        if today != g.current_date {
+            // Drop yesterday's handle; open today's. Pruning is on
+            // a separate path so failure here doesn't block writes.
+            g.file = open_dated(&self.dir, &self.stem, &today);
+            g.current_date = today.clone();
+            // Release lock before pruning (which scans the dir).
+            drop(g);
+            self.prune();
+            g = self.inner.lock().unwrap();
+        }
+        if let Some(f) = g.file.as_mut() {
             if let Err(e) = f.write_all(line.as_bytes()) {
-                warn!("events.jsonl write {:?}: {e}", self.path);
-                *g = None;
+                warn!(
+                    "events.{}.jsonl write: {e}",
+                    g.current_date
+                );
+                g.file = None;
                 return;
             }
             let _ = f.flush();
         }
     }
+
+    /// Delete dated event files older than `retention_days`. Silent
+    /// on individual failures — best-effort, log on errors.
+    fn prune(&self) {
+        let cutoff_days = match self.retention_days as u64 {
+            0 => return, // disabled
+            n => n,
+        };
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let prefix = format!("{}.", self.stem);
+        let suffix = ".jsonl";
+        let today_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let cutoff_secs = today_secs.saturating_sub(cutoff_days * 86_400);
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = match name.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            if !name_str.starts_with(&prefix) || !name_str.ends_with(suffix) {
+                continue;
+            }
+            let prefix_len = prefix.len();
+            let suffix_start = name_str.len() - suffix.len();
+            // Reject names where prefix and suffix overlap or touch
+            // (e.g. legacy `events.jsonl` matches both bookends but
+            // has no date segment in between).
+            if prefix_len >= suffix_start {
+                continue;
+            }
+            let date_str = &name_str[prefix_len..suffix_start];
+            let secs = match date_to_secs(date_str) {
+                Some(s) => s,
+                None => continue, // not a YYYY-MM-DD-shaped filename
+            };
+            if secs < cutoff_secs {
+                let path = entry.path();
+                if let Err(e) = std::fs::remove_file(&path) {
+                    warn!("prune {:?}: {e}", path);
+                } else {
+                    info!("pruned old events log: {:?}", path);
+                }
+            }
+        }
+    }
+}
+
+fn open_dated(dir: &StdPath, stem: &str, date: &str) -> Option<File> {
+    let path = dir.join(format!("{stem}.{date}.jsonl"));
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| warn!("cannot open events log {:?}: {e}", path))
+        .ok()
+}
+
+/// Civil-from-days algorithm (Howard Hinnant) — converts an integer
+/// number of days since the Unix epoch into a (year, month, day)
+/// gregorian triple. Avoids pulling in `chrono` for one date format.
+fn ymd_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + (if m <= 2 { 1 } else { 0 });
+    (y as i32, m as u32, d as u32)
+}
+
+fn today_utc_date() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, m, d) = ymd_from_days((secs / 86400) as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Inverse: parse "YYYY-MM-DD" back into seconds since epoch
+/// (start of that day, UTC). Returns None for malformed input.
+fn date_to_secs(s: &str) -> Option<u64> {
+    let mut parts = s.splitn(3, '-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let d: i64 = parts.next()?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || !(1970..=9999).contains(&y) {
+        return None;
+    }
+    // Inverse civil algorithm.
+    let y = y - if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64;
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe as i64 - 719468;
+    if days < 0 {
+        return None;
+    }
+    Some((days as u64) * 86_400)
 }
 
 fn default_events_path() -> PathBuf {
@@ -114,9 +267,29 @@ struct AppState {
     /// and we just log it (PLAN §4.1: missing intermediate events is
     /// acceptable; bots resync on next event).
     event_bus: broadcast::Sender<serde_json::Value>,
+    /// In-flight PreToolUse approval requests. The hook is parked on
+    /// a long-poll HTTP request; when the bot posts a decision via
+    /// `/tool-decision/:id` we fire the matching oneshot and unblock
+    /// the hook. `request_id` is a UUID picked at /tool-request time.
+    pending_decisions: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ToolDecision>>>>,
 }
 
 const EVENT_BUS_CAP: usize = 256;
+
+/// Default wait-time on `/tool-request`. Most decisions take seconds;
+/// 5 minutes is "user is on their phone, walking, will get to it."
+/// Past this, the hook treats the response as `deny` so claude isn't
+/// stuck forever.
+const PRETOOL_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDecision {
+    /// `allow` lets claude run the tool. `deny` blocks it; `reason`
+    /// is shown to claude so it knows why.
+    pub allow: bool,
+    #[serde(default)]
+    pub reason: String,
+}
 
 /// Owns the broker.pid file so it gets cleaned up when main returns.
 /// Drop won't fire on SIGKILL / panic, but start-broker.ps1 detects
@@ -256,6 +429,7 @@ async fn main() -> Result<()> {
         default_cwd: cwd,
         config: config.clone(),
         event_bus,
+        pending_decisions: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // Idle hibernate scanner. Disabled at 0; otherwise wakes every
@@ -325,6 +499,8 @@ async fn run_http_server(app_state: AppState) {
         .route("/sessions/:key/ring", get(http_ring_snapshot))
         .route("/shutdown", post(http_shutdown))
         .route("/event", post(http_event))
+        .route("/tool-request", post(http_tool_request))
+        .route("/tool-decision/:request_id", post(http_tool_decision))
         .route("/ws", get(http_ws_upgrade))
         .with_state(app_state);
 
@@ -717,6 +893,115 @@ async fn http_set_persist(
         .get_by_id_or_name(&key)
         .ok_or((StatusCode::NOT_FOUND, "session not found".to_string()))?;
     Ok(Json(session.info()))
+}
+
+#[derive(Deserialize)]
+struct ToolRequestBody {
+    /// Broker session id (`AGENT_SESSION_ID` from the hook env). Used
+    /// purely to annotate the broadcast event so bots route the
+    /// approval prompt to the right channel.
+    session_id: String,
+    tool_name: String,
+    /// Free-form. Pass-through to the bot so it can render whatever
+    /// the user needs to make a decision (Bash command, file path, …).
+    tool_input: serde_json::Value,
+    /// Hook-side timeout in seconds. Caller can override; otherwise
+    /// we apply `PRETOOL_DEFAULT_TIMEOUT`.
+    #[serde(default)]
+    timeout_secs: u64,
+}
+
+/// Long-poll endpoint. The PreToolUse hook POSTs here with a tool
+/// request, the broker registers a oneshot, broadcasts an event so
+/// the Discord bot (or any other approval surface) can prompt a
+/// human, and the response body lands once `/tool-decision/:id`
+/// fires the oneshot. On timeout the request is implicitly denied.
+async fn http_tool_request(
+    State(s): State<AppState>,
+    Json(body): Json<ToolRequestBody>,
+) -> Result<Json<ToolDecision>, (StatusCode, String)> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel::<ToolDecision>();
+    s.pending_decisions
+        .lock()
+        .unwrap()
+        .insert(request_id.clone(), tx);
+
+    // Lookup human-friendly session name for nicer downstream UX.
+    let session_name = s
+        .manager
+        .get_by_id_or_name(&body.session_id)
+        .map(|sess| sess.name.clone())
+        .unwrap_or_else(|| body.session_id.clone());
+
+    info!(
+        "/tool-request id={} session={} tool={}",
+        request_id, session_name, body.tool_name
+    );
+
+    // Broadcast so subscribers (Discord bot etc.) can prompt the user.
+    let event = serde_json::json!({
+        "type": "tool_request",
+        "request_id": request_id,
+        "session_id": body.session_id,
+        "session_name": session_name,
+        "tool_name": body.tool_name,
+        "tool_input": body.tool_input,
+    });
+    let _ = s.event_bus.send(event.clone());
+    s.events.append(event);
+
+    let timeout = if body.timeout_secs == 0 {
+        PRETOOL_DEFAULT_TIMEOUT
+    } else {
+        Duration::from_secs(body.timeout_secs)
+    };
+
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(decision)) => {
+            info!(
+                "/tool-request id={} resolved: allow={} reason={:?}",
+                request_id, decision.allow, decision.reason
+            );
+            Ok(Json(decision))
+        }
+        Ok(Err(_)) => {
+            // Sender dropped without sending — should be unreachable
+            // (we own both ends), but treat as deny just in case.
+            s.pending_decisions.lock().unwrap().remove(&request_id);
+            warn!("/tool-request id={} sender dropped", request_id);
+            Ok(Json(ToolDecision {
+                allow: false,
+                reason: "broker decision channel dropped".into(),
+            }))
+        }
+        Err(_) => {
+            // Timeout. Remove the entry so the broker doesn't leak a
+            // sender if /tool-decision arrives later.
+            s.pending_decisions.lock().unwrap().remove(&request_id);
+            info!("/tool-request id={} timed out, denying", request_id);
+            Ok(Json(ToolDecision {
+                allow: false,
+                reason: format!("no human decision within {}s", timeout.as_secs()),
+            }))
+        }
+    }
+}
+
+async fn http_tool_decision(
+    Path(request_id): Path<String>,
+    State(s): State<AppState>,
+    Json(decision): Json<ToolDecision>,
+) -> Result<&'static str, (StatusCode, String)> {
+    let sender = s.pending_decisions.lock().unwrap().remove(&request_id);
+    let Some(sender) = sender else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no pending decision: {request_id}"),
+        ));
+    };
+    let _ = sender.send(decision);
+    Ok("ok")
 }
 
 async fn http_shutdown(State(s): State<AppState>) -> &'static str {

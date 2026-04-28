@@ -55,6 +55,38 @@ pub struct DiscordConfig {
     /// Permission prompts and other Notification messages always pass
     /// through regardless of this flag.
     pub notify_on_idle: bool,
+    /// When true, accept messages from non-whitelisted server channels
+    /// **only if** the bot is @mentioned in them. The mention is
+    /// stripped from the prompt before forwarding. Off by default —
+    /// avoids the bot getting drawn into channels it wasn't told
+    /// about.
+    pub respond_to_mentions: bool,
+    /// Optional guild id for slash-command registration. When set,
+    /// commands are registered as guild commands (instant updates,
+    /// scoped to one server). When `0` / unset, commands register
+    /// globally — propagation can take up to an hour. Set this for
+    /// dev / single-server use; leave 0 for multi-guild bots.
+    pub slash_command_guild_id: u64,
+    /// When true, posting a Discord reply prepends a one-line
+    /// `[replying to: "..."]` header to the forwarded prompt so
+    /// claude has the quoted text as context. The reply-target
+    /// session routing (in `state.rs`) is independent of this flag.
+    /// On by default — quoting helps when the referenced message is
+    /// from a different speaker / channel and claude wouldn't have
+    /// it in its own transcript.
+    pub reply_quote_in_prompt: bool,
+    /// When true, certain Unicode emoji reactions on bot-posted
+    /// assistant messages are interpreted as broker actions on the
+    /// session that produced the message:
+    ///
+    ///   * 🛑 / ❌  → interrupt
+    ///   * 💤      → hibernate
+    ///   * 🔄 / 🔁 → restart
+    ///
+    /// Only reactions from `allowed_user_ids` count. Other emojis
+    /// and reactions on unknown messages are ignored silently.
+    /// On by default.
+    pub react_with_actions: bool,
     /// Where to find the broker config (only its `pipe_name` is needed,
     /// and only when the bot one day learns to attach as a viewer).
     /// Empty = ignore. Reserved for later phases.
@@ -73,6 +105,10 @@ impl Default for DiscordConfig {
             max_message_chars: 1900,
             allow_dm: false,
             notify_on_idle: false,
+            respond_to_mentions: false,
+            slash_command_guild_id: 0,
+            reply_quote_in_prompt: true,
+            react_with_actions: true,
             broker_config_path: String::new(),
         }
     }

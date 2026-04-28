@@ -116,6 +116,21 @@ impl BrokerClient {
         check_ok(resp, "/sessions").await
     }
 
+    /// POST a decision to a parked PreToolUse approval request. The
+    /// hook waiting on `/tool-request` resolves and returns to claude
+    /// with the same `allow` / `reason`.
+    pub async fn tool_decision(&self, request_id: &str, allow: bool, reason: &str) -> Result<()> {
+        let url = format!("{}/tool-decision/{}", self.base_http, request_id);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&json!({ "allow": allow, "reason": reason }))
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        check_ok(resp, "tool-decision").await
+    }
+
     pub async fn set_persist(&self, name: &str, on: bool) -> Result<()> {
         let url = format!("{}/sessions/{}/persist", self.base_http, name);
         let resp = self

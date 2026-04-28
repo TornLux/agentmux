@@ -86,6 +86,24 @@ allow_dm = false
 # noisy). Permission prompts and other Notification messages always
 # pass through regardless.
 notify_on_idle = false
+
+# Accept messages in non-whitelisted server channels when the bot is
+# @mentioned? The mention is stripped from the prompt before forwarding.
+# Useful for "let bot reach me anywhere" without listing every channel.
+respond_to_mentions = false
+
+# Optional guild id for slash-command registration. When set, /commands
+# register as guild-scoped and update INSTANTLY. Leave 0 for global
+# commands (work everywhere the bot is, but propagation can take ~1h
+# after the bot first comes online or after definitions change).
+slash_command_guild_id = 0
+
+# When you Reply (Discord UI) to an earlier message, prepend a
+# `[replying to: "..."]` header to the prompt forwarded to claude.
+# Helpful when the referenced message is from someone else or from a
+# different channel and claude wouldn't otherwise have it in context.
+# Reply-thread session routing is independent of this flag.
+reply_quote_in_prompt = true
 '@
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

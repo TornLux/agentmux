@@ -1,0 +1,14 @@
+[package]
+name = "hook-pretool"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "hook-pretool"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

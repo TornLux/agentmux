@@ -18,8 +18,11 @@ mod attachments;
 mod broker;
 mod config;
 mod handler;
+mod slash;
 mod state;
 
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -56,7 +59,7 @@ async fn main() -> Result<()> {
     );
 
     let broker_client = Arc::new(BrokerClient::new(config.broker_http_url.clone()));
-    let bot_state = BotState::new();
+    let bot_state = BotState::new(default_bindings_path(), default_pending_path());
 
     // The WS subscriber pushes events into a queue; a small relay task
     // pops from the queue and uses serenity's `Http` to send / edit on
@@ -76,7 +79,9 @@ async fn main() -> Result<()> {
 
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
-        | GatewayIntents::MESSAGE_CONTENT;
+        | GatewayIntents::MESSAGE_CONTENT
+        | GatewayIntents::GUILD_MESSAGE_REACTIONS
+        | GatewayIntents::DIRECT_MESSAGE_REACTIONS;
 
     let handler = Handler::new(config.clone(), broker_client.clone(), bot_state.clone());
 
@@ -93,6 +98,15 @@ async fn main() -> Result<()> {
             relay_event_to_discord(&event, &http_for_relay, &relay_config, &relay_state).await;
         }
     });
+
+    // Crash-recovery: clean up `💭 working…` placeholders left by a
+    // previous bot instance that didn't get to edit them. We don't
+    // try to recover the in-flight turn (the assistant_message event
+    // for it likely flew past before our WS subscriber attached) —
+    // just put a clear error in the message so the user knows what
+    // happened. Done before client.start() so it doesn't race with
+    // new turns.
+    cleanup_orphans(&client.http, &bot_state).await;
 
     info!("connecting to Discord gateway...");
     if let Err(e) = client.start().await {
@@ -165,6 +179,9 @@ async fn relay_event_to_discord(
             // unsolicited and may arrive between turns.
             send_fresh(http, config, state, &session_name, &body).await;
         }
+        "tool_request" => {
+            relay_tool_request(http, config, state, &session_name, event).await;
+        }
         other => {
             tracing::debug!("ws event ignored: type={other}");
         }
@@ -180,6 +197,11 @@ async fn relay_assistant(
 ) {
     let chunks = chunked(body, config.max_message_chars);
     if let Some(pending) = state.pop_pending(session_name).await {
+        // Stop the typing-indicator background task immediately so
+        // the bot doesn't keep "is typing" flickering after the
+        // answer landed.
+        pending.typing_cancel.store(true, Ordering::Release);
+
         let channel = ChannelId::new(pending.channel_id);
         let mid = MessageId::new(pending.message_id);
         let first = chunks.first().cloned().unwrap_or_default();
@@ -190,16 +212,37 @@ async fn relay_assistant(
             warn!("edit placeholder for session={session_name}: {e}");
             // Fall through and post the entire body fresh — placeholder
             // edit failed, but the user still needs to see the answer.
-            send_fresh_chunks(http, channel, session_name, &chunks, /*include_first=*/ true).await;
+            send_fresh_chunks(
+                http,
+                channel,
+                session_name,
+                &chunks,
+                /*include_first=*/ true,
+                Some(state),
+            )
+            .await;
             return;
         }
+        // Record the placeholder's message id → session so future
+        // user replies (Discord Reply UI) targeting this answer get
+        // routed back to the same session.
+        state
+            .record_assistant_message(pending.message_id, session_name.to_string())
+            .await;
         for chunk in chunks.iter().skip(1) {
-            if let Err(e) = channel
+            match channel
                 .send_message(http, CreateMessage::new().content(chunk))
                 .await
             {
-                warn!("follow-up send for session={session_name}: {e}");
-                break;
+                Ok(m) => {
+                    state
+                        .record_assistant_message(m.id.get(), session_name.to_string())
+                        .await;
+                }
+                Err(e) => {
+                    warn!("follow-up send for session={session_name}: {e}");
+                    break;
+                }
             }
         }
         return;
@@ -209,6 +252,85 @@ async fn relay_assistant(
     // header so the user knows which session woke up.
     let display = format!("**[{session_name}]**\n{body}");
     send_fresh(http, config, state, session_name, &display).await;
+}
+
+/// Render a `tool_request` event to Discord with Allow / Deny
+/// buttons whose `custom_id`s carry the broker's `request_id` so the
+/// click handler in `handler.rs::interaction_create` can POST the
+/// decision back to `/tool-decision/:request_id`.
+async fn relay_tool_request(
+    http: &Arc<Http>,
+    config: &DiscordConfig,
+    state: &Arc<BotState>,
+    session_name: &str,
+    event: &serde_json::Value,
+) {
+    use serenity::all::{ButtonStyle, CreateActionRow, CreateButton};
+    let request_id = match event.get("request_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            warn!("tool_request without request_id, dropping");
+            return;
+        }
+    };
+    let tool_name = event
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let summary = format_tool_request(tool_name, event.get("tool_input"));
+    let body = format!(
+        "⚠️ **[{session_name}]** approval needed\n**{tool_name}**\n```\n{summary}\n```"
+    );
+
+    let Some(channel) = pick_channel(config, state, session_name).await else {
+        warn!("no destination for tool_request id={request_id}");
+        return;
+    };
+
+    let row = CreateActionRow::Buttons(vec![
+        CreateButton::new(format!("tool:allow:{request_id}"))
+            .style(ButtonStyle::Success)
+            .label("Allow")
+            .emoji('✅'),
+        CreateButton::new(format!("tool:deny:{request_id}"))
+            .style(ButtonStyle::Danger)
+            .label("Deny")
+            .emoji('❌'),
+    ]);
+
+    let chunks = chunked(&body, config.max_message_chars);
+    let first = chunks.first().cloned().unwrap_or_default();
+    let msg_builder = CreateMessage::new().content(first).components(vec![row]);
+    if let Err(e) = channel.send_message(http, msg_builder).await {
+        warn!("send tool_request: {e}");
+    }
+}
+
+/// Best-effort one-line excerpt of the tool's input for the Discord
+/// prompt. Bash → command; Edit/Write → path; everything else falls
+/// back to a compact JSON dump capped at 300 chars.
+fn format_tool_request(tool_name: &str, input: Option<&serde_json::Value>) -> String {
+    let Some(input) = input else {
+        return "(no input)".to_string();
+    };
+    let pick = match tool_name {
+        "Bash" => input.get("command").and_then(|v| v.as_str()),
+        "Edit" | "Write" | "MultiEdit" => input.get("file_path").and_then(|v| v.as_str()),
+        "NotebookEdit" => input.get("notebook_path").and_then(|v| v.as_str()),
+        _ => None,
+    };
+    if let Some(s) = pick {
+        let truncated: String = s.chars().take(800).collect();
+        return truncated;
+    }
+    let dump = serde_json::to_string(input).unwrap_or_default();
+    if dump.chars().count() > 300 {
+        let mut t: String = dump.chars().take(300).collect();
+        t.push('…');
+        t
+    } else {
+        dump
+    }
 }
 
 async fn send_fresh(
@@ -223,7 +345,7 @@ async fn send_fresh(
         return;
     };
     let chunks = chunked(body, config.max_message_chars);
-    send_fresh_chunks(http, channel, session_name, &chunks, /*include_first=*/ true).await;
+    send_fresh_chunks(http, channel, session_name, &chunks, /*include_first=*/ true, Some(state)).await;
 }
 
 async fn send_fresh_chunks(
@@ -232,15 +354,26 @@ async fn send_fresh_chunks(
     session_name: &str,
     chunks: &[String],
     include_first: bool,
+    state: Option<&Arc<BotState>>,
 ) {
     let start = if include_first { 0 } else { 1 };
     for chunk in chunks.iter().skip(start) {
-        if let Err(e) = channel
+        match channel
             .send_message(http, CreateMessage::new().content(chunk))
             .await
         {
-            warn!("discord send for session={session_name}: {e}");
-            break;
+            Ok(m) => {
+                // Record so a future user reply targeting this
+                // message routes back to the same session.
+                if let Some(s) = state {
+                    s.record_assistant_message(m.id.get(), session_name.to_string())
+                        .await;
+                }
+            }
+            Err(e) => {
+                warn!("discord send for session={session_name}: {e}");
+                break;
+            }
         }
     }
 }
@@ -301,6 +434,54 @@ fn chunked(s: &str, max: usize) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// Resolved path of `discord-bindings.toml` — `%LOCALAPPDATA%\agentmux\
+/// discord-bindings.toml` on Windows, falling back to `./agentmux/...`
+/// when LOCALAPPDATA is unset (test harness, headless env, …).
+fn default_bindings_path() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("agentmux").join("discord-bindings.toml")
+}
+
+/// Resolved path of `discord-pending.toml` — sibling of bindings,
+/// rewritten on every push/pop and removed on clean shutdown of an
+/// empty queue. Presence of a non-empty file at startup ⇔ previous
+/// bot instance exited mid-turn.
+fn default_pending_path() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("agentmux").join("discord-pending.toml")
+}
+
+/// Edit each orphaned `💭 working…` placeholder left over from a
+/// previous bot run into a clear error state, then clear the
+/// pending file. Best-effort: failures (deleted message, no perms)
+/// are logged at debug level since the user's experience already
+/// degraded once and we don't want the recovery itself to be noisy.
+async fn cleanup_orphans(http: &Arc<Http>, state: &Arc<BotState>) {
+    let orphans = state.take_orphans();
+    if orphans.is_empty() {
+        return;
+    }
+    info!("cleaning up {} orphan placeholder(s) from previous run", orphans.len());
+    for o in orphans {
+        let channel = ChannelId::new(o.channel_id);
+        let mid = MessageId::new(o.message_id);
+        let body = format!(
+            "❌ this turn was interrupted by a bot restart (session: `{}`)",
+            o.session
+        );
+        if let Err(e) = channel
+            .edit_message(http, mid, EditMessage::new().content(body))
+            .await
+        {
+            tracing::debug!("orphan edit {mid} (session={}): {e}", o.session);
+        }
+    }
 }
 
 #[cfg(test)]

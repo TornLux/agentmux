@@ -1,24 +1,42 @@
 //! Discord-side event handler. Implements `serenity::EventHandler`,
 //! forwarding allowed-user messages to the channel-bound session via the
-//! broker HTTP API and handling a small set of `!` meta-commands.
+//! broker HTTP API and handling `!`-prefix meta-commands as well as
+//! slash-command interactions.
 //!
-//! Two non-trivial behaviours sit here:
+//! Non-trivial behaviours implemented here:
 //!
 //!  * **Per-channel binding** — each Discord channel maps to one session.
 //!    First-time access in a channel binds it to `default_session`;
-//!    `!attach <name>` rebinds the *current* channel. Outbound routing
-//!    in `main.rs` uses the same map so an `assistant_message` event for
-//!    session `s` lands in whichever channel(s) bind it.
+//!    `!attach <name>` (or `/attach`) rebinds the *current* channel.
+//!    Outbound routing in `main.rs` uses the same map so an
+//!    `assistant_message` event for session `s` lands in whichever
+//!    channel(s) bind it.
+//!  * **Mention wake** — when `respond_to_mentions = true`, an inbound
+//!    message in a non-whitelisted server channel is accepted iff the
+//!    bot is `@`-mentioned. The mention is stripped from the prompt
+//!    before forwarding.
+//!  * **Reply-thread routing** — when the user posts a Discord
+//!    message_reference (Reply UI) targeting a previously-relayed
+//!    assistant message, this turn is forwarded to *that* session,
+//!    overriding the channel binding for this one message.
 //!  * **Placeholder + edit-in-place** — every forwarded user message
-//!    posts a `💭 working...` reply immediately, registers the message
+//!    posts a `💭 working…` reply immediately, registers the message
 //!    id in `pending_replies[session]`, and the WS relay edits that
 //!    message in place when the matching `assistant_message` arrives.
+//!  * **Typing indicator** — while a placeholder is unresolved, a
+//!    background task pings Discord's "user is typing" every ~7s so
+//!    long claude turns feel responsive in the client.
+//!  * **Error reaction** — when a forward fails (broker unreachable,
+//!    session 404, etc.), the placeholder is deleted and the user's
+//!    original message gets a ❌ reaction, plus a short error reply.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serenity::all::{
-    Context, EditMessage, EventHandler, Message, ReactionType, Ready,
+    ChannelId, Context, EventHandler, GuildId, Interaction, Message, Reaction, ReactionType,
+    Ready,
 };
 use serenity::async_trait;
 use tracing::{info, warn};
@@ -27,7 +45,8 @@ use crate::ansi;
 use crate::attachments;
 use crate::broker::{BrokerClient, SessionLite};
 use crate::config::DiscordConfig;
-use crate::state::{BotState, PendingReply};
+use crate::slash;
+use crate::state::{now_unix_ms, BotState, PendingReply};
 
 /// How long a placeholder waits for `assistant_message` before being
 /// considered abandoned (and therefore freely overwritable by the next
@@ -35,10 +54,33 @@ use crate::state::{BotState, PendingReply};
 /// minutes is "user has clearly given up" territory.
 const PENDING_TTL: Duration = Duration::from_secs(600);
 
+/// Actions reachable via reactions on bot-posted assistant messages.
+#[derive(Copy, Clone, Debug)]
+enum ReactAction {
+    Interrupt,
+    Hibernate,
+    Restart,
+}
+
+impl std::fmt::Display for ReactAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ReactAction::Interrupt => "interrupt",
+            ReactAction::Hibernate => "hibernate",
+            ReactAction::Restart => "restart",
+        })
+    }
+}
+
 pub struct Handler {
     pub config: Arc<DiscordConfig>,
     pub broker: Arc<BrokerClient>,
     pub state: Arc<BotState>,
+    /// Bot's own user id, captured on `ready` so the message handler
+    /// can detect `@`-mentions of itself without polling the cache.
+    /// `OnceLock` because we only ever set it once and reads should
+    /// be lock-free.
+    bot_user_id: OnceLock<u64>,
 }
 
 impl Handler {
@@ -51,20 +93,56 @@ impl Handler {
             config,
             broker,
             state,
+            bot_user_id: OnceLock::new(),
         }
+    }
+
+    /// Best-effort getter — returns `0` before `ready` fires, which
+    /// effectively disables mention-wake until the bot is online (a
+    /// non-issue since we wouldn't be receiving messages yet).
+    fn bot_user_id(&self) -> u64 {
+        self.bot_user_id.get().copied().unwrap_or(0)
     }
 }
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
+        let _ = self.bot_user_id.set(ready.user.id.get());
         info!(
-            "discord ready as {} (id={}); default_session={} channels={} (per-channel binding)",
+            "discord ready as {} (id={}); default_session={} channels={} respond_to_mentions={} allow_dm={}",
             ready.user.name,
             ready.user.id.get(),
             self.config.default_session,
             self.config.channel_ids.len(),
+            self.config.respond_to_mentions,
+            self.config.allow_dm,
         );
+
+        // Register slash commands. Guild registration is instant;
+        // global registration takes up to an hour to propagate but
+        // requires no extra config. Errors are logged and non-fatal —
+        // the bot still works via `!`-prefix commands.
+        let cmds = slash::definitions();
+        let result = if self.config.slash_command_guild_id != 0 {
+            let gid = GuildId::new(self.config.slash_command_guild_id);
+            gid.set_commands(&ctx.http, cmds).await.map(|v| v.len())
+        } else {
+            serenity::all::Command::set_global_commands(&ctx.http, cmds)
+                .await
+                .map(|v| v.len())
+        };
+        match result {
+            Ok(n) => info!(
+                "registered {n} slash command(s) ({})",
+                if self.config.slash_command_guild_id != 0 {
+                    "guild-scoped, instant"
+                } else {
+                    "global, may take up to 1h to appear"
+                }
+            ),
+            Err(e) => warn!("slash command registration failed: {e}"),
+        }
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
@@ -76,22 +154,37 @@ impl EventHandler for Handler {
             tracing::debug!("ignoring message from non-whitelisted user {uid}");
             return;
         }
+
         let cid = msg.channel_id.get();
         let is_dm = msg.guild_id.is_none();
+        let bot_id = self.bot_user_id();
+        let mentioned = bot_id != 0 && msg.mentions.iter().any(|u| u.id.get() == bot_id);
+
+        // Whitelist gate.
+        // - DM:                   require allow_dm.
+        // - Server, in list:      always accept.
+        // - Server, not in list:  accept only if respond_to_mentions
+        //                         AND bot is mentioned. Else drop.
         if is_dm {
-            // DMs always require explicit opt-in: even an empty
-            // channel_ids ("loose mode" for guilds) shouldn't accidentally
-            // open a private side-channel into claude.
             if !self.config.allow_dm {
                 tracing::debug!("ignoring DM (allow_dm=false) from user {uid}");
                 return;
             }
         } else if !self.config.channel_ids.is_empty() && !self.config.channel_ids.contains(&cid) {
-            tracing::debug!("ignoring message in non-whitelisted channel {cid}");
-            return;
+            if !(self.config.respond_to_mentions && mentioned) {
+                tracing::debug!("ignoring message in non-whitelisted channel {cid}");
+                return;
+            }
         }
 
-        let text = msg.content.trim().to_string();
+        // Strip our own mention markers from the prompt — we don't want
+        // claude to see literal "<@1234567890>" garbage when it was
+        // really just the user paging the bot.
+        let text = if bot_id != 0 {
+            strip_bot_mentions(msg.content.trim(), bot_id)
+        } else {
+            msg.content.trim().to_string()
+        };
 
         // Commands: ignore attachments, dispatch by verb.
         if let Some(rest) = text.strip_prefix('!') {
@@ -104,10 +197,36 @@ impl EventHandler for Handler {
             return;
         }
 
-        let session = self
-            .state
-            .resolve_or_bind(cid, &self.config.default_session)
-            .await;
+        // Reply-thread override. If the user replied (Discord UI)
+        // to a previously-relayed assistant message, forward this
+        // turn to that session — does NOT change channel binding.
+        let reply_target_id = msg.message_reference.as_ref().and_then(|r| r.message_id);
+        let replied_session = match reply_target_id {
+            Some(mid) => self.state.lookup_replied_session(mid.get()).await,
+            None => None,
+        };
+        let session = match &replied_session {
+            Some(s) => {
+                tracing::debug!("reply-thread route: msg {} -> session {s}", msg.id.get());
+                s.clone()
+            }
+            None => {
+                self.state
+                    .resolve_or_bind(cid, &self.config.default_session)
+                    .await
+            }
+        };
+
+        // If this is a reply, optionally fetch the quoted text and
+        // prepend it to the prompt as a context header so claude
+        // sees what the user is responding to. Cheap when serenity
+        // populated `referenced_message` inline; falls back to a
+        // single API call.
+        let quote = if reply_target_id.is_some() && self.config.reply_quote_in_prompt {
+            fetch_reply_quote(&ctx, &msg).await
+        } else {
+            None
+        };
 
         let processed = attachments::process(&text, &msg.attachments, msg.id.get()).await;
         if !processed.skipped.is_empty() {
@@ -119,15 +238,17 @@ impl EventHandler for Handler {
             let _ = msg.reply(&ctx.http, note).await;
         }
         if processed.prompt.trim().is_empty() {
-            // All attachments skipped and no text — nothing meaningful to forward.
             return;
         }
-        let prompt = processed.prompt;
+        let prompt = match quote {
+            Some(q) => format!("{}\n{}", format_reply_quote(&q), processed.prompt),
+            None => processed.prompt,
+        };
 
         // Post placeholder REPLY first so we have a message_id to edit
         // when the assistant_message event arrives. Done before
-        // send_input so the user sees acknowledgment even if the broker
-        // takes a while to settle.
+        // send_input so the user sees acknowledgment even if the
+        // broker takes a while to settle.
         let placeholder = match msg.reply(&ctx.http, "💭 working…").await {
             Ok(m) => m,
             Err(e) => {
@@ -137,33 +258,327 @@ impl EventHandler for Handler {
         };
 
         info!(
-            "forwarding to session={} from user={} channel={} chars={} attachments={}",
+            "forwarding to session={} from user={} channel={} chars={} attachments={} reply_route={}",
             session,
             uid,
             cid,
             prompt.chars().count(),
             msg.attachments.len(),
+            msg.message_reference.is_some(),
         );
 
         match self.broker.send_input(&session, &prompt).await {
             Ok(_) => {
+                let typing_cancel = Arc::new(AtomicBool::new(false));
                 let pending = PendingReply {
                     channel_id: placeholder.channel_id.get(),
                     message_id: placeholder.id.get(),
-                    deadline: Instant::now() + PENDING_TTL,
+                    deadline_unix_ms: now_unix_ms()
+                        .saturating_add(PENDING_TTL.as_millis() as u64),
+                    typing_cancel: typing_cancel.clone(),
                 };
                 self.state.push_pending(&session, pending).await;
+                spawn_typing_task(
+                    ctx.http.clone(),
+                    placeholder.channel_id,
+                    typing_cancel,
+                );
             }
             Err(e) => {
                 warn!("forward to {session}: {e:#}");
-                let body = format!("❌ forward to `{session}`: {e}");
-                let _ = placeholder
-                    .channel_id
-                    .edit_message(&ctx.http, placeholder.id, EditMessage::new().content(body))
+                // Switch to react-on-original-message UX: delete our
+                // placeholder, react ❌ on user's msg, post a brief
+                // error reply with the diagnostic so the user can
+                // see why it failed.
+                let _ = placeholder.delete(&ctx.http).await;
+                let _ = msg
+                    .react(&ctx.http, ReactionType::Unicode("❌".into()))
+                    .await;
+                let _ = msg
+                    .reply(&ctx.http, format!("forward to `{session}`: {e}"))
                     .await;
             }
         }
     }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        match interaction {
+            Interaction::Command(cmd) => {
+                slash::handle_command(self, &ctx, &cmd).await;
+            }
+            Interaction::Autocomplete(ac) => {
+                slash::handle_autocomplete(self, &ctx, &ac).await;
+            }
+            Interaction::Component(comp) => {
+                handle_component(self, &ctx, &comp).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn reaction_add(&self, ctx: Context, reaction: Reaction) {
+        if !self.config.react_with_actions {
+            return;
+        }
+        // Reactor must be whitelisted.
+        let user_id = match reaction.user_id {
+            Some(u) => u.get(),
+            None => return,
+        };
+        if !self.config.allowed_user_ids.contains(&user_id) {
+            return;
+        }
+        // Don't react to our own ack reactions (would loop).
+        if user_id == self.bot_user_id() {
+            return;
+        }
+        // Map emoji → broker action.
+        let emoji = match &reaction.emoji {
+            ReactionType::Unicode(s) => s.clone(),
+            _ => return,
+        };
+        let action = match emoji.as_str() {
+            "🛑" | "❌" => ReactAction::Interrupt,
+            "💤" => ReactAction::Hibernate,
+            "🔄" | "🔁" => ReactAction::Restart,
+            _ => return,
+        };
+        // Target message must be one we recorded as a session reply
+        // (we don't dispatch on arbitrary user messages or third-party
+        // bot messages).
+        let session = match self
+            .state
+            .lookup_replied_session(reaction.message_id.get())
+            .await
+        {
+            Some(s) => s,
+            None => return,
+        };
+
+        let result = match action {
+            ReactAction::Interrupt => self.broker.interrupt_session(&session).await,
+            ReactAction::Hibernate => self.broker.hibernate_session(&session).await,
+            ReactAction::Restart => self.broker.restart_session(&session).await,
+        };
+
+        let ack = match (action, &result) {
+            (_, Err(e)) => format!("❌ react `{action}` on `{session}`: {e}"),
+            (ReactAction::Interrupt, Ok(_)) => format!("🛑 interrupted `{session}` (via react)"),
+            (ReactAction::Hibernate, Ok(_)) => {
+                format!("💤 hibernated `{session}` (via react)")
+            }
+            (ReactAction::Restart, Ok(_)) => {
+                format!("🔄 restarted `{session}` (via react, history preserved)")
+            }
+        };
+        // Short ack as a fresh post in the same channel — better
+        // signal than another reaction (no echo loop, visible in
+        // mobile notifications). Falls back silently on failure
+        // since the action itself already happened.
+        if let Err(e) = reaction
+            .channel_id
+            .say(&ctx.http, ack)
+            .await
+        {
+            tracing::debug!("react ack send: {e}");
+        }
+    }
+}
+
+/// Dispatch a Discord component interaction (button click). Today
+/// only the PreToolUse approval buttons are wired here — their
+/// `custom_id` is shaped `tool:allow:<request_id>` or
+/// `tool:deny:<request_id>` so we extract the verb and id, route the
+/// decision to the broker via `BrokerClient::tool_decision`, then
+/// edit the original message to a settled "approved by X" / "denied
+/// by X" line so it's clear from the channel history that the
+/// request is no longer pending.
+async fn handle_component(
+    handler: &Handler,
+    ctx: &Context,
+    comp: &serenity::all::ComponentInteraction,
+) {
+    let user_id = comp.user.id.get();
+    if !handler.config.allowed_user_ids.contains(&user_id) {
+        // Acknowledge silently so Discord doesn't show "this
+        // interaction failed" but don't act on it.
+        let _ = comp
+            .create_response(
+                &ctx.http,
+                serenity::all::CreateInteractionResponse::Acknowledge,
+            )
+            .await;
+        return;
+    }
+
+    let parts: Vec<&str> = comp.data.custom_id.splitn(3, ':').collect();
+    if parts.len() != 3 || parts[0] != "tool" {
+        return;
+    }
+    let allow = match parts[1] {
+        "allow" => true,
+        "deny" => false,
+        _ => return,
+    };
+    let request_id = parts[2].to_string();
+
+    // Note who decided in the reason so claude can attribute
+    // server-side if needed (and so the channel history shows it).
+    let actor = comp.user.name.clone();
+    let reason = if allow {
+        format!("approved by {actor} via Discord")
+    } else {
+        format!("denied by {actor} via Discord")
+    };
+
+    let result = handler
+        .broker
+        .tool_decision(&request_id, allow, &reason)
+        .await;
+
+    // Update the prompt message in place so it doesn't keep the
+    // buttons live for additional clicks.
+    let label = if allow {
+        format!("✅ Approved by {actor}")
+    } else {
+        format!("❌ Denied by {actor}")
+    };
+    let mut new_content = comp.message.content.clone();
+    new_content.push_str(&format!("\n\n— {label}"));
+    let edit = serenity::all::EditMessage::new()
+        .content(new_content)
+        .components(vec![]);
+    let _ = comp
+        .channel_id
+        .edit_message(&ctx.http, comp.message.id, edit)
+        .await;
+
+    // Ack the interaction. If the broker call failed we still ack
+    // (otherwise Discord shows a generic error) but follow up with
+    // a visible reply so the user sees the failure.
+    let _ = comp
+        .create_response(
+            &ctx.http,
+            serenity::all::CreateInteractionResponse::Acknowledge,
+        )
+        .await;
+    if let Err(e) = result {
+        warn!("tool_decision id={request_id}: {e:#}");
+        let _ = comp
+            .channel_id
+            .say(
+                &ctx.http,
+                format!("⚠️ couldn't deliver decision to broker: {e}"),
+            )
+            .await;
+    }
+}
+
+/// Spawn a background task that pokes Discord's "user is typing"
+/// indicator every ~7 s on `channel`. Exits when the cancel flag is
+/// set (the placeholder got edited / deleted) or after ~10 minutes
+/// (matches PENDING_TTL — guard against an orphaned task hanging
+/// around forever if the cancel flag never fires).
+fn spawn_typing_task(
+    http: Arc<serenity::http::Http>,
+    channel: ChannelId,
+    cancel: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        const TICK: Duration = Duration::from_secs(7);
+        let deadline = Instant::now() + PENDING_TTL;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            // Discord's typing indicator visibly lasts ~10 s in the
+            // client — repinging at 7 s keeps it on continuously.
+            let _ = channel.broadcast_typing(&http).await;
+            // Sleep in small increments so cancel propagates fast
+            // (no 7 s residual ghost typing after edit).
+            for _ in 0..14 {
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                tokio::time::sleep(TICK / 14).await;
+            }
+        }
+    });
+}
+
+/// Reply-quote header length cap (chars). Long enough for a useful
+/// excerpt; short enough that the bulk of the prompt is still the
+/// user's actual question.
+const REPLY_QUOTE_MAX_CHARS: usize = 300;
+
+/// Best-effort fetch of the text body of the message a Discord reply
+/// targets. Tries serenity's inline `referenced_message` first (no
+/// API call) and falls back to `channel.message(http, mid)` only if
+/// that's missing. Returns None on missing reference or API failure.
+async fn fetch_reply_quote(ctx: &Context, msg: &Message) -> Option<String> {
+    if let Some(referenced) = msg.referenced_message.as_ref() {
+        let s = referenced.content.trim();
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    let mid = msg.message_reference.as_ref()?.message_id?;
+    match msg.channel_id.message(&ctx.http, mid).await {
+        Ok(m) => {
+            let s = m.content.trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        }
+        Err(e) => {
+            tracing::debug!("fetch reply target {mid}: {e}");
+            None
+        }
+    }
+}
+
+/// Render the quoted body as a single-line `[replying to: "..."]`
+/// header. Newlines collapsed to spaces (avoids the broker having to
+/// split-write a multi-line header on top of the user's payload),
+/// then capped at `REPLY_QUOTE_MAX_CHARS` with an ellipsis.
+fn format_reply_quote(quote: &str) -> String {
+    let single_line: String = quote
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let excerpt: String = if single_line.chars().count() > REPLY_QUOTE_MAX_CHARS {
+        let truncated: String = single_line.chars().take(REPLY_QUOTE_MAX_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        single_line
+    };
+    format!("[replying to: \"{excerpt}\"]")
+}
+
+/// Strip `<@id>` and `<@!id>` mention markers (where id matches our
+/// bot) and the trailing whitespace they leave behind. Returns a
+/// trimmed prompt suitable for forwarding.
+fn strip_bot_mentions(text: &str, bot_id: u64) -> String {
+    let m1 = format!("<@{bot_id}>");
+    let m2 = format!("<@!{bot_id}>");
+    let mut out = text.to_string();
+    while let Some(idx) = out.find(&m1) {
+        out.replace_range(idx..idx + m1.len(), "");
+    }
+    while let Some(idx) = out.find(&m2) {
+        out.replace_range(idx..idx + m2.len(), "");
+    }
+    // Collapse the run of whitespace the strip likely left.
+    let collapsed: String = out
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    collapsed
 }
 
 impl Handler {
@@ -641,7 +1056,39 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_new_args;
+    use super::{parse_new_args, strip_bot_mentions};
+
+    #[test]
+    fn strip_bot_mentions_basic() {
+        assert_eq!(strip_bot_mentions("<@123> hello", 123), "hello");
+        assert_eq!(strip_bot_mentions("<@!123> hello", 123), "hello");
+        assert_eq!(strip_bot_mentions("hi <@123> there", 123), "hi there");
+        assert_eq!(strip_bot_mentions("plain text", 123), "plain text");
+        // Mentions for OTHER ids are left alone.
+        assert_eq!(strip_bot_mentions("<@999> ignore me", 123), "<@999> ignore me");
+    }
+
+    #[test]
+    fn reply_quote_short() {
+        let q = super::format_reply_quote("hello world");
+        assert_eq!(q, "[replying to: \"hello world\"]");
+    }
+
+    #[test]
+    fn reply_quote_collapses_newlines() {
+        let q = super::format_reply_quote("line one\nline two\n  line three");
+        assert_eq!(q, "[replying to: \"line one line two line three\"]");
+    }
+
+    #[test]
+    fn reply_quote_truncates_long() {
+        let long: String = "x".repeat(500);
+        let q = super::format_reply_quote(&long);
+        let inside = q.trim_start_matches("[replying to: \"").trim_end_matches("\"]");
+        // Should be 300 chars + the ellipsis.
+        assert_eq!(inside.chars().count(), super::REPLY_QUOTE_MAX_CHARS + 1);
+        assert!(inside.ends_with('…'));
+    }
 
     #[test]
     fn empty_arg() {

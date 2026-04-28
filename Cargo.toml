@@ -6,6 +6,7 @@ members = [
     "crates/claude-attach",
     "crates/hook-stop",
     "crates/hook-notification",
+    "crates/hook-pretool",
     "crates/platform-discord",
     "crates/agentmux-cli",
 ]

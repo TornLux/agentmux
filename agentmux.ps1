@@ -58,20 +58,24 @@ function Require-Binary([string]$path, [string]$label) {
 }
 
 function Test-HooksInstalled {
-    # Returns $true iff Claude Code's settings.json has both a Stop hook
-    # whose command references hook-stop.exe and a Notification hook
-    # referencing hook-notification.exe. Match is by basename (case-
-    # insensitive) so it stays robust to slash-shape and path-move
-    # changes; install-hooks.ps1 handles re-canonicalisation if asked.
+    # Returns $true iff Claude Code's settings.json has all three
+    # agentmux hook entries (Stop, Notification, PreToolUse) wired
+    # to their respective exes. Match is by basename (case-insensitive)
+    # so it stays robust to slash-shape and path-move changes;
+    # install-hooks.ps1 handles re-canonicalisation if asked.
     if (-not (Test-Path $hooksCfg)) { return $false }
     try {
         $raw = Get-Content -LiteralPath $hooksCfg -Raw -ErrorAction Stop
         if (-not $raw -or $raw.Trim().Length -eq 0) { return $false }
         $json = $raw | ConvertFrom-Json
         if (-not $json.hooks) { return $false }
-        $found = @{ Stop = $false; Notification = $false }
-        $needles = @{ Stop = "hook-stop.exe"; Notification = "hook-notification.exe" }
-        foreach ($evt in @("Stop", "Notification")) {
+        $found = @{ Stop = $false; Notification = $false; PreToolUse = $false }
+        $needles = @{
+            Stop         = "hook-stop.exe"
+            Notification = "hook-notification.exe"
+            PreToolUse   = "hook-pretool.exe"
+        }
+        foreach ($evt in @("Stop", "Notification", "PreToolUse")) {
             $groups = $json.hooks.$evt
             if (-not $groups) { continue }
             foreach ($g in @($groups)) {
@@ -85,7 +89,7 @@ function Test-HooksInstalled {
                 }
             }
         }
-        return ($found.Stop -and $found.Notification)
+        return ($found.Stop -and $found.Notification -and $found.PreToolUse)
     } catch {
         return $false
     }

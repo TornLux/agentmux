@@ -163,6 +163,36 @@ fn check_discord(path: &Path, had_failure: &mut bool) -> Result<()> {
         println!("✓ notify_on_idle = false (idle pings dropped, permission prompts still pass)");
     }
 
+    let respond_to_mentions = doc
+        .get("respond_to_mentions")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if respond_to_mentions {
+        println!("✓ respond_to_mentions = true (@mention bypasses channel whitelist)");
+    } else {
+        println!("✓ respond_to_mentions = false (channel whitelist enforced strictly)");
+    }
+
+    let guild_id = doc
+        .get("slash_command_guild_id")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0);
+    if guild_id > 0 {
+        println!("✓ slash_command_guild_id = {guild_id} (instant per-guild registration)");
+    } else {
+        println!("✓ slash_command_guild_id = 0 (global registration, ~1h propagation)");
+    }
+
+    let reply_quote = doc
+        .get("reply_quote_in_prompt")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if reply_quote {
+        println!("✓ reply_quote_in_prompt = true (Discord replies prepend quoted text)");
+    } else {
+        println!("✓ reply_quote_in_prompt = false (replies forwarded as-is)");
+    }
+
     let default_session = doc
         .get("default_session")
         .and_then(|v| v.as_str())
@@ -194,9 +224,10 @@ fn check_hooks(path: &Path, had_failure: &mut bool) -> Result<()> {
     let hooks = doc.get("hooks");
     let mut found_stop = false;
     let mut found_notif = false;
+    let mut found_pretool = false;
 
     if let Some(events) = hooks.and_then(|h| h.as_object()) {
-        for kind in ["Stop", "Notification"] {
+        for kind in ["Stop", "Notification", "PreToolUse"] {
             let entries = events.get(kind).and_then(|v| v.as_array());
             let entries = match entries {
                 Some(e) => e,
@@ -220,6 +251,7 @@ fn check_hooks(path: &Path, had_failure: &mut bool) -> Result<()> {
                         match kind {
                             "Stop" => found_stop = true,
                             "Notification" => found_notif = true,
+                            "PreToolUse" => found_pretool = true,
                             _ => {}
                         }
                     }
@@ -233,6 +265,9 @@ fn check_hooks(path: &Path, had_failure: &mut bool) -> Result<()> {
     }
     if !found_notif {
         println!("⚠ no Notification hook entry — auto-resume readiness wait won't see the ready signal");
+    }
+    if !found_pretool {
+        println!("ℹ no PreToolUse hook entry — tool-use approval flow disabled (claude runs all tools without ask)");
     }
     Ok(())
 }

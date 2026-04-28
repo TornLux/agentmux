@@ -30,8 +30,9 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $hookStop         = Join-Path $root "target\release\hook-stop.exe"
 $hookNotification = Join-Path $root "target\release\hook-notification.exe"
+$hookPreTool      = Join-Path $root "target\release\hook-pretool.exe"
 
-if (-not (Test-Path $hookStop) -or -not (Test-Path $hookNotification)) {
+if (-not (Test-Path $hookStop) -or -not (Test-Path $hookNotification) -or -not (Test-Path $hookPreTool)) {
     throw "Hook binaries missing. Run: cargo build --release"
 }
 # Forward slashes — Claude Code on Windows runs hook commands via
@@ -40,6 +41,7 @@ if (-not (Test-Path $hookStop) -or -not (Test-Path $hookNotification)) {
 # launching but survive bash unscathed.
 $hookStop         = ((Resolve-Path -LiteralPath $hookStop).Path        -replace '\\', '/')
 $hookNotification = ((Resolve-Path -LiteralPath $hookNotification).Path -replace '\\', '/')
+$hookPreTool      = ((Resolve-Path -LiteralPath $hookPreTool).Path     -replace '\\', '/')
 
 function ConvertTo-OrderedHashtable {
     param($obj)
@@ -167,6 +169,7 @@ $hooks = $settings["hooks"]
 $pairs = @(
     @{ Event = "Stop";         Exe = $hookStop }
     @{ Event = "Notification"; Exe = $hookNotification }
+    @{ Event = "PreToolUse";   Exe = $hookPreTool }
 )
 
 $changed = $false

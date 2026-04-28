@@ -107,3 +107,49 @@ pub fn post_json(url: &str, body: &str) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// POST + return body as String, with caller-supplied I/O timeout.
+/// Used by long-poll endpoints (PreToolUse approval) where the
+/// server may take minutes to respond. `timeout` applies to BOTH
+/// read and write deadlines on the socket; connect timeout stays at
+/// the module default.
+pub fn post_json_with_response(url: &str, body: &str, timeout: Duration) -> io::Result<String> {
+    let (host_port, path) = split_url(url)?;
+    let mut stream = connect(host_port)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+
+    let req = format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: {host_port}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        len = body.len(),
+    );
+    stream.write_all(req.as_bytes())?;
+    stream.flush()?;
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+
+    let s = std::str::from_utf8(&buf)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 response"))?;
+    let body_start = s
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no header/body separator"))?;
+    let head = &s[..body_start - 4];
+    if !head.starts_with("HTTP/1.1 2") && !head.starts_with("HTTP/1.0 2") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "non-2xx response: {}",
+                head.lines().next().unwrap_or("(empty)")
+            ),
+        ));
+    }
+    Ok(s[body_start..].to_string())
+}
