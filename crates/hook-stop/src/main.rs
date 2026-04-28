@@ -89,61 +89,49 @@ fn is_local_viewer_attached(broker_url: &str, session_id: &str) -> bool {
 }
 
 /// Waits for claude's transcript to finish flushing the latest
-/// assistant turn before extracting its text. Stop hook timing is
-/// racy: claude fires Stop the moment a turn completes, but the
-/// transcript line for that turn may still be in claude's stdio
-/// buffer and not yet on disk. Rather than a blind sleep (which is
-/// arbitrary — fragile on slow disks, wasteful on fast ones) we
-/// observe whether the file is *still being written* and wait only
-/// while it is.
+/// assistant turn before extracting its text.
+///
+/// Stop hook timing is racy: claude fires Stop the moment a turn
+/// completes, but the transcript line for that turn may still be in
+/// claude's stdio buffer and not yet on disk. We can NOT short-circuit
+/// on "file already has assistant text" — from turn 2 onward the file
+/// always has the *previous* turn's text, so an early read leaks stale
+/// content one turn behind the actual answer.
 ///
 /// Strategy:
-///   * Read immediately. If non-empty body, return it (zero-cost
-///     common path).
-///   * Otherwise poll every 50ms. Track file size — if it grows,
-///     claude is still flushing; keep waiting.
-///   * If the file has been stable for `STABLE_FOR` AND we still
-///     have no content, give up early (this turn had no text — e.g.
-///     pure tool-use). No point waiting the full deadline.
-///   * Hard cap at `MAX_WAIT` regardless. Hooks have a 60 s default
-///     timeout, but we don't want to slow claude needlessly.
+///   * Poll size every 50ms. Whenever the file grows, reset a
+///     "stability" timer.
+///   * Once the file has been unchanged for `STABLE_FOR`, the flush
+///     for this turn is done; read once and return.
+///   * Hard cap at `MAX_WAIT` so a stuck flush never blocks claude
+///     past the hook's own timeout.
+///
+/// Cost: every Stop adds ~`STABLE_FOR` of latency. That's tiny next to
+/// claude's per-turn time and is the price of correctness.
 fn wait_for_assistant_text(path: &str) -> String {
     use std::time::{Duration, Instant};
     const POLL_INTERVAL: Duration = Duration::from_millis(50);
     const STABLE_FOR: Duration = Duration::from_millis(300);
-    const MAX_WAIT: Duration = Duration::from_secs(2);
+    const MAX_WAIT: Duration = Duration::from_secs(3);
 
     let file_size = |p: &str| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
 
-    let body = read_last_assistant_text(path).unwrap_or_default();
-    if !body.is_empty() {
-        return body;
-    }
-
-    let deadline = Instant::now() + MAX_WAIT;
+    let start = Instant::now();
     let mut last_size = file_size(path);
-    let mut last_growth = Instant::now();
+    let mut last_change = start;
 
     loop {
-        let now = Instant::now();
-        if now > deadline {
-            return read_last_assistant_text(path).unwrap_or_default();
-        }
         std::thread::sleep(POLL_INTERVAL);
-
-        let body = read_last_assistant_text(path).unwrap_or_default();
-        if !body.is_empty() {
-            return body;
-        }
-
+        let now = Instant::now();
         let size = file_size(path);
         if size != last_size {
             last_size = size;
-            last_growth = Instant::now();
-            continue;
+            last_change = now;
         }
-        if now - last_growth > STABLE_FOR {
-            return String::new();
+        let stable = now.duration_since(last_change) >= STABLE_FOR;
+        let timed_out = now.duration_since(start) >= MAX_WAIT;
+        if stable || timed_out {
+            return read_last_assistant_text(path).unwrap_or_default();
         }
     }
 }
