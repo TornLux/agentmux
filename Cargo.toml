@@ -6,6 +6,7 @@ members = [
     "crates/claude-attach",
     "crates/hook-stop",
     "crates/hook-notification",
+    "crates/platform-discord",
 ]
 
 [workspace.package]

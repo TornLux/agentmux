@@ -15,8 +15,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
@@ -106,7 +108,15 @@ struct AppState {
     events: Arc<EventsLog>,
     default_cwd: PathBuf,
     config: Arc<Config>,
+    /// Fan-out channel for hook events. `http_event` publishes after
+    /// annotating; `/ws` subscribers receive a JSON line per event.
+    /// Capacity is per-subscriber — laggy bots get a `Lagged` error
+    /// and we just log it (PLAN §4.1: missing intermediate events is
+    /// acceptable; bots resync on next event).
+    event_bus: broadcast::Sender<serde_json::Value>,
 }
+
+const EVENT_BUS_CAP: usize = 256;
 
 /// Owns the broker.pid file so it gets cleaned up when main returns.
 /// Drop won't fire on SIGKILL / panic, but start-broker.ps1 detects
@@ -238,12 +248,14 @@ async fn main() -> Result<()> {
     }
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let (event_bus, _) = broadcast::channel::<serde_json::Value>(EVENT_BUS_CAP);
     let app_state = AppState {
         manager: manager.clone(),
         shutdown_tx: shutdown_tx.clone(),
         events,
         default_cwd: cwd,
         config: config.clone(),
+        event_bus,
     };
 
     // Idle hibernate scanner. Disabled at 0; otherwise wakes every
@@ -308,8 +320,11 @@ async fn run_http_server(app_state: AppState) {
         .route("/sessions/:key/interrupt", post(http_interrupt))
         .route("/sessions/:key/restart", post(http_restart))
         .route("/sessions/:key/hibernate", post(http_hibernate))
+        .route("/sessions/:key/input", post(http_input))
+        .route("/sessions/:key/ring", get(http_ring_snapshot))
         .route("/shutdown", post(http_shutdown))
         .route("/event", post(http_event))
+        .route("/ws", get(http_ws_upgrade))
         .with_state(app_state);
 
     let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -684,7 +699,7 @@ async fn http_shutdown(State(s): State<AppState>) -> &'static str {
 
 async fn http_event(
     State(s): State<AppState>,
-    Json(event): Json<serde_json::Value>,
+    Json(mut event): Json<serde_json::Value>,
 ) -> &'static str {
     let kind = event
         .get("type")
@@ -712,9 +727,82 @@ async fn http_event(
         }
     }
 
+    // Annotate session_name so WS subscribers don't need a second
+    // round-trip to /sessions/<id> to resolve the human label.
+    if let Some(sid) = event.get("session_id").and_then(|v| v.as_str()) {
+        if let Some(sess) = s.manager.get_by_id_or_name(sid) {
+            if let Some(obj) = event.as_object_mut() {
+                obj.entry("session_name")
+                    .or_insert_with(|| serde_json::json!(sess.name));
+            }
+        }
+    }
+
+    // Tee to WS subscribers before persisting — broadcast::send returns
+    // Err only when there are zero receivers, which is fine.
+    let _ = s.event_bus.send(event.clone());
+
     s.events.append(event);
     info!("event recorded: {kind}");
     "ok"
+}
+
+/// Waits until claude's PTY output settles into a "TUI fully drawn"
+/// state. The signal: the ring buffer has accumulated enough bytes to
+/// rule out an early-init sliver (so we don't return on the first
+/// silent gap during transcript loading) and *then* stays unchanged
+/// for long enough to span claude's normal init pauses.
+///
+/// Thresholds were tuned against `claude --resume` on Win11 + Rust
+/// release build:
+///   * MIN_OUTPUT 500 — a bare-minimum draw is ~7 KB; 500 is enough
+///     to rule out the first sub-1 KB stall
+///   * STABLE 1500 ms — observed init gaps ran up to ~1 s, so 1.5 s
+///     of quiet means the input box is mounted
+///   * MAX_WAIT 10 s — fallback so a stuck claude doesn't hang IM
+async fn wait_until_claude_ready(session: &Arc<session::Session>) -> String {
+    const POLL: Duration = Duration::from_millis(100);
+    const STABLE: Duration = Duration::from_millis(1500);
+    const MIN_OUTPUT: usize = 500;
+    const MAX_WAIT: Duration = Duration::from_secs(10);
+
+    let start = std::time::Instant::now();
+    let mut last_size: usize = session.pty_out.ring.lock().unwrap().len();
+    let mut last_change = start;
+
+    loop {
+        tokio::time::sleep(POLL).await;
+        let now = std::time::Instant::now();
+        let size = session.pty_out.ring.lock().unwrap().len();
+        if size != last_size {
+            last_size = size;
+            last_change = now;
+        }
+        let stable_for = now.duration_since(last_change);
+        let elapsed = now.duration_since(start);
+        if size >= MIN_OUTPUT && stable_for >= STABLE {
+            return format!("ring stable: {size} bytes after {elapsed:?}");
+        }
+        if elapsed >= MAX_WAIT {
+            return format!("max wait reached: {size} bytes after {elapsed:?}");
+        }
+    }
+}
+
+/// Diagnostic: returns the session's ring buffer snapshot as raw bytes.
+/// Pipe through `od -c` / `xxd` to see exactly what claude is rendering
+/// — useful when tracking down "input goes in but doesn't submit"
+/// style bugs without firing up a viewer.
+async fn http_ring_snapshot(
+    Path(key): Path<String>,
+    State(s): State<AppState>,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    let session = s
+        .manager
+        .get_by_id_or_name(&key)
+        .ok_or((StatusCode::NOT_FOUND, format!("session not found: {key}")))?;
+    let snap = session.pty_out.ring.lock().unwrap().snapshot();
+    Ok(snap)
 }
 
 /// Pulls the UUID-shaped basename out of a Claude Code transcript
@@ -723,4 +811,120 @@ async fn http_event(
 fn extract_claude_session_id(transcript_path: &str) -> Option<String> {
     let stem = StdPath::new(transcript_path).file_stem()?.to_str()?;
     uuid::Uuid::parse_str(stem).ok().map(|_| stem.to_string())
+}
+
+#[derive(Deserialize)]
+struct InputBody {
+    text: String,
+    /// When true (default) a `\r` byte is appended so claude treats the
+    /// text as a submitted prompt. Set false if the caller is feeding
+    /// keystrokes mid-line and wants to control the Enter explicitly.
+    #[serde(default = "default_append_enter")]
+    append_enter: bool,
+}
+
+fn default_append_enter() -> bool {
+    true
+}
+
+/// Inject text into a session's PTY stdin — the IM-side counterpart of
+/// the named-pipe input path used by claude-attach. Hibernated/Crashed
+/// sessions are auto-resumed first so a stale Discord channel binding
+/// doesn't silently swallow input on a session that fell asleep.
+async fn http_input(
+    Path(key): Path<String>,
+    State(s): State<AppState>,
+    Json(body): Json<InputBody>,
+) -> Result<&'static str, (StatusCode, String)> {
+    let session = s
+        .manager
+        .get_by_id_or_name(&key)
+        .ok_or((StatusCode::NOT_FOUND, format!("session not found: {key}")))?;
+
+    info!(
+        "/input session={} text_chars={} append_enter={} state={:?}",
+        session.name,
+        body.text.chars().count(),
+        body.append_enter,
+        session.state()
+    );
+
+    if matches!(
+        session.state(),
+        SessionState::Hibernated | SessionState::Crashed
+    ) {
+        let to_resume = session.clone();
+        tokio::task::spawn_blocking(move || to_resume.resume())
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("resume: {e}")))?;
+
+        let why = wait_until_claude_ready(&session).await;
+        info!("/input post-resume readiness: {why}");
+    }
+
+    // With claude fully Idle, the simplest write works: text + \r
+    // as one buffer, the same shape the original successful turns
+    // saw before any auto-resume race existed.
+    let mut bytes = body.text.into_bytes();
+    let has_text = !bytes.is_empty();
+    if body.append_enter {
+        bytes.push(b'\r');
+    }
+    if !bytes.is_empty() {
+        session.write_to_pty(&bytes);
+        info!("/input wrote {} bytes (text={} append_enter={})", bytes.len(), has_text, body.append_enter);
+    }
+    Ok("ok")
+}
+
+/// Upgrade the connection to a WebSocket and stream every annotated
+/// hook event published on `event_bus` to the subscriber as a JSON line.
+/// Inbound frames are currently ignored (subscription filters can be
+/// added when a second IM platform arrives).
+async fn http_ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(s): State<AppState>,
+) -> impl IntoResponse {
+    let rx = s.event_bus.subscribe();
+    ws.on_upgrade(move |socket| handle_ws_socket(socket, rx))
+}
+
+async fn handle_ws_socket(
+    mut socket: WebSocket,
+    mut rx: broadcast::Receiver<serde_json::Value>,
+) {
+    info!("ws subscriber connected");
+    loop {
+        tokio::select! {
+            inbound = socket.recv() => {
+                match inbound {
+                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {
+                        // Reserved for future {"type":"subscribe", ...}
+                        // and bot→broker control messages.
+                    }
+                }
+            }
+            ev = rx.recv() => match ev {
+                Ok(v) => {
+                    let line = match serde_json::to_string(&v) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("ws: serialise event: {e}");
+                            continue;
+                        }
+                    };
+                    if socket.send(WsMessage::Text(line)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("ws subscriber lagged: dropped {n} events");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+        }
+    }
+    info!("ws subscriber disconnected");
 }
