@@ -1,4 +1,8 @@
-# Start the agentmux broker as a detached background process.
+# Start the agentmux broker.
+#
+# Default mode: detached background process (Start-Process). Use
+# -Foreground to invoke broker.exe directly, blocking the current
+# shell — useful for debugging since logs and panics appear inline.
 #
 # Singleton via %LOCALAPPDATA%\agentmux\broker.pid: a live PID owned by
 # a process named `broker` blocks the launch; a dead/foreign PID is
@@ -12,16 +16,21 @@
 
 [CmdletBinding()]
 param(
-    [string]$WorkingDirectory = (Get-Location).Path
+    [string]$WorkingDirectory = (Get-Location).Path,
+    [switch]$Foreground
 )
 
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$exe  = Join-Path $root "target\release\broker.exe"
-
-if (-not (Test-Path $exe)) {
-    throw "broker.exe not found at $exe. Run: cargo build --release"
+# Release zips lay binaries in bin/; cargo builds in target/release/.
+$candidates = @(
+    (Join-Path $root "bin\broker.exe"),
+    (Join-Path $root "target\release\broker.exe")
+)
+$exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $exe) {
+    throw "broker.exe not found in $($candidates -join ' or '). Build with: cargo build --release"
 }
 
 if (-not (Test-Path $WorkingDirectory)) {
@@ -48,11 +57,27 @@ if (Test-Path -LiteralPath $pidFile) {
     }
 }
 
-# tracing-appender writes to %LOCALAPPDATA%\agentmux\logs\broker.YYYY-MM-DD.log
-# directly. Keep stderr redirected for early-startup eprintln! / panics.
-$err = Join-Path $dataDir "broker.stderr.log"
-
 if (-not $env:RUST_LOG) { $env:RUST_LOG = "info" }
+
+if ($Foreground) {
+    Write-Host "broker running in foreground (Ctrl+C to stop)"
+    Write-Host "  exe:    $exe"
+    Write-Host "  cwd:    $WorkingDirectory"
+    Write-Host "  logs:   $(Join-Path $dataDir 'logs')"
+    Write-Host ""
+    Push-Location $WorkingDirectory
+    try {
+        & $exe --cwd $WorkingDirectory
+    } finally {
+        Pop-Location
+    }
+    return
+}
+
+# Background mode. tracing-appender writes daily-rolling files into
+# %LOCALAPPDATA%\agentmux\logs\broker.YYYY-MM-DD.log directly; we keep
+# stderr captured so early-startup eprintln! / panics still surface.
+$err = Join-Path $dataDir "broker.stderr.log"
 
 $p = Start-Process -FilePath $exe `
     -ArgumentList @("--cwd", $WorkingDirectory) `

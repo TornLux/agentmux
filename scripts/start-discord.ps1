@@ -13,10 +13,14 @@ param(
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$exe  = Join-Path $root "target\release\platform-discord.exe"
-
-if (-not (Test-Path $exe)) {
-    throw "platform-discord.exe not found at $exe. Run: cargo build --release"
+# Release zips lay binaries in bin/; cargo builds in target/release/.
+$candidates = @(
+    (Join-Path $root "bin\platform-discord.exe"),
+    (Join-Path $root "target\release\platform-discord.exe")
+)
+$exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $exe) {
+    throw "platform-discord.exe not found in $($candidates -join ' or '). Build with: cargo build --release"
 }
 
 $dataDir = Join-Path $env:LOCALAPPDATA "agentmux"

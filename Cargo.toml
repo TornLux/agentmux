@@ -7,6 +7,7 @@ members = [
     "crates/hook-stop",
     "crates/hook-notification",
     "crates/platform-discord",
+    "crates/agentmux-cli",
 ]
 
 [workspace.package]
