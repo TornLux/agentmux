@@ -53,9 +53,10 @@ token_env = "DISCORD_BOT_TOKEN"
 broker_http_url = "http://127.0.0.1:8765"
 broker_ws_url   = "ws://127.0.0.1:8765/ws"
 
-# Discord channel IDs the bot listens in. Empty = all channels the
-# bot can see (DM-friendly but loose). Right-click a channel with
-# Developer Mode on → Copy ID.
+# Discord channel IDs the bot listens in (server channels only).
+# Empty = listen in any server channel the bot can see.
+# DMs are governed by `allow_dm` below, NOT by this list.
+# Right-click a channel with Developer Mode on -> Copy ID.
 channel_ids = [
     # 123456789012345678,
 ]
@@ -74,6 +75,17 @@ default_session = "default"
 # Discord caps a single message at 2000 chars; the bot splits at this
 # threshold to leave a small margin for decorators (`**[name]**` etc).
 max_message_chars = 1900
+
+# Accept messages in 1:1 DM channels with whitelisted users? When false
+# (default) the bot only reads from server channels. Flip to true for
+# solo / mobile use without a guild.
+allow_dm = false
+
+# Forward Claude Code's idle "waiting for your input" pings? Off by
+# default (they fire ~60s after every reply and most users find them
+# noisy). Permission prompts and other Notification messages always
+# pass through regardless.
+notify_on_idle = false
 '@
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

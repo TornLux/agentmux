@@ -1,4 +1,4 @@
-# agentmux unified entrypoint.
+﻿# agentmux unified entrypoint.
 #
 # Wraps the individual scripts under scripts/ and the agentmux-cli helper
 # binary into a single CLI. Run `.\agentmux help` for the verb list.
@@ -13,6 +13,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Force UTF-8 console I/O so glyphs (✓, ─, …) render correctly on systems
+# whose OEM code page is not 65001 (e.g. CP936 on zh-CN Windows).
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+    $OutputEncoding           = [System.Text.Encoding]::UTF8
+} catch {}
 
 # --- paths --------------------------------------------------------------
 
@@ -46,6 +54,40 @@ function Require-Binary([string]$path, [string]$label) {
         Write-Host "✗ $label not found at $path" -ForegroundColor Red
         Write-Host "  Run: cargo build --release   (or download a release zip)" -ForegroundColor Yellow
         exit 1
+    }
+}
+
+function Test-HooksInstalled {
+    # Returns $true iff Claude Code's settings.json has both a Stop hook
+    # whose command references hook-stop.exe and a Notification hook
+    # referencing hook-notification.exe. Match is by basename (case-
+    # insensitive) so it stays robust to slash-shape and path-move
+    # changes; install-hooks.ps1 handles re-canonicalisation if asked.
+    if (-not (Test-Path $hooksCfg)) { return $false }
+    try {
+        $raw = Get-Content -LiteralPath $hooksCfg -Raw -ErrorAction Stop
+        if (-not $raw -or $raw.Trim().Length -eq 0) { return $false }
+        $json = $raw | ConvertFrom-Json
+        if (-not $json.hooks) { return $false }
+        $found = @{ Stop = $false; Notification = $false }
+        $needles = @{ Stop = "hook-stop.exe"; Notification = "hook-notification.exe" }
+        foreach ($evt in @("Stop", "Notification")) {
+            $groups = $json.hooks.$evt
+            if (-not $groups) { continue }
+            foreach ($g in @($groups)) {
+                $entries = $g.hooks
+                if (-not $entries) { continue }
+                foreach ($h in @($entries)) {
+                    if ($h.type -ne "command" -or -not $h.command) { continue }
+                    if ($h.command.ToLowerInvariant().Contains($needles[$evt])) {
+                        $found[$evt] = $true
+                    }
+                }
+            }
+        }
+        return ($found.Stop -and $found.Notification)
+    } catch {
+        return $false
     }
 }
 
@@ -311,11 +353,19 @@ function Cmd-Init([string[]]$Argv) {
 
     # 2 — hooks
     Write-Host "[2/5] Claude Code hooks" -ForegroundColor Cyan
-    Write-Host "  Hooks let agentmux receive 'turn complete' events. Without them,"
-    Write-Host "  Discord won't get replies and auto-resume can't detect 'ready'."
-    $ans = Read-Host "  Install hooks now? [Y/n]"
-    if ($ans -ne "n" -and $ans -ne "N") {
-        & (Join-Path $scriptsDir "install-hooks.ps1")
+    if (Test-HooksInstalled) {
+        Write-Host "  ✓ Stop and Notification hooks already installed in $hooksCfg"
+        $ans = Read-Host "  Reinstall (e.g. after moving the agentmux folder)? [y/N]"
+        if ($ans -eq "y" -or $ans -eq "Y") {
+            & (Join-Path $scriptsDir "install-hooks.ps1")
+        }
+    } else {
+        Write-Host "  Hooks let agentmux receive 'turn complete' events. Without them,"
+        Write-Host "  Discord won't get replies and auto-resume can't detect 'ready'."
+        $ans = Read-Host "  Install hooks now? [Y/n]"
+        if ($ans -ne "n" -and $ans -ne "N") {
+            & (Join-Path $scriptsDir "install-hooks.ps1")
+        }
     }
     Write-Host ""
 
@@ -333,7 +383,20 @@ function Cmd-Init([string[]]$Argv) {
 
     # 4 — discord (optional)
     Write-Host "[4/5] Discord IM bridge (optional)" -ForegroundColor Cyan
-    $ans = Read-Host "  Set up Discord? [y/N]"
+    $hasDiscordCfg   = Test-Path $discordCfg
+    $hasDiscordToken = [bool][Environment]::GetEnvironmentVariable("DISCORD_BOT_TOKEN", "User")
+    if ($hasDiscordCfg -and $hasDiscordToken) {
+        Write-Host "  ✓ already configured (discord.toml present, DISCORD_BOT_TOKEN set)"
+        $ans = Read-Host "  Reconfigure? [y/N]"
+    } elseif ($hasDiscordCfg -or $hasDiscordToken) {
+        $what = if ($hasDiscordCfg) { "discord.toml present but DISCORD_BOT_TOKEN missing" } `
+                else                { "DISCORD_BOT_TOKEN set but discord.toml missing" }
+        Write-Host "  ⚠ partial setup detected: $what" -ForegroundColor Yellow
+        $ans = Read-Host "  Finish setup? [Y/n]"
+        if ($ans -eq "" -or $ans -eq "y" -or $ans -eq "Y") { $ans = "y" }
+    } else {
+        $ans = Read-Host "  Set up Discord? [y/N]"
+    }
     if ($ans -eq "y" -or $ans -eq "Y") {
         Cmd-DiscordSetup
     } else {

@@ -70,6 +70,14 @@ $content = @'
 # Override directory for daily-rolling broker logs (kept 7 days).
 # Empty = default %LOCALAPPDATA%\agentmux\logs.
 # log_dir = ""
+
+# Default value of `auto_resume` on newly-created sessions when the
+# create request doesn't pass one explicitly. false = sessions are
+# ephemeral by default (forgotten on broker restart); true = always
+# restored. Per-session `auto_resume` (set at create time or via
+# the `/sessions/:k/persist` endpoint, e.g. Discord `!persist on`)
+# always wins over this default.
+# auto_resume_default = false
 '@
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

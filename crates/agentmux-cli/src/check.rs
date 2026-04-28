@@ -97,6 +97,15 @@ fn check_broker(path: &Path, had_failure: &mut bool) -> Result<()> {
             println!("✓ ring_cap_bytes = {n}");
         }
     }
+    let auto_resume_default = doc
+        .get("auto_resume_default")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if auto_resume_default {
+        println!("✓ auto_resume_default = true (new sessions persist by default)");
+    } else {
+        println!("✓ auto_resume_default = false (new sessions are ephemeral by default)");
+    }
     Ok(())
 }
 
@@ -131,7 +140,27 @@ fn check_discord(path: &Path, had_failure: &mut bool) -> Result<()> {
     let channels = doc.get("channel_ids").and_then(|v| v.as_array());
     match channels {
         Some(arr) if !arr.is_empty() => println!("✓ channel_ids: {} channel(s)", arr.len()),
-        _ => println!("⚠ channel_ids is empty — bot will listen in every visible channel"),
+        _ => println!("⚠ channel_ids is empty — bot will listen in every visible server channel"),
+    }
+
+    let allow_dm = doc
+        .get("allow_dm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if allow_dm {
+        println!("✓ allow_dm = true (1:1 DMs from whitelisted users accepted)");
+    } else {
+        println!("✓ allow_dm = false (DMs ignored)");
+    }
+
+    let notify_on_idle = doc
+        .get("notify_on_idle")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if notify_on_idle {
+        println!("✓ notify_on_idle = true (idle pings forwarded)");
+    } else {
+        println!("✓ notify_on_idle = false (idle pings dropped, permission prompts still pass)");
     }
 
     let default_session = doc

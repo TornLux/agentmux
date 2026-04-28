@@ -88,20 +88,44 @@ impl BrokerClient {
         Ok(())
     }
 
-    pub async fn create_session(&self, name: &str, cwd: Option<&str>) -> Result<()> {
+    /// Create a session. `auto_resume = None` lets the broker fall
+    /// through to its `auto_resume_default` policy (intended path for
+    /// general use); `Some(bool)` forces a per-session value.
+    pub async fn create_session(
+        &self,
+        name: &str,
+        cwd: Option<&str>,
+        auto_resume: Option<bool>,
+    ) -> Result<()> {
         let url = format!("{}/sessions", self.base_http);
-        let body = match cwd {
-            Some(c) => json!({ "name": name, "cwd": c }),
-            None => json!({ "name": name }),
-        };
+        let mut body = serde_json::Map::new();
+        body.insert("name".into(), json!(name));
+        if let Some(c) = cwd {
+            body.insert("cwd".into(), json!(c));
+        }
+        if let Some(ar) = auto_resume {
+            body.insert("auto_resume".into(), json!(ar));
+        }
         let resp = self
             .http
             .post(&url)
-            .json(&body)
+            .json(&serde_json::Value::Object(body))
             .send()
             .await
             .with_context(|| format!("POST {url}"))?;
         check_ok(resp, "/sessions").await
+    }
+
+    pub async fn set_persist(&self, name: &str, on: bool) -> Result<()> {
+        let url = format!("{}/sessions/{}/persist", self.base_http, name);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&json!({ "auto_resume": on }))
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        check_ok(resp, "persist").await
     }
 
     pub async fn delete_session(&self, name: &str) -> Result<()> {
@@ -113,6 +137,27 @@ impl BrokerClient {
             .await
             .with_context(|| format!("DELETE {url}"))?;
         check_ok(resp, "DELETE /sessions/:k").await
+    }
+
+    /// Fetch the raw PTY ringbuffer snapshot for a session. The bytes
+    /// include ANSI escape sequences and TUI redraw artefacts; callers
+    /// rendering for humans must strip those (see `ansi::strip` in the
+    /// handler).
+    pub async fn get_ring(&self, name: &str) -> Result<Vec<u8>> {
+        let url = format!("{}/sessions/{}/ring", self.base_http, name);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("/ring → {status}: {text}");
+        }
+        let bytes = resp.bytes().await.context("read /ring body")?.to_vec();
+        Ok(bytes)
     }
 
     pub async fn interrupt_session(&self, name: &str) -> Result<()> {

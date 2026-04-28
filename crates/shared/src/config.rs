@@ -39,6 +39,12 @@ pub struct Config {
     /// Override directory for broker logs (one file per day, kept 7
     /// days). Empty = default `%LOCALAPPDATA%\agentmux\logs`.
     pub log_dir: String,
+    /// Default value of `auto_resume` on newly-created sessions when
+    /// the create request doesn't specify one. Per-session value still
+    /// wins; this only changes the default for unspecified creates.
+    /// Set `false` for "ephemeral by default — opt in to persist";
+    /// `true` (legacy behaviour) for "always persist by default".
+    pub auto_resume_default: bool,
 }
 
 impl Default for Config {
@@ -55,6 +61,7 @@ impl Default for Config {
             sessions_toml_path: String::new(),
             pid_file_path: String::new(),
             log_dir: String::new(),
+            auto_resume_default: false,
         }
     }
 }
@@ -171,6 +178,7 @@ hibernate_idle_secs = 0
 sessions_toml_path = "C:\\custom\\sessions.toml"
 pid_file_path = "C:\\custom\\broker.pid"
 log_dir = "C:\\custom\\logs"
+auto_resume_default = true
 "#;
         let c: Config = toml::from_str(toml_src).unwrap();
         assert_eq!(c.http_addr, "0.0.0.0:1234");
@@ -181,6 +189,7 @@ log_dir = "C:\\custom\\logs"
         assert_eq!(c.sessions_toml_path, "C:\\custom\\sessions.toml");
         assert_eq!(c.pid_file_path, "C:\\custom\\broker.pid");
         assert_eq!(c.log_dir, "C:\\custom\\logs");
+        assert!(c.auto_resume_default);
     }
 
     #[test]

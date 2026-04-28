@@ -515,6 +515,18 @@ impl Session {
         *self.auto_resume.lock().unwrap()
     }
 
+    /// Returns true iff the value changed — caller passes that up to
+    /// decide whether to call `manager.save()` (writing sessions.toml
+    /// is cheap but pointless if nothing actually moved).
+    pub fn set_auto_resume(&self, v: bool) -> bool {
+        let mut g = self.auto_resume.lock().unwrap();
+        if *g == v {
+            return false;
+        }
+        *g = v;
+        true
+    }
+
     /// Returns true iff the stored id changed (caller may want to
     /// trigger persistence).
     pub fn set_claude_session_id_if_changed(&self, id: String) -> bool {

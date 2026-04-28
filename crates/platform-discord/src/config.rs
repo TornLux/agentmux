@@ -43,6 +43,18 @@ pub struct DiscordConfig {
     /// Discord caps single-message text at 2000 chars; we split at
     /// this many to leave headroom for per-message decoration.
     pub max_message_chars: usize,
+    /// When true, accept messages in 1:1 DM channels with whitelisted
+    /// users (`allowed_user_ids`). Off by default so the bot can't
+    /// accidentally take orders from DMs that bypass the channel
+    /// whitelist; flip this on for solo / mobile use.
+    pub allow_dm: bool,
+    /// When true, forward Claude Code's "Claude is waiting for your
+    /// input" idle pings (the Notification hook fires these after a
+    /// short period of TUI inactivity, which means roughly once after
+    /// every reply). Off by default — most users find them noisy.
+    /// Permission prompts and other Notification messages always pass
+    /// through regardless of this flag.
+    pub notify_on_idle: bool,
     /// Where to find the broker config (only its `pipe_name` is needed,
     /// and only when the bot one day learns to attach as a viewer).
     /// Empty = ignore. Reserved for later phases.
@@ -59,6 +71,8 @@ impl Default for DiscordConfig {
             allowed_user_ids: Vec::new(),
             default_session: "default".to_string(),
             max_message_chars: 1900,
+            allow_dm: false,
+            notify_on_idle: false,
             broker_config_path: String::new(),
         }
     }

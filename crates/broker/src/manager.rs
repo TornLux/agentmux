@@ -168,6 +168,21 @@ impl Manager {
         self.sessions.read().unwrap().values().cloned().collect()
     }
 
+    /// Toggle the persistence flag on an existing session. Returns the
+    /// effective new value (= the input). Saves sessions.toml when the
+    /// flag actually changed.
+    pub fn set_auto_resume(&self, key: &str, value: bool) -> Result<bool> {
+        let session = self
+            .get_by_id_or_name(key)
+            .ok_or_else(|| anyhow::anyhow!("session not found: {key}"))?;
+        if session.set_auto_resume(value) {
+            if let Err(e) = self.save() {
+                warn!("sessions.toml save after set_auto_resume: {e}");
+            }
+        }
+        Ok(value)
+    }
+
     pub fn remove(&self, key: &str) -> Result<()> {
         let session = self
             .get_by_id_or_name(key)

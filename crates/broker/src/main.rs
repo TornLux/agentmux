@@ -321,6 +321,7 @@ async fn run_http_server(app_state: AppState) {
         .route("/sessions/:key/restart", post(http_restart))
         .route("/sessions/:key/hibernate", post(http_hibernate))
         .route("/sessions/:key/input", post(http_input))
+        .route("/sessions/:key/persist", post(http_set_persist))
         .route("/sessions/:key/ring", get(http_ring_snapshot))
         .route("/shutdown", post(http_shutdown))
         .route("/event", post(http_event))
@@ -563,12 +564,11 @@ async fn http_list(State(s): State<AppState>) -> Json<Vec<SessionInfo>> {
 struct CreateBody {
     name: String,
     cwd: Option<String>,
-    #[serde(default = "default_auto_resume")]
-    auto_resume: bool,
-}
-
-fn default_auto_resume() -> bool {
-    true
+    /// Per-session override of `auto_resume`. None falls through to
+    /// `Config.auto_resume_default` so the client doesn't have to know
+    /// the system policy.
+    #[serde(default)]
+    auto_resume: Option<bool>,
 }
 
 async fn http_create(
@@ -585,9 +585,12 @@ async fn http_create(
             format!("cwd does not exist: {cwd:?}"),
         ));
     }
+    let auto_resume = body
+        .auto_resume
+        .unwrap_or(s.config.auto_resume_default);
     let session = s
         .manager
-        .create(body.name, cwd, body.auto_resume)
+        .create(body.name, cwd, auto_resume)
         .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
     Ok(Json(session.info()))
 }
@@ -690,6 +693,30 @@ async fn http_restart(
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
     Ok("ok")
+}
+
+#[derive(Deserialize)]
+struct PersistBody {
+    auto_resume: bool,
+}
+
+/// Toggle the persistence (auto_resume) flag on an existing session.
+/// `true` = restored on broker boot (default behaviour pre-change);
+/// `false` = forgotten on next boot. Per-session — does not affect
+/// config-level `auto_resume_default`.
+async fn http_set_persist(
+    Path(key): Path<String>,
+    State(s): State<AppState>,
+    Json(body): Json<PersistBody>,
+) -> Result<Json<SessionInfo>, (StatusCode, String)> {
+    s.manager
+        .set_auto_resume(&key, body.auto_resume)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let session = s
+        .manager
+        .get_by_id_or_name(&key)
+        .ok_or((StatusCode::NOT_FOUND, "session not found".to_string()))?;
+    Ok(Json(session.info()))
 }
 
 async fn http_shutdown(State(s): State<AppState>) -> &'static str {
@@ -863,18 +890,37 @@ async fn http_input(
         info!("/input post-resume readiness: {why}");
     }
 
-    // With claude fully Idle, the simplest write works: text + \r
-    // as one buffer, the same shape the original successful turns
-    // saw before any auto-resume race existed.
-    let mut bytes = body.text.into_bytes();
-    let has_text = !bytes.is_empty();
+    // claude code TUI groups bytes arriving in the same read() call
+    // as a single paste burst — when that burst ends in `\r` and the
+    // input visually wraps (>~63 cols on the user's current terminal)
+    // or contains embedded `\n`, the trailing `\r` is NOT treated as
+    // an Enter keystroke and the input never submits. Empirically the
+    // fix is to write the text and the `\r` in two separate write()
+    // calls with even a tiny gap between them — claude then sees the
+    // `\r` as a discrete Enter keystroke and submits. 30 ms is two
+    // orders of magnitude above the threshold (5 ms still worked in
+    // diagnosis) yet imperceptible compared to network + claude
+    // turn latency.
+    //
+    // Skip the split when there is no text (no first write needed)
+    // or when append_enter is false (caller wants raw bytes — they
+    // can stage their own keystrokes).
+    let text_bytes = body.text.into_bytes();
+    let has_text = !text_bytes.is_empty();
+    if has_text {
+        session.write_to_pty(&text_bytes);
+    }
     if body.append_enter {
-        bytes.push(b'\r');
+        if has_text {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        session.write_to_pty(b"\r");
     }
-    if !bytes.is_empty() {
-        session.write_to_pty(&bytes);
-        info!("/input wrote {} bytes (text={} append_enter={})", bytes.len(), has_text, body.append_enter);
-    }
+    info!(
+        "/input wrote text_bytes={} append_enter={}",
+        text_bytes.len(),
+        body.append_enter
+    );
     Ok("ok")
 }
 
