@@ -1,4 +1,4 @@
-# Idempotent merger for Phase 5 hooks into Claude Code's user-global
+﻿# Idempotent merger for Phase 5 hooks into Claude Code's user-global
 # settings.json. Run once and you're done — claude in *any* working
 # directory will fire hook-stop.exe / hook-notification.exe.
 #
@@ -32,12 +32,15 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 
 # Prefer bin/ (release-zip layout); fall back to target/release/ (cargo
-# builds). Two layouts so the same script works for both release-zip
-# users (no Rust toolchain) and from-source developers.
+# builds). target/debug/ is a third fallback so a `cargo build` (no
+# --release) still produces a usable hooks setup for development —
+# the only cost is slower hook startup, which doesn't affect
+# correctness.
 function Find-HookExe([string]$name) {
     $candidates = @(
         (Join-Path $root "bin\$name"),
-        (Join-Path $root "target\release\$name")
+        (Join-Path $root "target\release\$name"),
+        (Join-Path $root "target\debug\$name")
     )
     foreach ($c in $candidates) {
         if (Test-Path -LiteralPath $c) { return $c }
@@ -55,12 +58,26 @@ if (-not $hookStop -or -not $hookNotification -or -not $hookPreTool -or -not $ho
 Hook binaries not found. Looked in:
   $root\bin\               (release zip layout)
   $root\target\release\    (cargo build layout)
+  $root\target\debug\      (cargo build, debug profile)
 
 If you extracted from a release zip, re-extract — the zip should contain a bin\ folder
 with hook-stop.exe / hook-notification.exe / hook-pretool.exe / hook-posttool.exe.
 If you cloned from source, build with: cargo build --release
+(or cargo build for a debug build — slower hooks, otherwise equivalent)
 "@
     throw $msg
+}
+
+# If any hook resolved to a debug build, warn loudly. Debug binaries
+# launch noticeably slower (~100-300 ms per hook fire vs <30 ms for
+# release), which can make claude feel sluggish on busy turns. They
+# also keep debug symbols, so the on-disk footprint is much larger.
+$debugUsed = $hookStop, $hookNotification, $hookPreTool, $hookPostTool |
+    Where-Object { $_ -match '\\target\\debug\\' }
+if ($debugUsed) {
+    Write-Host "warning: using debug-profile hooks (cargo build without --release)" -ForegroundColor Yellow
+    Write-Host "         expect noticeably slower per-tool-call latency. Build release for prod:" -ForegroundColor Yellow
+    Write-Host "           cargo build --release" -ForegroundColor Yellow
 }
 # Forward slashes — Claude Code on Windows runs hook commands via
 # /usr/bin/bash, which silently eats unquoted backslashes. Forward

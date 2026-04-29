@@ -1,4 +1,4 @@
-# Write a documented template config.toml at
+﻿# Write a documented template config.toml at
 # %LOCALAPPDATA%\agentmux\config.toml. Every field is commented out so
 # defaults apply unmodified — uncomment a line to override.
 #
@@ -85,6 +85,15 @@ $content = @'
 # broker rejects every non-loopback connection (default; safe).
 # Generate one with:  .\agentmux config token --set
 # attach_token = ""
+
+# Default working directory for newly-created sessions when the
+# caller does not specify one (e.g. POST /sessions without `cwd`,
+# the initial `default` session at first boot, or
+# `.\agentmux new <name>` without `-Cwd`). Empty = use the broker
+# process's startup cwd (legacy behaviour). Set this so new-session
+# cwd does not depend on which directory you happened to be in
+# when you ran `.\agentmux start`.
+# default_cwd = "G:\\projects\\my-main-repo"
 '@
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

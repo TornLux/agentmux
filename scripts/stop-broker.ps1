@@ -1,4 +1,4 @@
-# Stop the agentmux broker. Prefers the broker.pid file for precision;
+﻿# Stop the agentmux broker. Prefers the broker.pid file for precision;
 # falls back to name-based killing if the file is missing/stale.
 
 $ErrorActionPreference = "Stop"

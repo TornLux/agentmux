@@ -1,4 +1,4 @@
-# Write a documented template discord.toml at
+﻿# Write a documented template discord.toml at
 # %LOCALAPPDATA%\agentmux\discord.toml. The bot token is intentionally
 # NOT a field here — store it in an env var (default DISCORD_BOT_TOKEN)
 # so it never lands in this file or its backups.

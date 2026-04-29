@@ -29,12 +29,18 @@ $scriptsDir  = Join-Path $root "scripts"
 
 # Release zips ship `bin/`; cargo builds drop into `target/release/`.
 # Prefer bin/ when present so a release-extracted tree always works.
+# target/debug/ is a third-tier fallback for `cargo build` (no
+# --release) — works fine for development, just slower hooks/startup.
 $binCandidates = @(
     (Join-Path $root "bin"),
-    (Join-Path $root "target\release")
+    (Join-Path $root "target\release"),
+    (Join-Path $root "target\debug")
 )
 $bin = $binCandidates | Where-Object { Test-Path (Join-Path $_ "broker.exe") } | Select-Object -First 1
 if (-not $bin) { $bin = $binCandidates[1] }   # fall back so error messages point somewhere sensible
+if ($bin -and ($bin -match '\\target\\debug$')) {
+    Write-Host "(using debug build at $bin — slower, intended for development; cargo build --release for prod)" -ForegroundColor Yellow
+}
 
 $agentmuxCli = Join-Path $bin "agentmux-cli.exe"
 $brokerExe   = Join-Path $bin "broker.exe"
@@ -132,6 +138,50 @@ function Read-Token {
     }
 }
 
+function Invoke-BrokerJson {
+    # Thin wrapper around Invoke-RestMethod for broker calls. Always
+    # talks to loopback (broker's auth middleware exempts loopback so
+    # no token plumbing here). Captures non-2xx response bodies so
+    # callers can render the broker's structured error JSON instead of
+    # PowerShell's default "Response status code does not indicate
+    # success" message.
+    param(
+        [Parameter(Mandatory)] [string]$Method,
+        [Parameter(Mandatory)] [string]$Path,
+        $Body = $null,
+        [int]$TimeoutSec = 30
+    )
+    $url = "http://127.0.0.1:8765$Path"
+    $params = @{
+        Method = $Method
+        Uri = $url
+        TimeoutSec = $TimeoutSec
+        ErrorAction = 'Stop'
+    }
+    if ($null -ne $Body) {
+        $params.Body = ($Body | ConvertTo-Json -Compress -Depth 10)
+        $params.ContentType = 'application/json; charset=utf-8'
+    }
+    try {
+        $resp = Invoke-RestMethod @params
+        return @{ ok = $true; data = $resp }
+    } catch {
+        $status = 0
+        $body = ""
+        $resp = $_.Exception.Response
+        if ($resp) {
+            try { $status = [int]$resp.StatusCode } catch {}
+            try {
+                $stream = $resp.GetResponseStream()
+                $reader = New-Object System.IO.StreamReader($stream)
+                $body = $reader.ReadToEnd()
+                $reader.Close()
+            } catch {}
+        }
+        return @{ ok = $false; status = $status; body = $body; err = $_.Exception.Message }
+    }
+}
+
 function Verify-DiscordToken([string]$token) {
     try {
         $headers = @{ Authorization = "Bot $token" }
@@ -166,6 +216,17 @@ Daily ops
                         --broker http://host:port --token <t>: connect over LAN
                         Or: open http://<broker>:8765/ in any browser
                         Or: right-click the tray icon → Attach <session>
+  new <name> [-Cwd <path>] [-Persist | -Ephemeral]
+                        Create a new broker session.
+                        Default cwd = config.default_cwd, else broker's launch cwd.
+  kill <name> [-Force]  Delete a session record (asks for confirmation
+                        unless -Force).
+  adopt --resume <id> [name] [--cwd <path>]
+                        Bring an external claude conversation under broker.
+                        Run AFTER exiting the local 'claude'.
+  adopt <name>          Re-adopt a previously-demoted session.
+  demote <name>         Hand a broker session back to local terminal control.
+                        Broker kills claude and prints the resume command.
   logs [broker|discord|tray|events]
                         Tail a log stream
 
@@ -273,6 +334,94 @@ Usage: .\agentmux attach [name | --new [name] | --session name | --debug]
     1×           interrupt claude's current turn
     2× in 1.5 s  restart this session's claude (history kept)
     3× in 1.5 s  shut down the entire broker
+"@
+        }
+        "new" {
+            @"
+Usage: .\agentmux new <name> [-Cwd <path>] [-Persist | -Ephemeral]
+
+  Create a new broker session named <name>. Once created, attach
+  with '.\agentmux attach <name>', bind a Discord channel with
+  Discord's '!attach <name>', or open the web viewer.
+
+  -Cwd <path>      Working directory the session's claude is spawned
+                   in. Defaults to:
+                     1. broker config.toml `default_cwd` (if set)
+                     2. broker's launch cwd (legacy fallback)
+  -Persist         Survive broker restart (auto_resume = true).
+  -Ephemeral       Forget on broker restart (auto_resume = false).
+
+  When neither -Persist nor -Ephemeral is given, the broker's
+  `auto_resume_default` setting decides.
+"@
+        }
+        "kill" {
+            @"
+Usage: .\agentmux kill <name> [-Force]
+
+  Delete a session from broker (and from sessions.toml). claude is
+  killed if still running. Channel bindings to this session are
+  cleared by the Discord bot on next event.
+
+  Default behaviour: shows the session record and asks for confirmation.
+  -Force skips the prompt — useful for scripts.
+
+  This is the right command for:
+    * cleaning up a 'locally_owned' record you don't plan to re-adopt
+    * removing a default session that has the wrong cwd
+    * dropping a botched test session
+"@
+        }
+        "adopt" {
+            @"
+Usage: .\agentmux adopt --resume <claude-session-id> [name] [--cwd <path>]
+       .\agentmux adopt <name>
+
+  Bring a claude conversation under broker control. Two forms:
+
+  Fresh adopt (--resume):
+    Use after exiting a local 'claude' that you want to keep working
+    on remotely. broker spawns 'claude --resume <id>' so the new
+    process picks up your transcript.
+
+      name   defaults to the cwd basename
+      --cwd  defaults to the current shell's directory
+
+    Get the claude-session-id by running '/status' inside claude
+    BEFORE you exit, or by inspecting ~\.claude\projects\<encoded-cwd>\
+    after the fact (most-recently-modified .jsonl filename).
+
+    ⚠ Make sure the original claude process has fully exited
+      (Ctrl+C / /exit). Two processes on the same session id will
+      corrupt the transcript.
+
+  Re-adopt (no --resume, just a name):
+    Pulls a previously-demoted session back under broker. Uses the
+    claude_session_id stored in sessions.toml.
+
+      ⚠ Exit any local 'claude --resume <id>' you started after
+        the demote — same transcript-corruption risk.
+"@
+        }
+        "demote" {
+            @"
+Usage: .\agentmux demote <name>
+
+  Hand a broker-owned session back to local terminal control. Broker:
+    1. injects '/exit\r' into claude's PTY (graceful)
+    2. waits up to 2s for clean exit
+    3. if still alive, escalates to TerminateProcess + 1s wait
+    4. if STILL alive, fails the request and leaves state intact
+
+  On success, prints the exact 'cd ... ; claude --resume <id>' you
+  should run in your terminal. The session record stays in broker
+  (state=locally_owned) — Discord input to it is refused with a
+  hint, and tray shows it greyed out. Re-adopt with:
+
+      .\agentmux adopt <name>
+
+  Channel bindings, name, cwd, claude_session_id are all preserved
+  across the round-trip.
 "@
         }
         "logs" {
@@ -427,6 +576,39 @@ function Cmd-Init([string[]]$Argv) {
             & (Join-Path $scriptsDir "init-config.ps1")
         }
     }
+
+    # default_cwd is the single most-asked knob: where do new sessions
+    # land when you don't pass -Cwd? Without this prompt, users hit the
+    # "default session was created in some random subdir" gotcha that
+    # shows up in sessions.toml and silently sticks across restarts.
+    if (Test-Path $brokerCfg) {
+        Require-Binary $agentmuxCli "agentmux-cli.exe"
+        # Read the current value to skip the prompt if it's already set.
+        $rawCfg = Get-Content -LiteralPath $brokerCfg -Raw -ErrorAction SilentlyContinue
+        $hasDefaultCwd = $rawCfg -and ($rawCfg -match '(?m)^\s*default_cwd\s*=\s*"[^"]+"')
+        if ($hasDefaultCwd) {
+            Write-Host "  ✓ default_cwd already set in $brokerCfg"
+        } else {
+            Write-Host ""
+            Write-Host "  default_cwd controls where new sessions' cwd lands when you" -ForegroundColor Cyan
+            Write-Host "  don't pass -Cwd at create time. Empty = each new session inherits" -ForegroundColor Cyan
+            Write-Host "  the broker's launch cwd, which is whichever folder you happened" -ForegroundColor Cyan
+            Write-Host "  to be in when you ran '.\agentmux start' (a common confusion)." -ForegroundColor Cyan
+            $here = (Get-Location).Path
+            Write-Host ""
+            $suggested = Read-Host "  Set default_cwd? Enter a path (default: '$here'), or '-' to leave unset"
+            if ($suggested -ne "-") {
+                if (-not $suggested) { $suggested = $here }
+                if (Test-Path -LiteralPath $suggested -PathType Container) {
+                    $resolved = (Resolve-Path -LiteralPath $suggested).Path
+                    & $agentmuxCli config set $brokerCfg default_cwd $resolved | Out-Null
+                    Write-Host "  ✓ default_cwd = $resolved" -ForegroundColor Green
+                } else {
+                    Write-Host "  ⚠ '$suggested' does not exist — skipping" -ForegroundColor Yellow
+                }
+            }
+        }
+    }
     Write-Host ""
 
     # 4 — discord (optional)
@@ -562,7 +744,12 @@ function Cmd-Status([string[]]$Argv) {
             Write-Host "  sessions: $($sessions.Count)"
             foreach ($s in $sessions) {
                 $marker = " "
-                Write-Host ("  $marker {0,-18} {1,-12} viewers={2}  cwd={3}" -f $s.name, $s.state, $s.viewers, $s.cwd)
+                $line = "  $marker {0,-18} {1,-14} viewers={2}  cwd={3}" -f $s.name, $s.state, $s.viewers, $s.cwd
+                if ($s.state -eq "locally_owned") {
+                    Write-Host $line -ForegroundColor Magenta
+                } else {
+                    Write-Host $line
+                }
             }
         } catch {
             Write-Host "  (failed to query /sessions — broker still booting?)" -ForegroundColor Yellow
@@ -632,6 +819,314 @@ function Cmd-Logs([string[]]$Argv) {
             Write-Host "usage: .\agentmux logs [broker|discord|tray|events]"
         }
     }
+}
+
+# --- session create / destroy ------------------------------------------
+
+function Cmd-New([string[]]$Argv) {
+    if (Wants-Help $Argv) { Show-VerbHelp "new"; return }
+
+    # Parse: <name?> [-Cwd <path>] [-Persist | -Ephemeral]
+    $cwd = $null
+    $persist = $null    # $null = leave to broker default; $true / $false = explicit override
+    $positional = @()
+    $i = 0
+    while ($i -lt $Argv.Count) {
+        $a = $Argv[$i]
+        switch ($a) {
+            "-Cwd"        { if ($i + 1 -ge $Argv.Count) { Write-Host "-Cwd needs a path" -ForegroundColor Red; return }; $cwd = $Argv[$i + 1]; $i += 2 }
+            "--cwd"       { if ($i + 1 -ge $Argv.Count) { Write-Host "--cwd needs a path" -ForegroundColor Red; return }; $cwd = $Argv[$i + 1]; $i += 2 }
+            "-Persist"    { $persist = $true;  $i += 1 }
+            "--persist"   { $persist = $true;  $i += 1 }
+            "-Ephemeral"  { $persist = $false; $i += 1 }
+            "--ephemeral" { $persist = $false; $i += 1 }
+            default {
+                $positional += $a
+                $i += 1
+            }
+        }
+    }
+
+    if ($positional.Count -lt 1) {
+        Show-VerbHelp "new"
+        return
+    }
+    $name = $positional[0]
+    if ($name -match '[^A-Za-z0-9._-]') {
+        Write-Host "✗ session name has invalid chars (use only letters, digits, . _ -)" -ForegroundColor Red
+        return
+    }
+
+    $body = @{ name = $name }
+    if ($cwd) {
+        if (-not (Test-Path -LiteralPath $cwd -PathType Container)) {
+            Write-Host "✗ cwd does not exist: $cwd" -ForegroundColor Red
+            return
+        }
+        $body.cwd = (Resolve-Path -LiteralPath $cwd).Path
+    }
+    if ($null -ne $persist) { $body.auto_resume = $persist }
+
+    $r = Invoke-BrokerJson -Method POST -Path "/sessions" -Body $body
+    if (-not $r.ok) {
+        if ($r.status -eq 409) {
+            Write-Host "✗ a session named '$name' already exists." -ForegroundColor Red
+            Write-Host "  $($r.body)"
+        } elseif ($r.status -eq 400) {
+            Write-Host "✗ broker rejected request: $($r.body)" -ForegroundColor Red
+        } else {
+            Write-Host "✗ broker error: HTTP $($r.status) $($r.body)" -ForegroundColor Red
+            if (-not $r.status) { Write-Host "  ($($r.err))" -ForegroundColor Red }
+        }
+        return
+    }
+    $persistLabel = if ($r.data.auto_resume) { "persisted" } else { "ephemeral" }
+    Write-Host "✓ created '$($r.data.name)' (id=$($r.data.id), $persistLabel)" -ForegroundColor Green
+    Write-Host "  cwd: $($r.data.cwd)"
+    Write-Host ""
+    Write-Host "Next:"
+    Write-Host "  .\agentmux attach $name"
+}
+
+function Cmd-Kill([string[]]$Argv) {
+    if (Wants-Help $Argv -or -not $Argv -or $Argv.Count -lt 1) { Show-VerbHelp "kill"; return }
+    $name = $Argv[0]
+    $force = ($Argv -contains "-Force") -or ($Argv -contains "--force")
+
+    if (-not $force) {
+        # Show what will be deleted so the user can back out.
+        $g = Invoke-BrokerJson -Method GET -Path "/sessions/$name"
+        if (-not $g.ok) {
+            if ($g.status -eq 404) {
+                Write-Host "no session named '$name'." -ForegroundColor Yellow
+            } else {
+                Write-Host "✗ broker query failed: HTTP $($g.status) $($g.body)" -ForegroundColor Red
+            }
+            return
+        }
+        Write-Host "Will delete:"
+        Write-Host "  name              : $($g.data.name)"
+        Write-Host "  cwd               : $($g.data.cwd)"
+        Write-Host "  state             : $($g.data.state)"
+        Write-Host "  claude session id : $($g.data.claude_session_id)"
+        Write-Host ""
+        $ans = Read-Host "Proceed? [y/N]"
+        if ($ans -ne "y" -and $ans -ne "Y") { Write-Host "aborted."; return }
+    }
+
+    $r = Invoke-BrokerJson -Method DELETE -Path "/sessions/${name}?force=true"
+    if (-not $r.ok) {
+        Write-Host "✗ kill failed: HTTP $($r.status) $($r.body)" -ForegroundColor Red
+        return
+    }
+    Write-Host "✓ session '$name' deleted." -ForegroundColor Green
+}
+
+# --- adopt / demote -----------------------------------------------------
+
+function Cmd-Adopt([string[]]$Argv) {
+    if (Wants-Help $Argv) { Show-VerbHelp "adopt"; return }
+
+    # Parse: --resume <id> [name] [--cwd <path>]    (fresh adopt)
+    #     OR <name>                                  (re-adopt LocallyOwned)
+    $resumeId = $null
+    $cwd = $null
+    $positional = @()
+    $i = 0
+    while ($i -lt $Argv.Count) {
+        $a = $Argv[$i]
+        switch ($a) {
+            "--resume" {
+                if ($i + 1 -ge $Argv.Count) { Write-Host "--resume requires a claude session id" -ForegroundColor Red; return }
+                $resumeId = $Argv[$i + 1]
+                $i += 2
+            }
+            "--cwd" {
+                if ($i + 1 -ge $Argv.Count) { Write-Host "--cwd requires a path" -ForegroundColor Red; return }
+                $cwd = $Argv[$i + 1]
+                $i += 2
+            }
+            default {
+                $positional += $a
+                $i += 1
+            }
+        }
+    }
+
+    if ($resumeId) {
+        # ---- fresh adopt ------------------------------------------------
+        if (-not [System.Guid]::TryParse($resumeId, [ref][System.Guid]::Empty)) {
+            Write-Host "✗ --resume value doesn't look like a claude session id (UUID)" -ForegroundColor Red
+            Write-Host "  Get the id from claude's /status command before exiting, or"
+            Write-Host "  pick the most recent jsonl in ~\.claude\projects\<encoded-cwd>\"
+            return
+        }
+        if (-not $cwd) { $cwd = (Get-Location).Path }
+        if (-not (Test-Path -LiteralPath $cwd -PathType Container)) {
+            Write-Host "✗ cwd does not exist: $cwd" -ForegroundColor Red
+            return
+        }
+        $cwd = (Resolve-Path -LiteralPath $cwd).Path
+
+        $name = if ($positional.Count -ge 1) { $positional[0] } else { Split-Path -Leaf $cwd }
+        # Sanitise: name maps to a Discord channel binding key, must be filesystem-safe.
+        $name = ($name -replace '[^A-Za-z0-9._-]', '-')
+        if (-not $name) { Write-Host "✗ could not derive a session name from cwd" -ForegroundColor Red; return }
+
+        Write-Host ""
+        Write-Host "Fresh adopt:" -ForegroundColor Cyan
+        Write-Host "  name              : $name"
+        Write-Host "  cwd               : $cwd"
+        Write-Host "  claude session id : $resumeId"
+        Write-Host ""
+        Write-Host "  Make sure the original 'claude' (the one with this session id) has fully exited" -ForegroundColor Yellow
+        Write-Host "  in the other terminal — two ` --resume `s on the same id will corrupt the transcript." -ForegroundColor Yellow
+        $ans = Read-Host "Proceed? [Y/n]"
+        if ($ans -eq "n" -or $ans -eq "N") { Write-Host "aborted."; return }
+
+        $r = Invoke-BrokerJson -Method POST -Path "/sessions" -Body @{
+            name = $name
+            cwd = $cwd
+            resume_session_id = $resumeId
+            auto_resume = $true
+        }
+        if (-not $r.ok) {
+            Write-Host "✗ broker rejected adopt:" -ForegroundColor Red
+            if ($r.status -eq 409) {
+                Write-Host "  $($r.body)" -ForegroundColor Red
+                Write-Host "  Hint: a session with that name already exists. Either re-adopt with"
+                Write-Host "        '.\agentmux adopt $name' (if it's locally-owned) or pick a"
+                Write-Host "        different name."
+            } else {
+                Write-Host "  HTTP $($r.status): $($r.body)" -ForegroundColor Red
+                if (-not $r.status) { Write-Host "  ($($r.err))" -ForegroundColor Red }
+            }
+            return
+        }
+        Write-Host "✓ session '$($r.data.name)' adopted under broker (id=$($r.data.id))" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "Next steps:"
+        Write-Host "  .\agentmux attach $name        # local terminal viewer"
+        Write-Host "  open Discord, !attach $name    # bind a channel to it"
+        Write-Host "  http://<broker>:8765/          # browser viewer"
+        return
+    }
+
+    # ---- re-adopt ----------------------------------------------------
+    if ($positional.Count -lt 1) {
+        Show-VerbHelp "adopt"
+        return
+    }
+    $name = $positional[0]
+
+    $g = Invoke-BrokerJson -Method GET -Path "/sessions/$name"
+    if (-not $g.ok) {
+        if ($g.status -eq 404) {
+            Write-Host "✗ no broker session named '$name'." -ForegroundColor Red
+            Write-Host "  To do a fresh adopt of an external claude:" -ForegroundColor Yellow
+            Write-Host "    .\agentmux adopt --resume <claude-session-id> [name]" -ForegroundColor Yellow
+        } else {
+            Write-Host "✗ broker query failed: HTTP $($g.status) $($g.body)" -ForegroundColor Red
+        }
+        return
+    }
+    if ($g.data.state -ne "locally_owned") {
+        Write-Host "✗ session '$name' is in state '$($g.data.state)', not locally_owned." -ForegroundColor Red
+        Write-Host "  Nothing to re-adopt — the broker already owns this session."
+        return
+    }
+
+    Write-Host ""
+    Write-Host "Re-adopt:" -ForegroundColor Cyan
+    Write-Host "  name              : $($g.data.name)"
+    Write-Host "  cwd               : $($g.data.cwd)"
+    Write-Host "  claude session id : $($g.data.claude_session_id)"
+    Write-Host ""
+    Write-Host "  ⚠ Make sure your local 'claude --resume $($g.data.claude_session_id)' has" -ForegroundColor Yellow
+    Write-Host "    been exited (Ctrl+C / /exit). Two processes on the same session id will" -ForegroundColor Yellow
+    Write-Host "    corrupt the transcript." -ForegroundColor Yellow
+    $ans = Read-Host "Proceed? [Y/n]"
+    if ($ans -eq "n" -or $ans -eq "N") { Write-Host "aborted."; return }
+
+    $r = Invoke-BrokerJson -Method POST -Path "/sessions/$name/adopt"
+    if (-not $r.ok) {
+        Write-Host "✗ re-adopt failed: HTTP $($r.status)" -ForegroundColor Red
+        Write-Host "  $($r.body)" -ForegroundColor Red
+        return
+    }
+    Write-Host "✓ session '$($r.data.name)' is back under broker (state=$($r.data.state))" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Next steps:"
+    Write-Host "  .\agentmux attach $name"
+}
+
+function Cmd-Demote([string[]]$Argv) {
+    if (Wants-Help $Argv -or -not $Argv -or $Argv.Count -lt 1) { Show-VerbHelp "demote"; return }
+    $name = $Argv[0]
+
+    $g = Invoke-BrokerJson -Method GET -Path "/sessions/$name"
+    if (-not $g.ok) {
+        if ($g.status -eq 404) {
+            Write-Host "✗ no broker session named '$name'." -ForegroundColor Red
+        } else {
+            Write-Host "✗ broker query failed: HTTP $($g.status) $($g.body)" -ForegroundColor Red
+        }
+        return
+    }
+    if ($g.data.state -eq "locally_owned") {
+        Write-Host "session '$name' is already locally-owned — nothing to do." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Resume command (copy this whole line):"
+        $cwdEsc = $g.data.cwd
+        if ($g.data.claude_session_id) {
+            Write-Host "  cd `"$cwdEsc`" ; claude --resume $($g.data.claude_session_id)" -ForegroundColor Cyan
+        } else {
+            Write-Host "  cd `"$cwdEsc`" ; claude   # no claude_session_id recorded — start fresh" -ForegroundColor Cyan
+        }
+        return
+    }
+    if (-not $g.data.claude_session_id) {
+        Write-Host "⚠ session '$name' has no recorded claude_session_id yet." -ForegroundColor Yellow
+        Write-Host "  Demote will still kill claude, but you won't be able to --resume locally."
+        Write-Host "  This usually means the session never completed a turn under broker."
+        $ans = Read-Host "Proceed anyway? [y/N]"
+        if ($ans -ne "y" -and $ans -ne "Y") { Write-Host "aborted."; return }
+    }
+
+    # Wide timeout: graceful /exit + kill + wait can take ~3 s, plus
+    # any blocking that comes from the broker side. 30s is generous.
+    $r = Invoke-BrokerJson -Method POST -Path "/sessions/$name/demote" -TimeoutSec 30
+    if (-not $r.ok) {
+        Write-Host "✗ demote failed: HTTP $($r.status)" -ForegroundColor Red
+        Write-Host "  $($r.body)" -ForegroundColor Red
+        if ($r.status -eq 500) {
+            Write-Host ""
+            Write-Host "  This means broker couldn't kill claude even after TerminateProcess." -ForegroundColor Yellow
+            Write-Host "  Investigate via Task Manager. The session was NOT transitioned to" -ForegroundColor Yellow
+            Write-Host "  locally-owned, so it's safe to retry once claude is gone." -ForegroundColor Yellow
+        }
+        return
+    }
+    Write-Host "✓ session '$name' demoted (graceful=$($r.data.graceful))" -ForegroundColor Green
+    if (-not $r.data.graceful) {
+        Write-Host "  ⚠ /exit window timed out, broker had to TerminateProcess." -ForegroundColor Yellow
+        Write-Host "    Last few transcript lines may not have been flushed." -ForegroundColor Yellow
+    }
+    Write-Host ""
+    # Print as a single line — `cd` and `claude --resume` MUST run in
+    # the same shell for claude to find the transcript (it looks under
+    # ~\.claude\projects\<encoded-cwd>\<id>.jsonl). Splitting them
+    # across two Write-Host lines invited copy-paste-just-the-second-
+    # line confusion. Single line, copyable.
+    Write-Host "Resume in your terminal (copy this whole line):"
+    if ($r.data.claude_session_id) {
+        Write-Host "  cd `"$($r.data.cwd)`" ; claude --resume $($r.data.claude_session_id)" -ForegroundColor Cyan
+    } else {
+        Write-Host "  cd `"$($r.data.cwd)`" ; claude   # no claude_session_id recorded — start fresh" -ForegroundColor Cyan
+    }
+    Write-Host ""
+    Write-Host "When you want broker to take over again:"
+    Write-Host "  .\agentmux adopt $name"
 }
 
 # --- config subcommands -------------------------------------------------
@@ -933,6 +1428,11 @@ switch ($Command) {
     "config"  { Cmd-Config  $Rest }
     "discord" { Cmd-Discord $Rest }
     "hooks"   { Cmd-Hooks   $Rest }
+
+    "new"     { Cmd-New     $Rest }
+    "kill"    { Cmd-Kill    $Rest }
+    "adopt"   { Cmd-Adopt   $Rest }
+    "demote"  { Cmd-Demote  $Rest }
 
     default {
         Write-Host "unknown command: $Command" -ForegroundColor Red

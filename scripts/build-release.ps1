@@ -1,4 +1,4 @@
-# Build a release zip ready for end users to download + extract.
+﻿# Build a release zip ready for end users to download + extract.
 #
 # Layout produced:
 #   agentmux-vX.Y.Z-windows-x86_64/

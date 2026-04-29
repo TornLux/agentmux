@@ -1,4 +1,4 @@
-# Launch agentmux-tray.exe as a detached background process.
+﻿# Launch agentmux-tray.exe as a detached background process.
 #
 # The tray reads %LOCALAPPDATA%\agentmux\config.toml (same as broker)
 # for the broker URL — no separate config. Subscribes to broker /ws,
@@ -14,11 +14,15 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $candidates = @(
     (Join-Path $root "bin\agentmux-tray.exe"),
-    (Join-Path $root "target\release\agentmux-tray.exe")
+    (Join-Path $root "target\release\agentmux-tray.exe"),
+    (Join-Path $root "target\debug\agentmux-tray.exe")
 )
 $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $exe) {
     throw "agentmux-tray.exe not found in $($candidates -join ' or '). Build with: cargo build --release"
+}
+if ($exe -match '\\target\\debug\\') {
+    Write-Host "warning: starting tray from debug build (cargo build --release for prod)" -ForegroundColor Yellow
 }
 
 $dataDir = Join-Path $env:LOCALAPPDATA "agentmux"
@@ -36,8 +40,4 @@ $p = Start-Process -FilePath $exe `
     -WindowStyle Hidden `
     -PassThru
 
-Write-Host "agentmux-tray started: pid $($p.Id)"
-Write-Host "  stderr: $err"
-Write-Host ""
-Write-Host "tip: tail the log with"
-Write-Host "  Get-Content -Wait $err"
+Write-Host "tray:     started (pid $($p.Id))"

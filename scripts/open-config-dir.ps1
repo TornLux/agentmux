@@ -1,4 +1,4 @@
-# Open %LOCALAPPDATA%\agentmux\ in File Explorer.
+﻿# Open %LOCALAPPDATA%\agentmux\ in File Explorer.
 # Creates the directory if it doesn't exist yet (so the action always
 # succeeds even on a fresh install).
 

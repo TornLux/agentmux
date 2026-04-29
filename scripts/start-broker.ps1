@@ -1,4 +1,4 @@
-# Start the agentmux broker.
+﻿# Start the agentmux broker.
 #
 # Default mode: detached background process (Start-Process). Use
 # -Foreground to invoke broker.exe directly, blocking the current
@@ -24,13 +24,21 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 # Release zips lay binaries in bin/; cargo builds in target/release/.
+# target/debug/ is the development fallback so a plain `cargo build`
+# (no --release) is enough to bring up the broker — the only real cost
+# is binary size and slightly slower startup.
 $candidates = @(
     (Join-Path $root "bin\broker.exe"),
-    (Join-Path $root "target\release\broker.exe")
+    (Join-Path $root "target\release\broker.exe"),
+    (Join-Path $root "target\debug\broker.exe")
 )
 $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $exe) {
     throw "broker.exe not found in $($candidates -join ' or '). Build with: cargo build --release"
+}
+if ($exe -match '\\target\\debug\\') {
+    Write-Host "warning: starting broker from debug build" -ForegroundColor Yellow
+    Write-Host "         OK for development; use 'cargo build --release' for prod" -ForegroundColor Yellow
 }
 
 if (-not (Test-Path $WorkingDirectory)) {
@@ -100,11 +108,7 @@ if (Test-Path -LiteralPath $pidFile) {
 if (-not $env:RUST_LOG) { $env:RUST_LOG = "info" }
 
 if ($Foreground) {
-    Write-Host "broker running in foreground (Ctrl+C to stop)"
-    Write-Host "  exe:    $exe"
-    Write-Host "  cwd:    $WorkingDirectory"
-    Write-Host "  logs:   $(Join-Path $dataDir 'logs')"
-    Write-Host ""
+    Write-Host "broker:   foreground (Ctrl+C to stop, cwd $WorkingDirectory)"
     Push-Location $WorkingDirectory
     try {
         & $exe --cwd $WorkingDirectory
@@ -126,8 +130,4 @@ $p = Start-Process -FilePath $exe `
     -WindowStyle Hidden `
     -PassThru
 
-Write-Host "broker started: pid $($p.Id)"
-Write-Host "  cwd:    $WorkingDirectory"
-Write-Host "  pid:    $pidFile"
-Write-Host "  logs:   $(Join-Path $dataDir 'logs')"
-Write-Host "  stderr: $err"
+Write-Host "broker:   started (pid $($p.Id), cwd $WorkingDirectory)"

@@ -1,4 +1,4 @@
-# Launch platform-discord.exe as a detached background process.
+﻿# Launch platform-discord.exe as a detached background process.
 #
 # Reads %LOCALAPPDATA%\agentmux\discord.toml for everything except the
 # bot token, which must be in the env var named by `token_env`
@@ -16,11 +16,15 @@ $root = Split-Path -Parent $PSScriptRoot
 # Release zips lay binaries in bin/; cargo builds in target/release/.
 $candidates = @(
     (Join-Path $root "bin\platform-discord.exe"),
-    (Join-Path $root "target\release\platform-discord.exe")
+    (Join-Path $root "target\release\platform-discord.exe"),
+    (Join-Path $root "target\debug\platform-discord.exe")
 )
 $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $exe) {
     throw "platform-discord.exe not found in $($candidates -join ' or '). Build with: cargo build --release"
+}
+if ($exe -match '\\target\\debug\\') {
+    Write-Host "warning: starting discord bot from debug build (cargo build --release for prod)" -ForegroundColor Yellow
 }
 
 $dataDir = Join-Path $env:LOCALAPPDATA "agentmux"
@@ -58,10 +62,4 @@ try {
     $env:AGENT_DISCORD_CONFIG = $priorAGENT
 }
 
-Write-Host "platform-discord started: pid $($p.Id)"
-Write-Host "  config: $cfgPath"
-Write-Host "  stdout: $out"
-Write-Host "  stderr: $err"
-Write-Host ""
-Write-Host "tip: tail the log with"
-Write-Host "  Get-Content -Wait $err"
+Write-Host "discord:  started (pid $($p.Id))"
