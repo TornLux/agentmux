@@ -49,7 +49,17 @@ After that, you have a running agentmux. **Look at the Windows system tray (bott
 .\agentmux attach            # picker menu of sessions
 .\agentmux attach default    # attach directly
 .\agentmux attach --new foo  # create + attach a new session
+
+.\agentmux new blog -Cwd G:\projects\blog -Persist
+                             # create a session in another directory
+.\agentmux kill blog         # delete a session record (asks for confirmation)
+.\agentmux demote default    # hand a session back to local terminal
+.\agentmux adopt default     # bring a demoted session back under broker
 ```
+
+For the **local→broker handover** scenario (started a session locally,
+now want to keep working remotely), see *Take over a local claude
+conversation* below.
 
 `--no-tray` and `--no-discord` flags on `start` opt out of those processes
 respectively (the broker is always started).
@@ -344,6 +354,52 @@ Remove-NetFirewallRule -DisplayName "agentmux broker (LAN)"
 The `attach_token` stays in `broker.toml` — harmless when loopback-only
 since it's only checked on non-loopback requests. Re-enabling LAN later
 needs nothing more than changing `http_addr` back.
+
+## Take over a local claude conversation (`adopt` / `demote`)
+
+The story: you're working in a regular Windows Terminal with `claude`,
+have a useful conversation going, and need to leave the desk. You want
+to keep that **same conversation** reachable from Discord later.
+
+```powershell
+# 1. (in the local terminal) get claude's session id, then exit
+#    Inside claude: type /status — note the UUID, then /exit (or Ctrl+C)
+
+# 2. bring it under broker (cwd defaults to your current shell cwd)
+.\agentmux adopt --resume <claude-session-id>
+#    e.g. .\agentmux adopt --resume 16d0b111-1959-4f87-9a74-9317a9302ffd
+
+# 3. confirm
+.\agentmux status                # new session shows up, state = idle
+
+# 4. attach from anywhere
+.\agentmux attach <name>         # local viewer
+# or send a Discord message in the bound channel
+# or open http://<broker>:8765/ from your phone
+```
+
+**Going the other way** (broker → local): hand a session back to a
+local terminal session.
+
+```powershell
+.\agentmux demote default
+# prints: cd "G:\path"; claude --resume <id>     ← copy the whole line
+```
+
+While **locally-owned**:
+
+- Discord input is refused with a 💤 reaction + a one-time guidance reply (5-min window)
+- Tray icon turns purple, the per-session menu offers **Re-adopt to broker**
+- `/input`, `/interrupt`, `/restart`, `/hibernate` all return `409 locally_owned`
+- The session record (cwd, channel bindings, claude_session_id) survives broker restart
+
+To bring it back:
+
+```powershell
+# IMPORTANT: exit your local `claude --resume` first (Ctrl+C / /exit)
+# otherwise two processes on the same session id will corrupt the transcript
+.\agentmux adopt default
+```
 
 ## When things go wrong
 

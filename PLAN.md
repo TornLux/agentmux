@@ -1352,6 +1352,10 @@ claude-attach.exe --debug    # stderr 打印 frame 收发日志,不影响 stdout
 
 - ~~**Web viewer**:基于 xterm.js 的浏览器 attach,通过 Tailscale 或 Cloudflare Tunnel 安全访问。需要 broker 把 named pipe 协议同时映射到 WebSocket。~~ **已完成(v0.2.1)。**
 - ~~**本地通知**:`Notification` 事件除了 IM,也用 Windows toast。~~ **已完成(`agentmux-tray` crate)** —— 此外还做了 `tool_request` 的本地按钮审批,完全脱离 IM 也能批 / 拒。
+- ~~**本地 ↔ broker session 互转**:本地终端跑了一阵子的 claude,临时离开时希望能交给 broker 远程接管;反之亦然。~~ **已完成(v0.3.0,`adopt` / `demote` 命令)** —— 新增 `LocallyOwned` session 状态,broker 端 `/sessions/:k/demote` 注入 `/exit\r` 并 fallback 到 TerminateProcess,`/sessions/:k/adopt` 用 `--resume <id>` 接回。Discord/tray 在 LocallyOwned 状态下都有专门的 UX(💤 反应 + 5min 窗口、托盘紫色 + Re-adopt 菜单)。`POST /sessions` 增加 `resume_session_id` 字段支持"全新接管"路径。
+- ~~**默认 cwd 配置**:`config.default_cwd` 让新 session 不再依赖 broker 启动时所在目录。~~ **已完成(v0.3.0)** —— 同时 `init` 向导引导设置,`config check` 校验目录存在。
+- ~~**hooks 在本地 viewer 在场时也要捕获 claude_session_id**~~:**已完成(v0.3.0)** —— 新增内部 `session_seen` 事件类型,hooks 无条件先发它再判断要不要跑用户可见事件;broker 在 `http_event` 早期捕获 transcript_path → claude_session_id,然后短路返回不广播。
+- ~~**tray "Quit all" 一键全停**~~:**已完成(v0.3.0)** —— 适合排查跨机 token 复用导致的"两个 bot 都在回复"症状。
 - **输入锁**:同一 session 多客户端同时打字时,某段时间内只允许一个写,其他 read-only。`!lock` / `!unlock` 切换。
 - **Session 分支**:基于 claude 的 `--resume` 在某个 turn 后分叉一个新 session,实验不同方向。
 - **批量批准**:同 session 同 hour 内同类危险命令一次批准多次。

@@ -31,15 +31,16 @@ agentmux 把 Claude Code 改造成一个常驻的多会话后台服务。一个�
   - **附件转发** —— Discord 拖图进聊天，bot 落到本地 temp 并提示 claude 用 `Read` 工具看图；文本附件同理
   - **12 个 slash 命令**，session 名自动补全：`/ls /attach /new /persist /kill /interrupt /restart /hibernate /logs /cwd /status /help`
   - **Idle ping 默认抑制**（claude 的"等待输入"通知不打扰；权限提示等其它 notification 仍正常转发）
-- **系统托盘 + Windows toast(无需 IM)。** `agentmux-tray.exe` 与 broker 同进同退，给你一个**常驻托盘图标**,颜色编码 session 状态(绿=idle / 黄=running / 红=待审批或 crash / 灰=broker 离线)。右键展开 per-session 子菜单(Attach / Interrupt / Hibernate / Restart / Kill)、Open web viewer、Stop broker。Toast 在三种事件时弹出:`assistant_message`(点正文走 `agentmux://` URL scheme 启动 `claude-attach`)、`notification`、以及杀手级的 `tool_request`(自带 **`[Allow]` / `[Deny]` 按钮**)。tray 与 Discord **并行**:谁先点谁赢,broker 的 `/tool-decision/:id` 幂等。命名管道做单实例握手。结果:在桌前的时候**几乎不用切到 Discord 也能审批**。
+- **系统托盘 + Windows toast(无需 IM)。** `agentmux-tray.exe` 与 broker 同进同退，给你一个**常驻托盘图标**,颜色编码 session 状态(绿=idle / 黄=running / 红=待审批或 crash / **紫=任一 session locally-owned** / 灰=broker 离线)。右键展开 per-session 子菜单(普通 session: Attach / Interrupt / Hibernate / Restart / Kill;locally-owned session 换成 "Re-adopt to broker")、Open web viewer、Stop broker、以及 **Quit all (broker + discord + tray)** 一键全停(顺手 `taskkill` 残留的 discord 进程,适合排查跨机 token 复用导致的重复回复)。Toast 在三种事件时弹出:`assistant_message`(点正文走 `agentmux://` URL scheme 启动 `claude-attach`)、`notification`、以及杀手级的 `tool_request`(自带 **`[Allow]` / `[Deny]` 按钮**)。tray 与 Discord **并行**:谁先点谁赢,broker 的 `/tool-decision/:id` 幂等。命名管道做单实例握手。结果:在桌前的时候**几乎不用切到 Discord 也能审批**。
 - **Hook 驱动的事件流。** 四个 hook 接入 Claude Code 用户级 `settings.json`：
   - `hook-stop` —— claude 完成 turn 时 POST `assistant_message`
   - `hook-notification` —— 权限提示 / idle ping → POST `notification`
   - `hook-pretool` —— 工具调用**前**同步触发；放行安全工具（Read / Glob / Grep / `cargo` / `git status` / …），高危操作（`rm -rf`、`curl | sh`、session cwd 外的 Edit / Write 等）走 Discord / toast 审批
   - `hook-posttool` —— 工具调用**后**触发，POST `tool_progress` 事件驱动 Discord 的就地编辑式进度流
-  四个 hook 都通过 `AGENT_SESSION_ID` 哨兵识别非 broker 启动的 claude 直接静默退出；本地有 viewer 已 attach 时也跳过 —— 不重复打扰。
+  四个 hook 都通过 `AGENT_SESSION_ID` 哨兵识别非 broker 启动的 claude 直接静默退出。本地有 viewer 已 attach 时跳过用户可见的事件(不重复打扰),但仍会发一个最小的 `session_seen` 内部事件让 broker 学到 claude 的 session id —— 这是 `agentmux demote` 之后能给出正确 `--resume` 命令的前提。
 - **工具审批,两面通吃。** `hook-pretool` 决定要问时，broker **同时**把 `tool_request` 推到 Discord(`✅ Allow` / `❌ Deny` 按钮卡)和本地 tray(Windows toast,带同样按钮,通过 `agentmux://` URL scheme 回路)。hook 在 `/tool-request` 上长轮询最长 5 分钟；任一端点先 POST `/tool-decision/:id` 即赢，broker 对落败者幂等返回 404。绝大多数 turn 触发零个审批；只有真正高危操作才打扰你。
 - **Hibernate / resume + 持久化开关。** 空闲超过 `hibernate_idle_secs` 的 session 关掉 `claude` 子进程释放内存，元信息留在 `sessions.toml`，下次 `/input`（或 attach）通过 `claude --resume <session-id>` 拉回。auto-resume 等 TUI 画面稳定后再注入输入，避免休眠后第一条 IM 消息被启动期吞掉。新建 session 默认是*短暂*的（broker 重启后忘记）—— 用 `!persist on` / `/persist` / `-persist` 标志切换。
+- **本地 ↔ broker 互转(demote / adopt)。** 你在终端里跟 claude 聊得正起劲、突然要出门?跑 `.\agentmux adopt --resume <claude-session-id>`(先在本地 `/exit`),broker 用 `--resume` 在自己的 ConPTY 里把同一份对话接管过来,Discord/web/tray 全可用。反向回收:`.\agentmux demote <name>` 注入 `/exit\r` 等 2 秒(必要时 `TerminateProcess` fallback 1 秒),打印 `cd …; claude --resume <id>` 一行命令贴到本地终端继续。处于 locally-owned 状态期间,broker 拒绝 `/input`/`/interrupt`/`/restart`(返回结构化 409),Discord 给消息加 💤 反应(首次配完整提示,5 分钟窗口内只反应不刷屏),tray 图标变紫色并把 per-session 子菜单换成"Re-adopt to broker"。状态跨 broker 重启保留 —— 频道绑定、cwd、claude_session_id 全在。
 - **局域网远程接入（可选开启）。** 设置 `attach_token` 并把 `http_addr` 绑到 `0.0.0.0:8765`，第二台机器就能用 `claude-attach --broker http://host:8765 --token <…>` 通过 WebSocket 接入。回环调用方（同机现有工具）跳过鉴权；非回环调用方必须带 `Authorization: Bearer <token>`。
 - **浏览器 web viewer。** 任何设备（笔记本、手机、平板）打开 `http://<broker>:8765/` 都能 attach —— 单文件 HTML 由 broker.exe 直接 serve，xterm.js 和 fit addon 通过 `include_bytes!` **嵌入** broker 二进制（不走 CDN，离线 / 隔离网络也能用）。Token 输入存 localStorage，回环浏览器跳过 token 提问。WebSocket 自带指数退避重连（broker 重启不丢 scrollback）。触屏设备底部出软键盘条（Esc / Tab / 方向键 / `^C` `^D` `^L` `^Z`），补全虚拟键盘缺失的键。WS 鉴权用 `Sec-WebSocket-Protocol: bearer.<token>` 子协议（浏览器没法在 WebSocket 上设 Authorization header）。
 - **一行命令安装。** `.\agentmux init` 走交互式向导。日常用 `.\agentmux start | stop | status | attach | logs | config | discord` 一套子命令；配置编辑通过 `agentmux-cli` 保留注释和格式。`.\agentmux config token --set` 一键生成 32 字节随机 token 并写入 `broker.toml`。
@@ -98,8 +99,16 @@ cargo build --release
 ```powershell
 .\agentmux start             # broker + tray + Discord bot(如已配置)
 .\agentmux stop              # 全部停掉
-.\agentmux status            # 一行健康摘要
-.\agentmux attach [name]     # 进 TUI；不传名字走菜单选择
+.\agentmux status            # 一行健康摘要; locally-owned 用紫色显示
+.\agentmux attach [name]     # 进 TUI;不传名字走菜单选择
+.\agentmux new <name> [-Cwd <path>] [-Persist|-Ephemeral]
+                             # 创建 session(默认 cwd = config.default_cwd)
+.\agentmux kill <name> [-Force]
+                             # 删除 session 记录(无 -Force 会确认)
+.\agentmux adopt --resume <claude-session-id> [name] [--cwd <path>]
+                             # 把外部 claude 对话接管到 broker
+.\agentmux adopt <name>      # 重新接管之前 demote 的 session
+.\agentmux demote <name>     # 把 session 交还给本地终端
 .\agentmux logs broker       # 还可:discord / tray / events
 .\agentmux help              # 完整命令列表
 ```
@@ -196,6 +205,7 @@ $env:AGENT_ATTACH_TOKEN = "rjVBS19l...43字符..."
 | `hibernate_idle_secs` | `86400` | 空闲超过多少秒自动休眠（0 = 关闭） |
 | `auto_resume_default` | `false` | 为 `true` 时新 session 默认持久化；per-session 标志仍优先 |
 | `attach_token` | (空) | 非回环 HTTP/WS 的 Bearer token。空 = 禁用 LAN 接入。用 `.\agentmux config token --set` 生成 |
+| `default_cwd` | (空) | 创建新 session 时的默认工作目录(API 调用没传 `cwd` 时用)。空 = 用 broker 启动时的 cwd(老行为)。设置之后,新 session 的 cwd 不再依赖你跑 `.\agentmux start` 时所在的目录。`agentmux init` 向导会引导设置。 |
 | `sessions_toml_path` | `%LOCALAPPDATA%\agentmux\sessions.toml` | session 持久化文件路径 |
 | `pid_file_path` | `%LOCALAPPDATA%\agentmux\broker.pid` | 单实例锁文件路径 |
 | `log_dir` | `%LOCALAPPDATA%\agentmux\logs` | 按天滚动日志目录 |
@@ -224,15 +234,17 @@ $env:AGENT_ATTACH_TOKEN = "rjVBS19l...43字符..."
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| `GET` | `/sessions` | 列出所有 session（id、name、cwd、viewers、state、auto_resume） |
-| `POST` | `/sessions` | 创建 session（`{"name", "cwd"?, "auto_resume"?}`）；`auto_resume` 缺省取 `auto_resume_default` |
+| `GET` | `/sessions` | 列出所有 session（id、name、cwd、viewers、state、auto_resume、claude_session_id）。state 取值 `idle` / `hibernated` / `crashed` / `locally_owned` |
+| `POST` | `/sessions` | 创建 session（`{"name", "cwd"?, "auto_resume"?, "resume_session_id"?}`）；`auto_resume` 缺省取 `auto_resume_default`;`resume_session_id`(claude 自己的 UUID)让 broker 用 `claude --resume <id>` 接管已存在的对话 |
 | `GET` | `/sessions/:key` | 查询单个 session（key 可以是 id 或 name） |
 | `DELETE` | `/sessions/:key?force=true` | 杀掉 session |
 | `GET` | `/sessions/:key/state` | 轻量探针：存活 / 空闲 / viewer 数 |
-| `POST` | `/sessions/:key/interrupt` | 给 session 的 PTY 写 `0x03`（等同于在 claude 里按 Ctrl+C） |
-| `POST` | `/sessions/:key/restart` | 杀掉并重启 claude 子进程，保留 session id |
-| `POST` | `/sessions/:key/hibernate` | 关闭 claude 子进程但保留元信息，待下次 resume |
-| `POST` | `/sessions/:key/input` | 注入文本到 session 的 PTY stdin（`{"text", "append_enter"?}`）。`Hibernated/Crashed` 自动 resume；末尾 `\r` 与文本分两次写、间隔 30ms，避免 claude TUI 把它们当成 paste-burst 而不 submit |
+| `POST` | `/sessions/:key/interrupt` | 给 session 的 PTY 写 `0x03`（等同于在 claude 里按 Ctrl+C）。session 处于 locally-owned 时返回 409 + 结构化 body `{"error":"locally_owned",…}` |
+| `POST` | `/sessions/:key/restart` | 杀掉并重启 claude 子进程，保留 session id。locally-owned 时 409 |
+| `POST` | `/sessions/:key/hibernate` | 关闭 claude 子进程但保留元信息，待下次 resume。locally-owned 时 409 |
+| `POST` | `/sessions/:key/demote` | 把 session 交还给本地终端:向 claude 注入 `/exit\r`(graceful 2 秒等待),不退就 `TerminateProcess`(再 1 秒等待),还在的话返回 500。成功后丢弃 PTY、状态转 `LocallyOwned`、返回 `{claude_session_id, cwd, graceful, suggested_command}` |
+| `POST` | `/sessions/:key/adopt` | 接回 `LocallyOwned` 的 session:在 broker 用 `claude --resume <stored-id>` 起新进程。调用方负责先把本地 `claude --resume` 退掉 |
+| `POST` | `/sessions/:key/input` | 注入文本到 session 的 PTY stdin（`{"text", "append_enter"?}`）。`Hibernated/Crashed` 自动 resume;locally-owned 时返回 409 + 结构化 body。末尾 `\r` 与文本分两次写、间隔 30ms，避免 claude TUI 把它们当成 paste-burst 而不 submit |
 | `POST` | `/sessions/:key/persist` | 切换 session 的 `auto_resume` 标志（`{"auto_resume": bool}`），重写 sessions.toml |
 | `GET` | `/sessions/:key/ring` | 诊断：环形缓冲区原始字节快照 —— 配合 `xxd` / `od -c` 看 |
 | `POST` | `/event` | hook 摄入端点 —— 追加到 `events.YYYY-MM-DD.jsonl`，并 tee 到 `/ws` |

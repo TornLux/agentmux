@@ -31,15 +31,16 @@ agentmux turns Claude Code into an always-on, multi-session background service. 
   - **Attachment forwarding** — drop an image into Discord, the bot saves it locally and tells claude to `Read` it
   - **12 slash commands** with autocomplete on session names: `/ls /attach /new /persist /kill /interrupt /restart /hibernate /logs /cwd /status /help`
   - **Idle-ping suppression** by default (claude code's "Claude is waiting for your input" Notification hook is dropped; permission prompts still pass through)
-- **System tray + Windows toast (no IM required).** `agentmux-tray.exe` runs alongside the broker and gives you a **persistent tray icon** colour-coded by session state (green idle / yellow running / red waiting on approval / gray broker offline). Right-click for a per-session menu (Attach / Interrupt / Hibernate / Restart / Kill), Open web viewer, Stop broker. Toast notifications for `assistant_message` (click to spawn `claude-attach` for that session via the registered `agentmux://` URL scheme), `notification`, and — the killer feature — `tool_request` toasts with **`[Allow]` / `[Deny]` action buttons**. The tray runs in parallel with Discord; both endpoints race to resolve a tool approval, broker takes whichever decision arrives first. Single-instance handshake via named pipe. Result: at-the-desk users almost never need to open Discord for permissioning.
+- **System tray + Windows toast (no IM required).** `agentmux-tray.exe` runs alongside the broker and gives you a **persistent tray icon** colour-coded by session state (green idle / yellow running / red waiting on approval / **purple if any session is locally-owned** / gray broker offline). Right-click for a per-session menu (Attach / Interrupt / Hibernate / Restart / Kill, or Re-adopt for locally-owned sessions), Open web viewer, Stop broker, and **Quit all (broker + discord + tray)** for a one-click full shutdown that also cleans up stray bot processes. Toast notifications for `assistant_message` (click to spawn `claude-attach` for that session via the registered `agentmux://` URL scheme), `notification`, and — the killer feature — `tool_request` toasts with **`[Allow]` / `[Deny]` action buttons**. The tray runs in parallel with Discord; both endpoints race to resolve a tool approval, broker takes whichever decision arrives first. Single-instance handshake via named pipe. Result: at-the-desk users almost never need to open Discord for permissioning.
 - **Hook-driven event log.** Four hooks plug into Claude Code's user-global `settings.json`:
   - `hook-stop` — POSTs `assistant_message` events when claude finishes a turn
   - `hook-notification` — POSTs `notification` events for permission prompts / idle pings
   - `hook-pretool` — runs *synchronously* before each tool call; auto-allows safe tools (Read / Glob / Grep / `cargo` / `git status` / …) and asks via Discord/toast for risky ones (`rm -rf`, `curl | sh`, files outside the session cwd, …)
   - `hook-posttool` — fires after each tool call and POSTs `tool_progress` events that drive Discord's edit-in-place narration
-  All four bail silently for non-broker claudes via the `AGENT_SESSION_ID` sentinel, and skip when a local viewer is attached — no double-notify.
+  All four bail silently for non-broker claudes via the `AGENT_SESSION_ID` sentinel. With a local viewer attached, the user-facing event is skipped (no double-notify) but a tiny `session_seen` capture event still fires so broker learns claude's session id — required for `agentmux demote` to print the right `--resume` command after a turn that only had a terminal viewer.
 - **Tool-use approval, two surfaces.** When `hook-pretool` decides to ask, the broker fans out a `tool_request` event in parallel to Discord (`✅ Allow` / `❌ Deny` button card) and the local tray (Windows toast with the same action buttons via the `agentmux://` URL scheme). The hook long-polls `/tool-request` for up to 5 minutes; whichever endpoint POSTs `/tool-decision/:id` first wins, broker idempotently 404s the loser. Most turns trigger zero prompts; only genuinely risky operations interrupt you.
 - **Hibernate / resume + per-session persist.** Sessions idle past `hibernate_idle_secs` shut their `claude` child down while metadata stays in `sessions.toml`; the next `/input` (or attach) revives the session via `claude --resume <session-id>`. Auto-resume waits for the TUI to settle before injecting input, so the first IM message after a hibernate doesn't get eaten by claude's startup. New sessions default to *ephemeral* (forgotten on broker restart) — flip with `!persist on` / `/persist` / `-persist` flag at create time.
+- **Local ↔ broker handover (demote / adopt).** Started a session in your terminal and now want to keep working remotely? Run `.\agentmux adopt --resume <claude-session-id>` after exiting the local `claude` — broker spawns `claude --resume` on the same conversation under its own ConPTY. Going the other way: `.\agentmux demote <name>` injects `/exit` into broker's claude, waits up to 2 s for graceful shutdown (escalates to `TerminateProcess` if needed), and prints a one-liner `cd …; claude --resume <id>` for you to paste into a fresh terminal. While locally-owned, broker refuses `/input`/`/interrupt`/`/restart` with a structured 409 — Discord posts a 💤 reaction (with first-time-only full guidance), tray turns purple and offers "Re-adopt to broker". State survives broker restart so you don't lose channel bindings or session metadata across the round-trip.
 - **Remote viewer over LAN (opt-in).** Set `attach_token` and bind `http_addr = "0.0.0.0:8765"` and `claude-attach --broker http://host:8765` connects via WebSocket from another machine. Loopback callers (existing local tooling) bypass the auth check; non-loopback callers must present `Authorization: Bearer <token>`.
 - **Browser-based web viewer.** Navigate to `http://<broker>:8765/` from any device (laptop, phone, tablet) — the broker serves a single-file HTML page with xterm.js + the fit addon **embedded into broker.exe** (no CDN dependency, works on isolated networks). Token entry persists to localStorage; loopback browsers skip it entirely. WebSocket auto-reconnect with backoff handles broker restarts without losing scrollback. Touch devices get a soft-key bar (Esc / Tab / arrows / `^C` `^D` `^L` `^Z`) for keys virtual keyboards don't surface. Auth uses a `Sec-WebSocket-Protocol: bearer.<token>` subprotocol since browsers cannot set the Authorization header on WebSockets.
 - **One-command setup.** `.\agentmux init` walks an interactive wizard. Day-to-day is `.\agentmux start | stop | status | attach | logs | config | discord` — config edits are format-preserving via the bundled `agentmux-cli` helper. `.\agentmux config token --set` generates a 32-byte random LAN token and writes it to broker.toml.
@@ -105,8 +106,16 @@ re-run any time without harm.
 ```powershell
 .\agentmux start             # broker + tray + Discord bot (if configured)
 .\agentmux stop              # all of the above
-.\agentmux status            # one-line health summary
+.\agentmux status            # one-line health summary; locally-owned shown in magenta
 .\agentmux attach [name]     # enter the TUI; menu picker if no name
+.\agentmux new <name> [-Cwd <path>] [-Persist|-Ephemeral]
+                             # create a session (default cwd = config.default_cwd)
+.\agentmux kill <name> [-Force]
+                             # delete a session record (asks unless -Force)
+.\agentmux adopt --resume <claude-session-id> [name] [--cwd <path>]
+                             # bring an external claude conversation under broker
+.\agentmux adopt <name>      # re-adopt a previously-demoted session
+.\agentmux demote <name>     # hand a session back to local terminal control
 .\agentmux logs broker       # also: discord, tray, events
 .\agentmux help              # full command list
 ```
@@ -219,6 +228,7 @@ menu.
 | `hibernate_idle_secs` | `86400` | Auto-hibernate idle sessions after this many seconds (0 = off) |
 | `auto_resume_default` | `false` | When `true`, new sessions persist to disk by default; per-session flag still wins |
 | `attach_token` | (empty) | Bearer token for non-loopback HTTP/WS. Empty = LAN access disabled. Generate via `.\agentmux config token --set` |
+| `default_cwd` | (empty) | Default working directory for newly-created sessions when the caller doesn't specify one. Empty = use broker's launch cwd (legacy). Set this so new-session cwd doesn't depend on which directory you happened to be in when running `.\agentmux start`. The init wizard prompts for this. |
 | `sessions_toml_path` | `%LOCALAPPDATA%\agentmux\sessions.toml` | Override session persistence file |
 | `pid_file_path` | `%LOCALAPPDATA%\agentmux\broker.pid` | Override singleton lock file |
 | `log_dir` | `%LOCALAPPDATA%\agentmux\logs` | Override daily-rolling log directory |
@@ -247,15 +257,17 @@ All endpoints are loopback-only by default. When `attach_token` is set and `http
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/sessions` | List all sessions (id, name, cwd, viewers, state, auto_resume) |
-| `POST` | `/sessions` | Create a session (`{"name", "cwd"?, "auto_resume"?}`); `auto_resume` defaults to `auto_resume_default` |
+| `GET` | `/sessions` | List all sessions (id, name, cwd, viewers, state, auto_resume, claude_session_id). State is one of `idle` / `hibernated` / `crashed` / `locally_owned` |
+| `POST` | `/sessions` | Create a session (`{"name", "cwd"?, "auto_resume"?, "resume_session_id"?}`); `auto_resume` defaults to `auto_resume_default`; `resume_session_id` (Claude's UUID) makes broker spawn `claude --resume <id>` to adopt an existing conversation |
 | `GET` | `/sessions/:key` | Inspect one session (key = id or name) |
 | `DELETE` | `/sessions/:key?force=true` | Kill the session |
 | `GET` | `/sessions/:key/state` | Lightweight liveness / idle / viewer-count probe |
-| `POST` | `/sessions/:key/interrupt` | Send `0x03` to the session's PTY (== Ctrl+C inside claude) |
-| `POST` | `/sessions/:key/restart` | Kill and respawn the claude child, preserving session id |
-| `POST` | `/sessions/:key/hibernate` | Stop the claude child but keep metadata for later resume |
-| `POST` | `/sessions/:key/input` | Inject text into a session's PTY stdin (`{"text", "append_enter"?}`). Auto-resumes Hibernated/Crashed; the trailing `\r` is written **after** the text payload with a 30 ms gap so claude code's TUI doesn't bundle them into one paste-burst (which would skip the submit) |
+| `POST` | `/sessions/:key/interrupt` | Send `0x03` to the session's PTY (== Ctrl+C inside claude). Returns 409 with structured `{"error":"locally_owned",…}` body if session is locally-owned |
+| `POST` | `/sessions/:key/restart` | Kill and respawn the claude child, preserving session id. 409 on locally-owned |
+| `POST` | `/sessions/:key/hibernate` | Stop the claude child but keep metadata for later resume. 409 on locally-owned |
+| `POST` | `/sessions/:key/demote` | Hand a session back to local terminal: inject `/exit\r` into claude (graceful, 2 s window), escalate to `TerminateProcess` if needed (1 s window), 500 if claude survives both. On success: drops PTY, transitions to `LocallyOwned`, returns `{claude_session_id, cwd, graceful, suggested_command}` |
+| `POST` | `/sessions/:key/adopt` | Re-adopt a `LocallyOwned` session: spawn claude under broker with `--resume <stored-id>`. Caller is responsible for having exited any local `claude --resume` first |
+| `POST` | `/sessions/:key/input` | Inject text into a session's PTY stdin (`{"text", "append_enter"?}`). Auto-resumes Hibernated/Crashed. Returns 409 with `{"error":"locally_owned",…}` body if locally-owned. The trailing `\r` is written **after** the text payload with a 30 ms gap so claude code's TUI doesn't bundle them into one paste-burst (which would skip the submit) |
 | `POST` | `/sessions/:key/persist` | Toggle the per-session `auto_resume` flag (`{"auto_resume": bool}`) and re-save sessions.toml |
 | `GET` | `/sessions/:key/ring` | Diagnostic: raw ring-buffer snapshot — pipe through `xxd` / `od -c` |
 | `POST` | `/event` | Hook ingestion endpoint — appends to `events.YYYY-MM-DD.jsonl` and tees to `/ws` |
@@ -275,8 +287,8 @@ All endpoints are loopback-only by default. When `attach_token` is set and `http
 | `claude-attach` | Terminal viewer. Frame-protocol client with two transports: named pipe (default, local) and WebSocket (`--broker http://host:port --token …` for LAN). Session-picker menu, raw-mode stdin forwarding, Ctrl+C escalation, resize coordination |
 | `platform-discord` | Discord IM adapter. Per-channel session bindings (persisted), edit-in-place placeholders with live tool-progress narration, reply-thread routing with optional quote injection, attachment forwarding (image/text), 12 slash commands with autocomplete, reaction commands, tool-use approval buttons, idle-ping suppression, mention wake, DM mode, orphan-placeholder recovery |
 | `agentmux-tray` | System-tray icon + Windows toast notifications. Subscribes to `/ws` for live events, polls `/sessions` for menu state. Per-session right-click submenu; toasts on `assistant_message` / `notification` / `tool_request` (with `[Allow]` `[Deny]` action buttons via the `agentmux://` URL scheme). Single-instance handshake (named pipe), HKCU URL-scheme registration on first run |
-| `hook-stop` | Claude Code `Stop` hook. Reads transcript, posts `assistant_message` to broker. Bails silently when a local viewer is attached |
-| `hook-notification` | Claude Code `Notification` hook. Posts `notification` events to broker |
+| `hook-stop` | Claude Code `Stop` hook. Reads transcript, posts `assistant_message` to broker. Always emits a tiny internal `session_seen` event first (so broker learns claude's session id even when the user-facing event is suppressed). Bails silently for the user-facing event when a local viewer is attached |
+| `hook-notification` | Claude Code `Notification` hook. Same `session_seen` capture, posts `notification` events for permission prompts / idle pings |
 | `hook-pretool` | Claude Code `PreToolUse` hook. Smart classifier auto-allows safe tools and dev-flow `Bash` patterns; long-polls `/tool-request` for the rest. Fails open on broker outage so claude isn't blocked by infrastructure failure |
 | `hook-posttool` | Claude Code `PostToolUse` hook. Posts `tool_progress` events that drive Discord's edit-in-place narration (`✏️ edit src/x.rs`, `🖥 $ cargo test`, …). Fail-open + local-viewer-bail like the others |
 | `agentmux-cli` | Helper invoked by `agentmux.ps1` for format-preserving TOML edits and per-kind config validation |
