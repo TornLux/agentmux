@@ -119,6 +119,26 @@ fn check_broker(path: &Path, had_failure: &mut bool) -> Result<()> {
             token.chars().count()
         );
     }
+
+    // default_cwd: a typo here is annoying because broker quietly
+    // falls back to the launch cwd. Catch missing-dir at config-check
+    // time so the user sees a ✗ instead of "huh, my new sessions
+    // keep landing in the wrong folder".
+    let default_cwd = doc
+        .get("default_cwd")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if default_cwd.is_empty() {
+        println!("✓ default_cwd = (unset — new sessions inherit broker's launch cwd)");
+    } else if Path::new(default_cwd).is_dir() {
+        println!("✓ default_cwd = {default_cwd}");
+    } else {
+        println!(
+            "✗ default_cwd = {default_cwd:?} does not exist — broker will fall back to launch cwd"
+        );
+        *had_failure = true;
+    }
+
     Ok(())
 }
 
