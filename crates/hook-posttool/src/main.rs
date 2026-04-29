@@ -56,6 +56,18 @@ fn run() -> Result<()> {
     let broker_url =
         std::env::var("AGENT_BROKER_URL").unwrap_or_else(|_| DEFAULT_BROKER_URL.to_string());
 
+    // Capture-only nudge: ensures broker learns claude_session_id
+    // even when the hook bails-on-local-viewer below. See hook-stop
+    // for the rationale.
+    if !transcript_path.is_empty() {
+        let seen = json!({
+            "session_id": session_id,
+            "type": "session_seen",
+            "transcript_path": transcript_path,
+        });
+        let _ = post_json(&format!("{broker_url}/event"), &seen.to_string());
+    }
+
     // Mirror hook-stop / hook-notification: when a local Terminal
     // viewer is attached the user is already watching the tool calls
     // happen in the TUI — don't fan out a parallel narrative to IM.

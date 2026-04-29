@@ -41,6 +41,18 @@ fn run() -> Result<()> {
     let broker_url =
         std::env::var("AGENT_BROKER_URL").unwrap_or_else(|_| DEFAULT_BROKER_URL.to_string());
 
+    // Capture-only nudge: see hook-stop for rationale. Ensures
+    // broker learns claude_session_id even when this hook bails
+    // because a local viewer is attached.
+    if !transcript_path.is_empty() {
+        let seen = json!({
+            "session_id": session_id,
+            "type": "session_seen",
+            "transcript_path": transcript_path,
+        });
+        let _ = post_json(&format!("{broker_url}/event"), &seen.to_string());
+    }
+
     // PLAN §2.5 / Phase 9: skip the event when a local Terminal
     // viewer is attached — they're already watching claude's
     // notification on the TUI.

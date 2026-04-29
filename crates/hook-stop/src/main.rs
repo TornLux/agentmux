@@ -47,6 +47,20 @@ fn run() -> Result<()> {
     let broker_url =
         std::env::var("AGENT_BROKER_URL").unwrap_or_else(|_| DEFAULT_BROKER_URL.to_string());
 
+    // Always tell broker the claude_session_id mapping even if we're
+    // about to bail-on-local-viewer for the user-facing event below.
+    // Without this, demote/restart/resume can't issue --resume after
+    // a session whose only attach surface was a local terminal.
+    // session_seen is an internal capture nudge — broker short-
+    // circuits on the type so it doesn't fan to IM / appear in
+    // events.jsonl.
+    let seen = json!({
+        "session_id": session_id,
+        "type": "session_seen",
+        "transcript_path": transcript_path,
+    });
+    let _ = post_json(&format!("{broker_url}/event"), &seen.to_string());
+
     // PLAN §2.5 / Phase 9: when a local Terminal viewer is attached
     // the user is already watching the TUI live — don't double-notify
     // them by writing this event. We still wouldn't see the GET fail
