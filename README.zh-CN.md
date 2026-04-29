@@ -39,6 +39,7 @@ agentmux 把 Claude Code 改造成一个常驻的多会话后台服务。一个�
 - **Discord 工具审批。** `hook-pretool` 决定要问时，Discord 会推一条带 `✅ Allow` / `❌ Deny` 按钮的消息。hook 在 `/tool-request` 上长轮询最长 5 分钟；按钮按下的瞬间 broker 解开长轮询返回决策，超时则按 deny 处理。绝大多数 turn 触发零个审批；只有真正高危操作才打扰你。
 - **Hibernate / resume + 持久化开关。** 空闲超过 `hibernate_idle_secs` 的 session 关掉 `claude` 子进程释放内存，元信息留在 `sessions.toml`，下次 `/input`（或 attach）通过 `claude --resume <session-id>` 拉回。auto-resume 等 TUI 画面稳定后再注入输入，避免休眠后第一条 IM 消息被启动期吞掉。新建 session 默认是*短暂*的（broker 重启后忘记）—— 用 `!persist on` / `/persist` / `-persist` 标志切换。
 - **局域网远程接入（可选开启）。** 设置 `attach_token` 并把 `http_addr` 绑到 `0.0.0.0:8765`，第二台机器就能用 `claude-attach --broker http://host:8765 --token <…>` 通过 WebSocket 接入。回环调用方（同机现有工具）跳过鉴权；非回环调用方必须带 `Authorization: Bearer <token>`。
+- **浏览器 web viewer。** 任何设备（笔记本、手机、平板）打开 `http://<broker>:8765/` 都能 attach —— 单文件 HTML 由 broker.exe 直接 serve，xterm.js 和 fit addon 通过 `include_bytes!` **嵌入** broker 二进制（不走 CDN，离线 / 隔离网络也能用）。Token 输入存 localStorage，回环浏览器跳过 token 提问。WebSocket 自带指数退避重连（broker 重启不丢 scrollback）。触屏设备底部出软键盘条（Esc / Tab / 方向键 / `^C` `^D` `^L` `^Z`），补全虚拟键盘缺失的键。WS 鉴权用 `Sec-WebSocket-Protocol: bearer.<token>` 子协议（浏览器没法在 WebSocket 上设 Authorization header）。
 - **一行命令安装。** `.\agentmux init` 走交互式向导。日常用 `.\agentmux start | stop | status | attach | logs | config | discord` 一套子命令；配置编辑通过 `agentmux-cli` 保留注释和格式。`.\agentmux config token --set` 一键生成 32 字节随机 token 并写入 `broker.toml`。
 - **broker 单实例 + 按天日志 + 审计日志。** PID 文件防止两个 broker 抢同一根管道；`broker.YYYY-MM-DD.log` 和 `events.YYYY-MM-DD.jsonl` 在 `%LOCALAPPDATA%\agentmux\` 下按天滚动，保留 7 天。
 
@@ -47,6 +48,7 @@ agentmux 把 Claude Code 改造成一个常驻的多会话后台服务。一个�
 ```mermaid
 flowchart LR
     Term["Windows Terminal"]
+    Browser["浏览器<br/>(xterm.js, 内嵌)"]
     Hooks["Claude Code hooks<br/>(hook-stop, hook-notification, hook-pretool)"]
     Attach["claude-attach.exe<br/>(本机: 命名管道 / LAN: WS+token)"]
     Discord["platform-discord.exe<br/>(IM 适配器)"]
@@ -57,6 +59,7 @@ flowchart LR
 
     Term -- "spawn" --> Attach
     Attach -- "命名管道<br/>或 WS /attach" --> Broker
+    Browser -- "GET /<br/>WS /attach (子协议鉴权)" --> Broker
     Hooks -- "POST /event<br/>POST /tool-request (长轮询)" --> Broker
     Discord -- "WS /ws<br/>POST /input + /tool-decision/:id" --> Broker
     Broker --> Sess
@@ -98,6 +101,8 @@ cargo build --release
 ```
 
 `.\agentmux start --foreground` 让 broker 直接在当前 shell 里跑（Ctrl+C 退出），方便调试 —— panic 和 tracing 输出直接在终端里看到，不去日志文件。
+
+要在任意设备(无需装东西、手机也行)用浏览器 attach,broker 跑起来之后打开 `http://<broker>:8765/`。回环浏览器跳过 token 提问;LAN 浏览器粘贴跟 `claude-attach --broker` 同一个 `attach_token`。
 
 ### 4. 配置助手
 
@@ -228,8 +233,10 @@ $env:AGENT_ATTACH_TOKEN = "rjVBS19l...43字符..."
 | `POST` | `/tool-request` | **长轮询，最长 5 分钟。** hook-pretool 发 `{ session_id, tool_name, tool_input }`；broker 生成 UUID、广播 `tool_request` 事件，等待 `/tool-decision/:id`，返回 `{ allow, reason }`。超时返回 `{ allow: false, reason: "no human decision within 300s" }` |
 | `POST` | `/tool-decision/:request_id` | 解开一条挂起的 `/tool-request`（`{"allow": bool, "reason"?}`） |
 | `GET` | `/ws` | WebSocket 事件总线 —— 每个标注好的 hook 事件以一行 JSON 推给订阅者 |
-| `GET` | `/attach` | WebSocket viewer 接入。每条帧（HELLO / PTY_DATA / RESIZE / CONTROL）作为一个 Binary 消息。`claude-attach --broker` 走的就是这条 |
-| `POST` | `/shutdown` | broker 优雅关闭（杀光所有 claude、排空、退出） |
+| `GET` | `/attach` | WebSocket viewer 接入。每条帧（HELLO / PTY_DATA / RESIZE / CONTROL）作为一个 Binary 消息。LAN 上的 `claude-attach --broker` 和浏览器 viewer 都走这条(浏览器用 `Sec-WebSocket-Protocol: bearer.<token>` 子协议鉴权,因为 WebSocket 没法设 `Authorization` header) |
+| `GET` | `/`、`/web`、`/web/` | 浏览器 web viewer 主页 —— 单文件 HTML 直接由 broker.exe 提供。**Public** 不走鉴权(用户得先打开页面才能粘 token);页面里的特权调用(`/sessions`、`/attach`)依然走 auth middleware |
+| `GET` | `/web/vendor/*` | 嵌入的 xterm.js + addon-fit + xterm.css(~290 KB,通过 `include_bytes!` 入二进制),带 `Cache-Control: public, max-age=86400` |
+| `POST` | `/shutdown` | broker 优雅关闭(杀光所有 claude、排空、退出) |
 
 ## Crate 一览
 
@@ -252,6 +259,7 @@ agentmux/
 ├── QUICKSTART.md           # 一页用户向导
 ├── crates/
 │   ├── broker/             # 多会话守护进程
+│   │   └── web/            # 浏览器 viewer(HTML + 内嵌的 xterm.js)
 │   ├── claude-attach/      # 终端 viewer (pipe + WS)
 │   ├── platform-discord/   # Discord IM 适配器
 │   ├── hook-stop/          # Stop hook → assistant_message

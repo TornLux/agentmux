@@ -248,6 +248,39 @@ arrival order, and resize coordinates to the smallest pane (so claude
 never overflows the smaller window). Don't both type at once — claude
 has one input field and concurrent keystrokes interleave.
 
+### From a browser (no install)
+
+Same broker, no client-side install. From any device that can reach the
+broker host:
+
+```
+http://192.168.X.Y:8765/
+```
+
+The page is served from broker.exe itself (xterm.js + the fit addon
+embedded via `include_bytes!`, no CDN), so it works on isolated LANs
+with no internet access.
+
+- **Loopback browsers** (`http://127.0.0.1:8765/`) skip the token prompt
+  entirely — the auth middleware exempts loopback, same as for native
+  tooling.
+- **LAN browsers** see a token entry; paste the same `attach_token` you
+  generated above. It persists to `localStorage` so refreshes don't
+  re-prompt. WebSocket auth uses a `Sec-WebSocket-Protocol` subprotocol
+  carrying the token (browsers cannot set the `Authorization` header
+  on WebSockets), validated by the broker's middleware.
+- **Auto-reconnect** with exponential backoff (1 s → 30 s cap) when
+  the broker restarts. Scrollback survives the gap.
+- **Touch devices** get a soft-key bar at the bottom (Esc / Tab /
+  arrows / `^C` `^D` `^L` `^Z`) for keys most virtual keyboards omit.
+  Tapping `^C` on the bar bypasses the Ctrl+C escalation tracker on
+  purpose, so triple-tapping doesn't accidentally shut the broker down.
+
+The browser viewer is a peer of `claude-attach` over the named pipe
+or LAN WebSocket — same fan-out, same input merging, same resize
+coordination. Multiple viewers (browser, native, IM) on the same
+session all see the same TUI.
+
 ### Reverting to loopback-only
 
 ```powershell

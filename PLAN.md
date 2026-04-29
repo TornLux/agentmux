@@ -902,6 +902,10 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 ### 进度速览
 
+截至 v0.2.1。原 plan 里的核心 phase 1-9 全部落地,additional 的 LAN/web/
+release pipeline 等都做了。剩下的开放项是新方向(跨平台、vendor-agnostic
+backend、cost dashboard 等),见末尾 §11.
+
 | Phase | 状态 | 备注 |
 |---|---|---|
 | 1. 最小链路(cmd) | ✅ 完成 | commit `5b5b41f` |
@@ -909,18 +913,23 @@ rustflags = ["-C", "target-feature=+crt-static"]
 | 3. resize + 帧协议 + ANSI 裁剪 | ✅ 完成 | `5b5b41f` |
 | 4. 多 viewer + Ctrl+C 多击 + HTTP 控制面 | ✅ 完成 | `5b5b41f`(detach 键改为 Ctrl+Q / Ctrl+]) |
 | 5. hooks → events.jsonl | ✅ 完成 | `83bdba5`(含 install-hooks.ps1 + AGENT_SESSION_ID 哨兵) |
-| 6a/b/c. IM 适配器 | ⏸ 跳过 | 用户暂不接 IM |
-| 7. IM 输入 → claude | ⏸ 跳过 | 依赖 Phase 6 |
+| 6a. Discord IM 适配器 | ✅ 完成 | `10a4791` MVP → `858b133` 大改进:per-channel binding、edit-in-place + typing indicator、reply-thread 路由、attachment forwarding、12 slash commands、reaction commands、@mention wake、DM mode、orphan recovery |
+| 6b. Telegram 适配器 | ⏸ 跳过 | 当前需求只用 Discord;imbot-core 抽象未做(目前 platform-discord 直接调 serenity) |
+| 6c. QQ 适配器 | ⏸ 跳过 | 同上 |
+| 7. IM 输入 → claude | ✅ 完成 | `POST /sessions/:k/input` + 多行 submit fix + Bot 端转发 |
 | 7.5. 多 session 重构 | ✅ 完成 | `8e0bc06` |
-| 7.6. 菜单 + IM 命令 | ◐ 部分 | claude-attach 菜单完成 `7298e69`;IM 命令依赖 Phase 6 跳过 |
+| 7.6. 菜单 + IM 命令 | ✅ 完成 | claude-attach 菜单 `7298e69`;Discord 12 个 slash + `!`-prefix 等价 commands |
 | (额外)config 文件 + viewers 计数 + /state 端点 | ✅ 完成 | `d0c8307` |
 | 7.7-A. Hibernate + 持久化 | ✅ 完成 | `7d74b9d` |
 | 7.7-B. idle 自动 hibernate + crash 检测 | ✅ 完成 | `c5e331f` |
-| 7.8. LLM router | ⏸ 跳过 | 依赖 Phase 6 |
-| 8. 危险命令 IM 审批 | ⏸ 跳过 | 依赖 Phase 6 |
-| 9. 本地在场则闭嘴 | ✅ 完成 | hook 在 local_viewer_attached=true 时静默 |
-| 10. 运维(部分) | ◐ 部分 | PID 文件 + 按天轮转日志 已做 `0e7bbae`;开机自启 / claude crash 自动重启 跳过 |
-| 11. 打磨 | ◐ 部分 | 静态 CRT 已配置(`.cargo/config.toml`);其余可选 |
+| 7.8. LLM router | ⏸ 跳过 | 实际未上 —— Discord 直转的体感够用,自然语言 router 没成为痛点 |
+| 8. 危险命令 IM 审批 | ✅ 完成 | `858b133` `hook-pretool` + `/tool-request` long-poll + Discord ✅/❌ buttons,fail-open on broker outage |
+| 9. 本地在场则闭嘴 | ✅ 完成 | hook 在 `local_viewer_attached=true` 时静默 |
+| 10. 运维 | ◐ 部分 | PID 文件 + 按天轮转日志 + events.YYYY-MM-DD.jsonl 7 日 retention 都已完成;开机自启 / claude crash 自动重启**主动跳过** |
+| 11. 打磨 | ◐ 部分 | 静态 CRT 链接、unified `agentmux.ps1` 入口、agentmux-cli TOML 助手、release zip + GitHub Actions 自动发布,都已完成;systray / 输入锁 等剩余项可选 |
+| **额外:LAN attach + token auth** | ✅ 完成 | `ebfd70f` `claude-attach --broker http://host:port`,`Authorization: Bearer` 鉴权,loopback 豁免,constant-time 比较 |
+| **额外:浏览器 web viewer** | ✅ 完成 | `1f67820` (v0.2.1) `http://broker:8765/` 单文件 HTML,xterm.js + addon-fit 通过 `include_bytes!` 嵌入(broker.exe 自包含),WS subprotocol auth 给浏览器,自动重连,移动端软键盘条 |
+| **额外:release pipeline** | ✅ 完成 | `scripts/build-release.ps1` + `.github/workflows/release.yml` —— 推 `v*` tag 自动 windows-latest 跑 cargo build + 打 zip + 创 GitHub Release + sha256 校验和 |
 
 ### Phase 1:最小可跑链路(单 session,先跑 cmd) ✅
 

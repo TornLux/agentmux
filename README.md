@@ -39,6 +39,7 @@ agentmux turns Claude Code into an always-on, multi-session background service. 
 - **Tool-use approval over Discord.** When `hook-pretool` decides to ask, Discord shows a prompt with `✅ Allow` / `❌ Deny` buttons. The hook long-polls `/tool-request` for up to 5 minutes; the broker resolves it the moment a button is clicked (or returns deny on timeout). Most turns trigger zero prompts; only genuinely risky operations interrupt you.
 - **Hibernate / resume + per-session persist.** Sessions idle past `hibernate_idle_secs` shut their `claude` child down while metadata stays in `sessions.toml`; the next `/input` (or attach) revives the session via `claude --resume <session-id>`. Auto-resume waits for the TUI to settle before injecting input, so the first IM message after a hibernate doesn't get eaten by claude's startup. New sessions default to *ephemeral* (forgotten on broker restart) — flip with `!persist on` / `/persist` / `-persist` flag at create time.
 - **Remote viewer over LAN (opt-in).** Set `attach_token` and bind `http_addr = "0.0.0.0:8765"` and `claude-attach --broker http://host:8765` connects via WebSocket from another machine. Loopback callers (existing local tooling) bypass the auth check; non-loopback callers must present `Authorization: Bearer <token>`.
+- **Browser-based web viewer.** Navigate to `http://<broker>:8765/` from any device (laptop, phone, tablet) — the broker serves a single-file HTML page with xterm.js + the fit addon **embedded into broker.exe** (no CDN dependency, works on isolated networks). Token entry persists to localStorage; loopback browsers skip it entirely. WebSocket auto-reconnect with backoff handles broker restarts without losing scrollback. Touch devices get a soft-key bar (Esc / Tab / arrows / `^C` `^D` `^L` `^Z`) for keys virtual keyboards don't surface. Auth uses a `Sec-WebSocket-Protocol: bearer.<token>` subprotocol since browsers cannot set the Authorization header on WebSockets.
 - **One-command setup.** `.\agentmux init` walks an interactive wizard. Day-to-day is `.\agentmux start | stop | status | attach | logs | config | discord` — config edits are format-preserving via the bundled `agentmux-cli` helper. `.\agentmux config token --set` generates a 32-byte random LAN token and writes it to broker.toml.
 - **Singleton broker, daily-rotated logs and audit trail.** A PID file blocks a second broker on the same pipe; both `broker.YYYY-MM-DD.log` and `events.YYYY-MM-DD.jsonl` roll daily under `%LOCALAPPDATA%\agentmux\` with 7-day retention.
 
@@ -47,6 +48,7 @@ agentmux turns Claude Code into an always-on, multi-session background service. 
 ```mermaid
 flowchart LR
     Term["Windows Terminal"]
+    Browser["Browser<br/>(xterm.js, embedded)"]
     Hooks["Claude Code hooks<br/>(hook-stop, hook-notification, hook-pretool)"]
     Attach["claude-attach.exe<br/>(local: pipe / LAN: WS+token)"]
     Discord["platform-discord.exe<br/>(IM adapter)"]
@@ -57,6 +59,7 @@ flowchart LR
 
     Term -- "spawn" --> Attach
     Attach -- "named pipe<br/>or WS /attach" --> Broker
+    Browser -- "GET /<br/>WS /attach (subprotocol)" --> Broker
     Hooks -- "POST /event<br/>POST /tool-request (long-poll)" --> Broker
     Discord -- "WS /ws<br/>POST /input + /tool-decision/:id" --> Broker
     Broker --> Sess
@@ -106,6 +109,11 @@ re-run any time without harm.
 `.\agentmux start --foreground` runs the broker inline (Ctrl+C to stop) for
 debugging — panics and tracing output land in the current shell instead of
 log files.
+
+For a viewer that runs in any modern browser (no install, mobile-friendly),
+navigate to `http://<broker>:8765/` after starting the broker. Loopback
+browsers skip the token prompt; LAN browsers pick the same `attach_token`
+used by `claude-attach --broker`.
 
 ### 4. Configuration helpers
 
@@ -244,7 +252,9 @@ All endpoints are loopback-only by default. When `attach_token` is set and `http
 | `POST` | `/tool-request` | **Long-poll up to 5 min.** Hook-pretool POSTs `{ session_id, tool_name, tool_input }`; broker generates a UUID, broadcasts a `tool_request` event, awaits `/tool-decision/:id`, returns `{ allow, reason }`. Timeout returns `{ allow: false, reason: "no human decision within 300s" }` |
 | `POST` | `/tool-decision/:request_id` | Resolve a parked `/tool-request` (`{"allow": bool, "reason"?}`) |
 | `GET` | `/ws` | WebSocket bus — every annotated hook event is pushed as one JSON line per subscriber |
-| `GET` | `/attach` | WebSocket viewer transport. Each frame (HELLO / PTY_DATA / RESIZE / CONTROL) rides as one Binary message. Used by `claude-attach --broker` over LAN |
+| `GET` | `/attach` | WebSocket viewer transport. Each frame (HELLO / PTY_DATA / RESIZE / CONTROL) rides as one Binary message. Used by `claude-attach --broker` over LAN and the browser viewer (auth via `Sec-WebSocket-Protocol: bearer.<token>` subprotocol since browsers cannot set the `Authorization` header on WebSockets) |
+| `GET` | `/`, `/web`, `/web/` | Browser web viewer — single-file HTML inlined into broker.exe. **Public** (no auth) so the user can load the page before pasting their token; privileged calls inside the page (`/sessions`, `/attach`) still go through the auth middleware |
+| `GET` | `/web/vendor/*` | Embedded xterm.js + addon-fit + xterm.css (~290 KB, baked in via `include_bytes!`). Served with `Cache-Control: public, max-age=86400` |
 | `POST` | `/shutdown` | Graceful broker shutdown (kill all claudes, drain, exit) |
 
 ## Crates
@@ -268,6 +278,7 @@ agentmux/
 ├── QUICKSTART.md           # 1-page user-facing onboarding
 ├── crates/
 │   ├── broker/             # Multi-session daemon
+│   │   └── web/            # Browser viewer (HTML + vendored xterm.js)
 │   ├── claude-attach/      # Terminal viewer (pipe + WS transports)
 │   ├── platform-discord/   # Discord IM adapter
 │   ├── hook-stop/          # Stop hook → assistant_message
