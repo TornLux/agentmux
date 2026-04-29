@@ -1360,6 +1360,7 @@ claude-attach.exe --debug    # stderr 打印 frame 收发日志,不影响 stdout
 - **自定义 ITerminalConnection**:在 Microsoft Terminal 里走原生 connection 而非 stdio relay,获得更好的 attach UX(标签页菜单等)。低优先级。
 - **claude 异常监控**:卡死(长时间无输出)、内存暴涨等指标,自动重启或报警。
 - **跨设备 broker**:这台机器跑 broker,另一台机器的 Terminal 通过 SSH/WireGuard attach。
+- **P2P attach(跨公网,无中继服务器)**:broker 和 claude-attach 都在 NAT 后,通过 Discord 当信令通道交换 STUN 候选地址,UDP 打洞建 QUIC 隧道,attach frame 协议跑在 QUIC stream 上。详见 **附录 D**。
 - **router 切换到 Always 模式**:`Prefix` 跑稳后(误判率 < ~5%、月成本可接受),`router_mode` 改 `Always`,所有非 `!` 消息全过 LLM。
 - **router 两层路由**:Haiku 先跑,confidence 低或参数不全时升级 Sonnet 重跑,准确率接近 Sonnet 单跑而成本只略增。
 - **router 也用于 Terminal**:新增 `agent-cli "<自然语言>"` 命令,复用 `imbot-core::router`,Terminal 用户也享受自然语言而不必记菜单/参数。
@@ -1467,3 +1468,208 @@ AGENT_BROKER_URL    # http://127.0.0.1:8765
 | binding | "某个 IM 频道当前绑哪个 session" |
 | hibernate | session 元数据保留,claude 进程关闭,attach 时 resume |
 | attach / detach | 客户端连/断 session,session 本身不受影响 |
+
+---
+
+## 附录 D:P2P attach 设计(跨公网,无中继服务器)
+
+> 状态:**未实施**。本节为设计草案,落地前需要先做 NAT 体检确认环境可行。
+
+### D.1 目标场景
+
+broker 在家里(NAT 后,无公网 IP),用户出门带笔记本也在某个 NAT 后(咖啡馆 / 公司 / 4G)。希望:
+
+1. 用户在 Discord 发 `/p2p` 请求一条临时连接
+2. bot 回一段 ticket 字符串
+3. 用户本地 `claude-attach --p2p <ticket>` 直接和家里的 broker 建 P2P 连接,不经任何专属中继服务器
+4. 跑通后体验等同 LAN 模式,frame 协议(HELLO / PTY_DATA / RESIZE / CONTROL)零改动
+
+**反例**:这不是给"完全陌生网络"用的低门槛方案,假设双方都信任 `attach_token`。也不是 Tailscale 替代品 —— 一次性、按需、不常驻。
+
+### D.2 与现有架构的契合点
+
+复用项,**不动**:
+- `shared` crate 的 frame 协议(HELLO / PTY_DATA / RESIZE / CONTROL),载体可以是任何字节流
+- `claude-attach` 的传输抽象(已经支持 named pipe + WS 双传输,加 P2P 是第三个)
+- `attach_token`:LAN bearer 已有,P2P ticket 签名复用同一份 secret
+- `platform-discord` 的 slash command 框架 + WS 事件订阅 + 编辑回复机制
+- `broker` 的 `/ws` 事件总线(broker 把 ticket-ready 事件 push 给 Discord bot)
+
+新增项:
+- 新 crate `agentmux-p2p`(STUN / ticket / QUIC 包装)
+- broker 的 `/p2p/offer` `/p2p/answer` HTTP 端点
+- `claude-attach --p2p <ticket>` 模式
+- Discord `/p2p` slash command + 一个新事件类型 `p2p_ticket_ready`
+
+### D.3 Ticket 格式
+
+```jsonc
+// 序列化:JSON → CBOR(更紧凑) → base64url,前缀 "AGTX-"
+// 期望长度 ~300-500 字符,Discord 单条消息够放
+{
+  "v": 1,                                  // 版本
+  "role": "offer" | "answer",              // 谁先发的
+  "session": "01H...",                     // 一次会话的 nonce(防重放)
+  "candidates": [                          // 多候选(STUN / UPnP / LAN IP)
+    { "kind": "srflx", "addr": "1.2.3.4:54321" },
+    { "kind": "host",  "addr": "192.168.0.42:54321" },
+    { "kind": "upnp",  "addr": "1.2.3.4:54321" }
+  ],
+  "quic_cert_sha256": "ab12...",           // 自签证书指纹,用于 pinning
+  "expires_at": 1714400000,                // unix ts,5 分钟 TTL
+  "sig": "hmac-sha256(attach_token, payload_above_minus_sig)"
+}
+```
+
+签名密钥 = `HKDF(attach_token, info="agentmux-p2p-v1")`,broker 和 attach 双方各自派生。
+
+### D.4 握手流程
+
+```
+[A=broker(发起方)]                       [B=claude-attach]
+─────────────────────────────────────────────────────────────
+1. discord: /p2p start
+   ↓
+2. broker: STUN(stun.l.google.com)
+            UPnP(可选,igd crate)
+            收集候选 → ticket-A
+3. broker: 启 QUIC server,bind 同一 UDP 端口
+4. broker: POST event p2p_ticket_ready
+   ↓
+5. discord-bot: edit 用户消息回 ticket-A
+                                          ↓
+                                          6. 用户复制 ticket-A
+                                             运行 claude-attach --p2p AGTX-...
+                                          7. 验签、检查 expires_at
+                                          8. STUN 自己拿候选 → ticket-B
+                                          9. ticket-B 怎么送回 broker?
+                                             选项 a:用户复制 ticket-B 回 Discord
+                                                    /p2p answer AGTX-...
+                                             选项 b:ticket-A 里塞一个 broker
+                                                    临时 HTTPS 端点,POST 上去
+                                                    (需要 broker LAN 可达)
+   ↓
+10. broker 收到 ticket-B,验签
+11. 双方同时向对方所有 candidates
+    并发发 QUIC Initial 包
+    ICE 风格:谁先成功用谁
+12. QUIC 1-RTT 握手完成
+    cert fingerprint 必须匹配
+13. 开 bidirectional stream
+14. 跑 HELLO 帧 → 进入正常 attach 协议
+```
+
+ticket-B 回送的两种方案对应不同 UX:
+- **选项 a(纯手工)**:两次复制粘贴,完全不依赖 broker 公网可达,最干净
+- **选项 b(半自动)**:broker 临时开一个公网 rendezvous 端点(可以用 cloudflared 临时隧道、或者 broker 已经在用的 LAN 口 + 路由器临时端口转发),attach 直接 POST。这退化成"半中继",不再是纯 P2P,但用户只复制一次
+
+**默认选 (a),把 (b) 留作 v2 优化。**
+
+### D.5 端口复用是关键
+
+STUN 查询、QUIC server、QUIC client 必须**全部用同一个本地 UDP socket**,否则 NAT 映射的端口不匹配,白打。
+
+`quinn` 支持从已有 `tokio::net::UdpSocket` 构建 endpoint,所以实现上:
+
+```rust
+let sock = UdpSocket::bind("0.0.0.0:0")?;
+let local_port = sock.local_addr()?.port();
+
+// 1. 用 sock 发 STUN binding request,拿外部地址
+let external = stun_query(&sock, "stun.l.google.com:19302").await?;
+
+// 2. 用同一个 sock 起 quinn endpoint
+let endpoint = quinn::Endpoint::new_with_abstract_socket(
+    EndpointConfig::default(),
+    Some(server_config),
+    Arc::new(sock),
+    Arc::new(TokioRuntime),
+)?;
+```
+
+绝对不能让 STUN 库内部 `bind` 一个新 socket。
+
+### D.6 安全模型
+
+P2P 模式让 broker 暴露到公网 UDP,必须三道锁:
+
+1. **Ticket 签名**:HMAC(attach_token),拒绝任何未签或签错的 ticket。Discord 频道泄露的 ticket 不能被第三方利用 —— 需要签名密钥
+2. **Ticket 一次性 + 短 TTL**:5 分钟过期,session nonce 用过即扔,防重放
+3. **QUIC 证书 pinning**:ticket 里带 cert SHA256,握手时不匹配立即断,防止有 attach_token 但中间人攻击
+
+额外措施:
+- P2P endpoint 跑在**独立的 UDP 端口**,不复用现有 HTTP 控制面端口。即使 P2P 端口被发现,它只懂 QUIC + 自定义 frame,跟 `/sessions` 这些 HTTP API 完全隔离
+- 失败计数:同一 broker 5 分钟内 P2P 握手失败超过 N 次,自动关闭 P2P 监听,需要重新 `/p2p start` 才打开
+- 日志:每次 P2P 握手记录源 IP、ticket nonce、成败,写到 events.jsonl
+
+### D.7 NAT 兼容性兜底
+
+真实世界很多网络打不通,需要分层兜底:
+
+| 网络情况 | 方案 |
+|---|---|
+| 双方 Cone NAT | UDP 打洞,直连 ✅ |
+| 一方 Symmetric | 多端口预测 + 候选爆破(成功率提升,不保证) |
+| 双方都 Symmetric / CGNAT | UDP 打洞失败,降级 |
+| 降级 1 | broker 临时启 cloudflared / ngrok,把 LAN HTTP 端点暴露,attach 走 WS(回到现有 LAN 模式) |
+| 降级 2 | 用户改用 Tailscale / WireGuard,P2P 这个方案直接放弃 |
+
+降级 1 会自动 fallback,但要在 Discord 明确告知用户"已退化为中继模式,流量经 X 服务"。
+
+### D.8 改动估计
+
+| 模块 | 新增行数 | 关键依赖 |
+|---|---|---|
+| `crates/agentmux-p2p`(新) | ~600-1000 | `quinn`, `webrtc-ice` 或 `stun_codec`, `igd`(可选), `hmac`, `sha2` |
+| `crates/broker` | ~200 | 加 `/p2p/offer` `/p2p/answer` 路由 + 启停 QUIC endpoint |
+| `crates/claude-attach` | ~150 | 加 `--p2p <ticket>` 模式,frame 层零改动 |
+| `crates/platform-discord` | ~100 | 加 `/p2p` slash command + 监听 `p2p_ticket_ready` 事件 |
+| `crates/shared` | ~80 | ticket 类型 + HMAC helper |
+
+总量 ~1100-1500 行,一个完整 phase 的工作量。
+
+### D.9 落地步骤(分两阶段降低风险)
+
+**阶段 1:验证 NAT 可行性(不写代码)**
+
+先做 NAT 体检,确认这条路在用户的具体网络下能走通:
+
+1. 浏览器开 `https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/`,默认 STUN,Gather candidates
+2. 看是否出现 `srflx` 候选 —— 出现才说明能 STUN
+3. 填两个不同的 STUN URL(`stun.l.google.com:19302` 和 `stun1.l.google.com:19302`),看两条 srflx 端口是否相同 —— 相同 = Cone NAT 可打洞,不同 = Symmetric 大概率失败
+4. 对比路由器 WAN IP 和公网 IP —— 不一致且 WAN IP 在 `100.64.0.0/10` = CGNAT,P2P 直接放弃
+
+**注意**:agentmux 用户机器上若在跑 Clash / mihomo / v2ray 这类代理软件,会拦截或绕过 UDP 出站。STUN 走的是 UDP,代理客户端如果只代理 TCP 流量,STUN 看到的就是 ISP NAT 的真实情况(好);但如果代理把 UDP 也劫持了(全局 TUN 模式 / fake-IP / Meta Tunnel),STUN 拿到的是代理出口节点的地址,那就**绕过代理**(直连)做 P2P,否则 ticket 里的地址是云服务商 IP,对端永远打不通。实施前必须确认 broker 进程的出站不被代理劫持。
+
+**阶段 2:最小可行版本(不接 Discord)**
+
+跳过 IM 自动化,先做手动版验证主链路:
+
+1. 加 `agentmux-p2p` crate,实现 STUN + ticket 编解码 + QUIC 包装
+2. broker 加 `agentmux p2p offer` CLI 子命令,在 broker 那台机器跑,打印 ticket 到 stdout
+3. claude-attach 加 `--p2p <ticket>` 模式
+4. 用户**手动**复制 ticket(用任何 IM,微信也行),attach 端用 `--p2p` 接
+5. 答 ticket 也是手动:attach 打印自己的 ticket,用户复制回 broker 端,粘进 stdin 或 `agentmux p2p answer` 子命令
+
+这一步能验证:STUN 拿地址 → 同时打洞 → QUIC 握手 → frame 协议透传。**全链路通了再做下一步。**
+
+**阶段 3:Discord 自动化**
+
+链路通了之后再加 Discord 胶水,把"手动复制粘贴 ticket"自动化:
+
+1. broker 加 `/p2p/offer` HTTP 端点 + `p2p_ticket_ready` 事件
+2. platform-discord 加 `/p2p` slash command,触发 broker 端点,把 ticket 编辑回用户消息
+3. 用户复制粘贴一次到本地终端,跑 `claude-attach --p2p <ticket>`
+4. ticket-B 回送先用方案 (a)(用户再复制粘贴一次到 Discord `/p2p answer`),方案 (b) 留 v2
+
+### D.10 决策门槛
+
+实施前必须满足:
+
+- [ ] 阶段 1 NAT 体检:srflx 候选两次端口相同(Cone NAT)
+- [ ] 阶段 1 NAT 体检:WAN IP 等于公网 IP(无 CGNAT)
+- [ ] broker 出站 UDP 不被本地代理软件劫持(或可配置绕过)
+- [ ] 决定 ticket 回送用方案 (a) 还是 (b)
+- [ ] 评估 LAN 模式 + Tailscale / cloudflared 是否已经够用 —— 如果够用,P2P 这个方案 ROI 不高,可以无限期搁置
+
+最后一条很关键。如果用户已经接受 Tailscale 这种"私有 overlay 网络"的存在,直接用 Tailscale 做传输底层比自己实现 NAT 打洞简单 10 倍,而且 Tailscale 自己就解决了 CGNAT。**P2P 这条路只在"绝不允许任何专属/第三方服务"的洁癖场景下才值得做。**
