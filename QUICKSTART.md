@@ -124,28 +124,144 @@ When the broker is unreachable, the hook fails *open* (allows the tool) so a bus
 
 `config check` is the friend you call after hand-editing — it parses the file, reports any TOML / JSON issues with line numbers, and confirms semantic invariants (e.g. `allowed_user_ids` non-empty).
 
-## Attach from another machine (optional)
+## Attach from another machine (LAN mode)
+
+The broker can serve `claude-attach` viewers from elsewhere on your local
+network over HTTP/WebSocket, gated by a Bearer token. Loopback callers
+(Discord bot, hooks, local `claude-attach`) **bypass** the token check, so
+turning LAN mode on doesn't break anything that already works.
+
+### 1. Configure the broker host
 
 ```powershell
-# On the broker host:
-.\agentmux config token --set                                # generate + save random token
-.\agentmux config set broker http_addr "0.0.0.0:8765"        # bind LAN
-.\agentmux stop ; .\agentmux start
-# Open firewall port 8765 inbound (limit to your subnet).
+# Generate a 32-byte token, write it to broker config, and print it.
+# COPY THE PRINTED TOKEN — it's the only time it's shown plainly.
+.\agentmux config token --set
 
-# On the second machine — the token printed above:
-$env:AGENT_ATTACH_TOKEN = "<paste-token>"
-.\claude-attach.exe --broker http://192.168.X.Y:8765 --session default
+# Bind the HTTP/WS listener to all interfaces (default is loopback only).
+.\agentmux config set broker http_addr "0.0.0.0:8765"
+
+# Restart so the new bind / token take effect.
+.\agentmux stop
+.\agentmux start
+
+# Find the LAN IP to give the remote machine.
+Get-NetIPAddress -AddressFamily IPv4 |
+    Where-Object { $_.IPAddress -like "192.168.*" -or $_.IPAddress -like "10.*" } |
+    Select-Object IPAddress, InterfaceAlias
 ```
 
-Loopback callers (the Discord bot on the broker host, hooks, local `claude-attach`) bypass the auth check, so existing local setups keep working without touching the token.
-
-To revert to loopback-only:
+Open the Windows firewall for port 8765 — restrict to your subnet, do
+**not** open it to `0.0.0.0/0`:
 
 ```powershell
-.\agentmux config unset broker http_addr
+# Run this PS as Administrator. Replace 192.168.0.0/16 with your actual subnet,
+# e.g. 192.168.1.0/24 or 10.0.0.0/24.
+New-NetFirewallRule -DisplayName "agentmux broker (LAN)" `
+    -Direction Inbound -Protocol TCP -LocalPort 8765 `
+    -RemoteAddress 192.168.0.0/16 `
+    -Action Allow
+```
+
+### 2. Configure the remote machine
+
+Extract the same release zip there (no Rust, no broker, no hooks needed —
+just `claude-attach.exe` and the wrapper). Then persist the token to a
+User-scope environment variable:
+
+```powershell
+[Environment]::SetEnvironmentVariable("AGENT_ATTACH_TOKEN", "<paste-token>", "User")
+```
+
+⚠️ **Reopen the PowerShell window** before continuing — already-open
+shells won't see the new variable. Confirm:
+
+```powershell
+$env:AGENT_ATTACH_TOKEN.Length    # should print the token's character count, not 0
+```
+
+### 3. Connect
+
+```powershell
+cd C:\Tools\agentmux                                       # wherever you extracted to
+.\agentmux attach --broker http://192.168.X.Y:8765 --session default
+```
+
+Or call the binary directly without the wrapper:
+
+```powershell
+.\bin\claude-attach.exe --broker http://192.168.X.Y:8765 --session default
+
+# Single-shot token via flag instead of env var:
+.\bin\claude-attach.exe --broker http://192.168.X.Y:8765 --token "<token>" --session default
+```
+
+### Verifying connectivity (when something goes wrong)
+
+```powershell
+# 1. Can we reach the port at all?
+Test-NetConnection -ComputerName 192.168.X.Y -Port 8765
+
+# 2. Is the broker speaking HTTP and demanding auth?
+curl.exe http://192.168.X.Y:8765/sessions
+# expected: 401 Unauthorized — proves broker is up and token gating works
+
+# 3. Does our token actually work?
+curl.exe -H "Authorization: Bearer $env:AGENT_ATTACH_TOKEN" http://192.168.X.Y:8765/sessions
+# expected: 200 with a JSON list of sessions
+```
+
+| Symptom | Cause |
+|---|---|
+| `connection refused` | broker still bound to 127.0.0.1, or not running at all |
+| `connection timeout` | firewall closed / wrong subnet / wrong IP |
+| `401 Unauthorized` from step 3 | wrong token, or env var didn't propagate (reopen PS) |
+| works from `curl` but `agentmux attach` errors out | env var present in shell? `$env:AGENT_ATTACH_TOKEN.Length` |
+
+### Recovering a lost token
+
+The token is stored on the broker host in `broker.toml`. To read it back:
+
+```powershell
+# On the broker host
+.\agentmux config show broker | Select-String attach_token
+```
+
+To rotate (invalidates the old one — every remote viewer needs the new one):
+
+```powershell
+.\agentmux config token --set
 .\agentmux stop ; .\agentmux start
 ```
+
+### Multiple viewers on the same session
+
+Local pipe + LAN WS attaches are peer transports — broker doesn't
+distinguish. So you can have:
+
+- the broker host's own terminal attached locally (`.\agentmux attach default`)
+- the remote machine attached over LAN (`.\agentmux attach --broker http://... --session default`)
+
+…both watching the same TUI in real time. `.\agentmux status` on the
+broker host reports `viewers=N`. Output is mirrored, input is merged in
+arrival order, and resize coordinates to the smallest pane (so claude
+never overflows the smaller window). Don't both type at once — claude
+has one input field and concurrent keystrokes interleave.
+
+### Reverting to loopback-only
+
+```powershell
+.\agentmux config unset broker http_addr      # back to 127.0.0.1:8765
+.\agentmux stop
+.\agentmux start
+
+# Optional: drop the firewall rule too.
+Remove-NetFirewallRule -DisplayName "agentmux broker (LAN)"
+```
+
+The `attach_token` stays in `broker.toml` — harmless when loopback-only
+since it's only checked on non-loopback requests. Re-enabling LAN later
+needs nothing more than changing `http_addr` back.
 
 ## When things go wrong
 
