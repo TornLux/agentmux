@@ -902,9 +902,11 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 ### 进度速览
 
-截至 v0.2.1。原 plan 里的核心 phase 1-9 全部落地,additional 的 LAN/web/
-release pipeline 等都做了。剩下的开放项是新方向(跨平台、vendor-agnostic
-backend、cost dashboard 等),见末尾 §11.
+截至 v0.2.1 + 后续两个 feature commit。原 plan 里的核心 phase 1-9 全部
+落地,additional 的 LAN / web viewer / release pipeline / **PostToolUse
+驱动的工具进度流** / **system tray + Windows toast(本地通知 + 审批)** 等都
+做了。剩下的开放项是新方向(跨平台、vendor-agnostic backend、cost dashboard
+等),见末尾 §11.
 
 | Phase | 状态 | 备注 |
 |---|---|---|
@@ -930,6 +932,9 @@ backend、cost dashboard 等),见末尾 §11.
 | **额外:LAN attach + token auth** | ✅ 完成 | `ebfd70f` `claude-attach --broker http://host:port`,`Authorization: Bearer` 鉴权,loopback 豁免,constant-time 比较 |
 | **额外:浏览器 web viewer** | ✅ 完成 | `1f67820` (v0.2.1) `http://broker:8765/` 单文件 HTML,xterm.js + addon-fit 通过 `include_bytes!` 嵌入(broker.exe 自包含),WS subprotocol auth 给浏览器,自动重连,移动端软键盘条 |
 | **额外:release pipeline** | ✅ 完成 | `scripts/build-release.ps1` + `.github/workflows/release.yml` —— 推 `v*` tag 自动 windows-latest 跑 cargo build + 打 zip + 创 GitHub Release + sha256 校验和 |
+| **额外:PostToolUse 进度流** | ✅ 完成 | `4063f40` 新 `hook-posttool` crate POST `tool_progress` 事件;Discord `platform-discord/src/progress.rs` 渲染单工具人话(`✏️ edit src/x.rs` / `🖥 $ cargo test` / `🔎 grep` / `🔌 mcp \`server.tool\`` 等);peek_pending + 800ms 节流 + 8 行 history 上限,`💭 working…` 占位符变成 live timeline,turn 完成时替换成最终答案 |
+| **额外:hooks 安装器消重** | ✅ 完成 | `3fd9ec0` `scripts/install-hooks.ps1` 改成 basename 匹配:不论上次装在哪个 zip / 源码目录,重装永远收敛到 1 条指向当前 build 的条目;agentmux.ps1 的 init 步骤撤掉 "skip if installed" 闸,改成无条件调 install-hooks.ps1 当自愈 |
+| **额外:system tray + Windows toast** | ✅ 完成 | 新 `agentmux-tray` crate(独立进程,主线程跑 tao 消息泵,worker 跑 tokio):tray-icon 颜色编码 session 状态 + 右键 per-session 子菜单(Attach / Interrupt / Hibernate / Restart / Kill);WinRT 直接 XML toast 走 protocol activation,`assistant_message` / `notification` / `tool_request` 三种 toast,后者带 `[Allow]` `[Deny]` 按钮;`agentmux://` URL scheme 注册到 HKCU,deeplink 走 `interprocess` 命名管道单实例转发;Discord 与 toast 并行接收同一个 `tool_request`,先到先得,broker `/tool-decision/:id` 幂等;**不依赖 IM 即可处理本地审批**。`scripts/start-broker.ps1` 加 mid-shutdown 双 probe 防止 tray "Stop broker" + 立即 `agentmux start` 的 race |
 
 ### Phase 1:最小可跑链路(单 session,先跑 cmd) ✅
 
@@ -1092,8 +1097,9 @@ backend、cost dashboard 等),见末尾 §11.
 - [ ] IM bot 命令补全:`!history`、`!save-snapshot`、`!fork`。
 - [ ] 输入锁(同一 session 多客户端打字时只让一个写)。
 - [x] 静态 CRT 链接产出零依赖 exe(已配 `.cargo/config.toml` `+crt-static`)。
-- [ ] systray 图标(状态指示 + 一键收工)。
-- [ ] Web viewer(xterm.js,通过 Tailscale / Cloudflare Tunnel 远程看 TUI)。
+- [x] **systray 图标(状态指示 + 一键收工)** —— 新 `agentmux-tray` crate,见进度速览的"额外"行;独立进程主线程跑 tao 消息泵,worker 跑 tokio,tray-icon 颜色编码 session 状态(idle / running / waiting-approval / disconnected),右键菜单 per-session 子菜单 + Open web viewer + Stop broker + Quit tray;轮询 `/sessions` 5s 刷新 + WS 实时事件路。
+- [x] **Windows toast 通知**(原 plan 没单列但天然配对 systray)—— `agentmux-tray` 同进程托管,`assistant_message` / `notification` / `tool_request` 三种 toast,后者带 `[Allow]` `[Deny]` 按钮通过 `agentmux://` URL scheme + 命名管道 IPC 把决定回投 broker,与 Discord 审批并行;**纯本地路径不依赖 IM**。
+- [x] **Web viewer**(已在前面"额外"行做了:xterm.js 内嵌 broker.exe,通过 Tailscale / Cloudflare Tunnel 远程访问)。
 
 ---
 
@@ -1345,10 +1351,10 @@ claude-attach.exe --debug    # stderr 打印 frame 收发日志,不影响 stdout
 
 可能要做但现在不做:
 
-- **Web viewer**:基于 xterm.js 的浏览器 attach,通过 Tailscale 或 Cloudflare Tunnel 安全访问。需要 broker 把 named pipe 协议同时映射到 WebSocket。
+- ~~**Web viewer**:基于 xterm.js 的浏览器 attach,通过 Tailscale 或 Cloudflare Tunnel 安全访问。需要 broker 把 named pipe 协议同时映射到 WebSocket。~~ **已完成(v0.2.1)。**
+- ~~**本地通知**:`Notification` 事件除了 IM,也用 Windows toast。~~ **已完成(`agentmux-tray` crate)** —— 此外还做了 `tool_request` 的本地按钮审批,完全脱离 IM 也能批 / 拒。
 - **输入锁**:同一 session 多客户端同时打字时,某段时间内只允许一个写,其他 read-only。`!lock` / `!unlock` 切换。
 - **Session 分支**:基于 claude 的 `--resume` 在某个 turn 后分叉一个新 session,实验不同方向。
-- **本地通知**:`Notification` 事件除了 IM,也用 Windows toast。
 - **批量批准**:同 session 同 hour 内同类危险命令一次批准多次。
 - **Slack / 飞书 / Matrix 适配器**:imbot-core 已经预留扩展点,新加只需要新 crate。
 - **WeChat**:暂不支持(没有合规个人 bot API)。

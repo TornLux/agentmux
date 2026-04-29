@@ -23,7 +23,7 @@ agentmux turns Claude Code into an always-on, multi-session background service. 
 - **HTTP control plane + WS event bus.** `127.0.0.1:8765` exposes full session lifecycle (`/sessions` CRUD, `/interrupt` `/restart` `/hibernate` `/input` `/persist`), the `/event` hook-ingest endpoint, the `/ws` event-stream subscriber, the `/tool-request` long-poll for synchronous PreToolUse approval, and `/attach` for remote viewers (see *Remote viewer over LAN* below).
 - **Discord IM bridge (built-in).** `platform-discord.exe` subscribes to the WS bus and forwards Discord messages back through `/sessions/:id/input`. Includes:
   - **Per-channel session bindings** — each Discord channel maps to one session, persisted to disk so a bot restart preserves the topology
-  - **Edit-in-place replies** — every forwarded message gets an immediate `💭 working…` placeholder that's edited into the final answer when claude finishes (with a typing indicator on the way)
+  - **Edit-in-place replies with live progress streaming** — every forwarded message gets an immediate `💭 working…` placeholder. As claude runs tools (Edit / Bash / Grep / WebFetch / …), each `PostToolUse` hook firing edits the placeholder body in place to add a one-liner narration (`✏️ edit src/x.rs`, `🖥 $ cargo test`, `🔎 grep …`). When the turn completes, the whole progress timeline is replaced with claude's actual answer. Throttled to one edit per 800 ms so fast tool bursts stay under Discord's per-message edit rate limit.
   - **Reply-thread routing** — Discord-replying to an old assistant message sends your new turn to *that* session, optionally with the quoted text injected as context
   - **Reaction commands** — react 🛑 / 💤 / 🔄 on any bot message to interrupt / hibernate / restart its session
   - **`@mention` wake** — opt-in to make the bot reachable from any channel by mentioning it
@@ -31,12 +31,14 @@ agentmux turns Claude Code into an always-on, multi-session background service. 
   - **Attachment forwarding** — drop an image into Discord, the bot saves it locally and tells claude to `Read` it
   - **12 slash commands** with autocomplete on session names: `/ls /attach /new /persist /kill /interrupt /restart /hibernate /logs /cwd /status /help`
   - **Idle-ping suppression** by default (claude code's "Claude is waiting for your input" Notification hook is dropped; permission prompts still pass through)
-- **Hook-driven event log.** Three hooks plug into Claude Code's user-global `settings.json`:
+- **System tray + Windows toast (no IM required).** `agentmux-tray.exe` runs alongside the broker and gives you a **persistent tray icon** colour-coded by session state (green idle / yellow running / red waiting on approval / gray broker offline). Right-click for a per-session menu (Attach / Interrupt / Hibernate / Restart / Kill), Open web viewer, Stop broker. Toast notifications for `assistant_message` (click to spawn `claude-attach` for that session via the registered `agentmux://` URL scheme), `notification`, and — the killer feature — `tool_request` toasts with **`[Allow]` / `[Deny]` action buttons**. The tray runs in parallel with Discord; both endpoints race to resolve a tool approval, broker takes whichever decision arrives first. Single-instance handshake via named pipe. Result: at-the-desk users almost never need to open Discord for permissioning.
+- **Hook-driven event log.** Four hooks plug into Claude Code's user-global `settings.json`:
   - `hook-stop` — POSTs `assistant_message` events when claude finishes a turn
   - `hook-notification` — POSTs `notification` events for permission prompts / idle pings
-  - `hook-pretool` — runs *synchronously* before each tool call; auto-allows safe tools (Read / Glob / Grep / `cargo` / `git status` / …) and asks via Discord for risky ones (`rm -rf`, `curl | sh`, files outside the session cwd, …)
-  All three bail silently for non-broker claudes via the `AGENT_SESSION_ID` sentinel, and skip when a local viewer is attached — no double-notify.
-- **Tool-use approval over Discord.** When `hook-pretool` decides to ask, Discord shows a prompt with `✅ Allow` / `❌ Deny` buttons. The hook long-polls `/tool-request` for up to 5 minutes; the broker resolves it the moment a button is clicked (or returns deny on timeout). Most turns trigger zero prompts; only genuinely risky operations interrupt you.
+  - `hook-pretool` — runs *synchronously* before each tool call; auto-allows safe tools (Read / Glob / Grep / `cargo` / `git status` / …) and asks via Discord/toast for risky ones (`rm -rf`, `curl | sh`, files outside the session cwd, …)
+  - `hook-posttool` — fires after each tool call and POSTs `tool_progress` events that drive Discord's edit-in-place narration
+  All four bail silently for non-broker claudes via the `AGENT_SESSION_ID` sentinel, and skip when a local viewer is attached — no double-notify.
+- **Tool-use approval, two surfaces.** When `hook-pretool` decides to ask, the broker fans out a `tool_request` event in parallel to Discord (`✅ Allow` / `❌ Deny` button card) and the local tray (Windows toast with the same action buttons via the `agentmux://` URL scheme). The hook long-polls `/tool-request` for up to 5 minutes; whichever endpoint POSTs `/tool-decision/:id` first wins, broker idempotently 404s the loser. Most turns trigger zero prompts; only genuinely risky operations interrupt you.
 - **Hibernate / resume + per-session persist.** Sessions idle past `hibernate_idle_secs` shut their `claude` child down while metadata stays in `sessions.toml`; the next `/input` (or attach) revives the session via `claude --resume <session-id>`. Auto-resume waits for the TUI to settle before injecting input, so the first IM message after a hibernate doesn't get eaten by claude's startup. New sessions default to *ephemeral* (forgotten on broker restart) — flip with `!persist on` / `/persist` / `-persist` flag at create time.
 - **Remote viewer over LAN (opt-in).** Set `attach_token` and bind `http_addr = "0.0.0.0:8765"` and `claude-attach --broker http://host:8765` connects via WebSocket from another machine. Loopback callers (existing local tooling) bypass the auth check; non-loopback callers must present `Authorization: Bearer <token>`.
 - **Browser-based web viewer.** Navigate to `http://<broker>:8765/` from any device (laptop, phone, tablet) — the broker serves a single-file HTML page with xterm.js + the fit addon **embedded into broker.exe** (no CDN dependency, works on isolated networks). Token entry persists to localStorage; loopback browsers skip it entirely. WebSocket auto-reconnect with backoff handles broker restarts without losing scrollback. Touch devices get a soft-key bar (Esc / Tab / arrows / `^C` `^D` `^L` `^Z`) for keys virtual keyboards don't surface. Auth uses a `Sec-WebSocket-Protocol: bearer.<token>` subprotocol since browsers cannot set the Authorization header on WebSockets.
@@ -49,9 +51,10 @@ agentmux turns Claude Code into an always-on, multi-session background service. 
 flowchart LR
     Term["Windows Terminal"]
     Browser["Browser<br/>(xterm.js, embedded)"]
-    Hooks["Claude Code hooks<br/>(hook-stop, hook-notification, hook-pretool)"]
+    Hooks["Claude Code hooks<br/>(stop, notification,<br/>pretool, posttool)"]
     Attach["claude-attach.exe<br/>(local: pipe / LAN: WS+token)"]
     Discord["platform-discord.exe<br/>(IM adapter)"]
+    Tray["agentmux-tray.exe<br/>(tray icon + toast)"]
     Broker["broker.exe<br/>(singleton daemon)"]
     Sess["session × N<br/>ConPTY + ring buffer"]
     Claude["claude<br/>(child per session)"]
@@ -62,6 +65,7 @@ flowchart LR
     Browser -- "GET /<br/>WS /attach (subprotocol)" --> Broker
     Hooks -- "POST /event<br/>POST /tool-request (long-poll)" --> Broker
     Discord -- "WS /ws<br/>POST /input + /tool-decision/:id" --> Broker
+    Tray -- "WS /ws<br/>GET /sessions + POST /tool-decision/:id<br/>agentmux:// deeplinks → claude-attach" --> Broker
     Broker --> Sess
     Sess --> Claude
     Broker --> Events
@@ -81,9 +85,10 @@ cd agentmux
 cargo build --release
 ```
 
-Produces seven binaries in `target\release\`:
+Produces nine binaries in `target\release\`:
 `broker`, `claude-attach`, `hook-stop`, `hook-notification`,
-`hook-pretool`, `platform-discord`, `agentmux-cli`.
+`hook-pretool`, `hook-posttool`, `platform-discord`,
+`agentmux-tray`, `agentmux-cli`.
 
 ### 2. First-time setup
 
@@ -98,13 +103,18 @@ re-run any time without harm.
 ### 3. Day-to-day
 
 ```powershell
-.\agentmux start             # broker (and Discord bot if configured)
-.\agentmux stop
+.\agentmux start             # broker + tray + Discord bot (if configured)
+.\agentmux stop              # all of the above
 .\agentmux status            # one-line health summary
 .\agentmux attach [name]     # enter the TUI; menu picker if no name
-.\agentmux logs broker       # tail today's broker log
+.\agentmux logs broker       # also: discord, tray, events
 .\agentmux help              # full command list
 ```
+
+After `start`, look at the **Windows system tray (right side of the
+taskbar)** — a small coloured circle is the agentmux tray icon. Right-click
+for the per-session menu; toasts pop up on `assistant_message` and tool-
+approval prompts. `--no-tray` opts out, `--no-discord` skips the IM bot.
 
 `.\agentmux start --foreground` runs the broker inline (Ctrl+C to stop) for
 debugging — panics and tracing output land in the current shell instead of
@@ -263,10 +273,12 @@ All endpoints are loopback-only by default. When `attach_token` is set and `http
 |---|---|
 | `broker` | Multi-session daemon. Owns the ConPTY pool, ring buffers, named-pipe server, HTTP control plane (auth-middleware-protected), WS event bus, WS attach endpoint, hibernate scanner, decision-channel registry for PreToolUse, daily-rolling events log |
 | `claude-attach` | Terminal viewer. Frame-protocol client with two transports: named pipe (default, local) and WebSocket (`--broker http://host:port --token …` for LAN). Session-picker menu, raw-mode stdin forwarding, Ctrl+C escalation, resize coordination |
-| `platform-discord` | Discord IM adapter. Per-channel session bindings (persisted), edit-in-place placeholders + typing indicator, reply-thread routing with optional quote injection, attachment forwarding (image/text), 12 slash commands with autocomplete, reaction commands, tool-use approval buttons, idle-ping suppression, mention wake, DM mode, orphan-placeholder recovery |
+| `platform-discord` | Discord IM adapter. Per-channel session bindings (persisted), edit-in-place placeholders with live tool-progress narration, reply-thread routing with optional quote injection, attachment forwarding (image/text), 12 slash commands with autocomplete, reaction commands, tool-use approval buttons, idle-ping suppression, mention wake, DM mode, orphan-placeholder recovery |
+| `agentmux-tray` | System-tray icon + Windows toast notifications. Subscribes to `/ws` for live events, polls `/sessions` for menu state. Per-session right-click submenu; toasts on `assistant_message` / `notification` / `tool_request` (with `[Allow]` `[Deny]` action buttons via the `agentmux://` URL scheme). Single-instance handshake (named pipe), HKCU URL-scheme registration on first run |
 | `hook-stop` | Claude Code `Stop` hook. Reads transcript, posts `assistant_message` to broker. Bails silently when a local viewer is attached |
 | `hook-notification` | Claude Code `Notification` hook. Posts `notification` events to broker |
 | `hook-pretool` | Claude Code `PreToolUse` hook. Smart classifier auto-allows safe tools and dev-flow `Bash` patterns; long-polls `/tool-request` for the rest. Fails open on broker outage so claude isn't blocked by infrastructure failure |
+| `hook-posttool` | Claude Code `PostToolUse` hook. Posts `tool_progress` events that drive Discord's edit-in-place narration (`✏️ edit src/x.rs`, `🖥 $ cargo test`, …). Fail-open + local-viewer-bail like the others |
 | `agentmux-cli` | Helper invoked by `agentmux.ps1` for format-preserving TOML edits and per-kind config validation |
 | `shared` | Wire protocol (frame tags, HELLO / RESIZE / CONTROL / PTY_DATA, encode/decode-frame for WS), config loader, minimal blocking HTTP client (with optional Bearer auth + long-poll variant) |
 
@@ -280,15 +292,18 @@ agentmux/
 │   ├── broker/             # Multi-session daemon
 │   │   └── web/            # Browser viewer (HTML + vendored xterm.js)
 │   ├── claude-attach/      # Terminal viewer (pipe + WS transports)
-│   ├── platform-discord/   # Discord IM adapter
+│   ├── platform-discord/   # Discord IM adapter (with tool-progress streaming)
+│   ├── agentmux-tray/      # System tray + Windows toast notifications
 │   ├── hook-stop/          # Stop hook → assistant_message
 │   ├── hook-notification/  # Notification hook → notification
 │   ├── hook-pretool/       # PreToolUse hook → tool_request (synchronous approval)
+│   ├── hook-posttool/      # PostToolUse hook → tool_progress (live narration)
 │   ├── agentmux-cli/       # TOML helper (config set/check/array-add etc.)
 │   └── shared/             # Wire protocol + config + http client
 ├── scripts/
 │   ├── start-broker.ps1    # also accepts -Foreground
 │   ├── start-discord.ps1
+│   ├── start-tray.ps1
 │   ├── stop-broker.ps1
 │   ├── install-hooks.ps1
 │   ├── init-config.ps1

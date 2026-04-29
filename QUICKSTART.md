@@ -22,12 +22,12 @@ In a PowerShell window opened in the extracted folder:
 The wizard walks you through:
 
 1. **Prerequisite check** — confirms binaries are present and `claude` is on PATH
-2. **Hooks** — wires Claude Code's `Stop`, `Notification`, and `PreToolUse` hooks into `~\.claude\settings.json` so agentmux can see turn completions, permission prompts, and (optionally) ask you to approve risky tool calls. Idempotent; the wizard re-detects already-installed hooks and skips
+2. **Hooks** — wires Claude Code's `Stop`, `Notification`, `PreToolUse`, and `PostToolUse` hooks into `~\.claude\settings.json` so agentmux can see turn completions, permission prompts, live tool-progress narration, and (optionally) ask you to approve risky tool calls. Idempotent; the wizard re-detects already-installed hooks and dedups any leftover entries from prior installs
 3. **Broker config** — writes `%LOCALAPPDATA%\agentmux\config.toml` if missing (all defaults; you'll rarely need to edit)
 4. **Discord IM** *(optional)* — prompts for bot token, channel ID, and your user ID. The token is verified against Discord before being saved to a User-scope environment variable. Wizard re-detects an already-configured Discord and skips
-5. **Start broker** — launches the daemon as a background process
+5. **Start broker** — launches the daemon, the system-tray icon, and (if configured) the Discord bot, all as detached background processes
 
-After that, you have a running agentmux. Type:
+After that, you have a running agentmux. **Look at the Windows system tray (bottom-right of the taskbar)** — a small coloured circle is the agentmux tray icon. Right-click for the per-session menu. Or:
 
 ```powershell
 .\agentmux attach            # enter claude's TUI
@@ -38,17 +38,21 @@ After that, you have a running agentmux. Type:
 ## Daily ops cheat sheet
 
 ```powershell
-.\agentmux start             # broker + Discord bot (if configured)
-.\agentmux stop              # both
+.\agentmux start             # broker + tray + Discord bot (if configured)
+.\agentmux stop              # all of the above
 .\agentmux status            # one-line health summary
-.\agentmux logs broker       # tail today's broker log
-.\agentmux logs discord      # tail Discord adapter log
-.\agentmux logs events       # tail events.jsonl (audit trail)
+.\agentmux logs broker       # also: discord, tray, events
+.\agentmux logs discord
+.\agentmux logs tray
+.\agentmux logs events       # events.jsonl audit trail
 
 .\agentmux attach            # picker menu of sessions
 .\agentmux attach default    # attach directly
 .\agentmux attach --new foo  # create + attach a new session
 ```
+
+`--no-tray` and `--no-discord` flags on `start` opt out of those processes
+respectively (the broker is always started).
 
 Inside `claude-attach`:
 
@@ -104,13 +108,58 @@ A few config flags worth knowing about (in `discord.toml`):
 
 Edit any with `.\agentmux config set discord <key> <value>` then restart the bot.
 
+## System tray + toast (no IM required)
+
+Once `agentmux start` runs, an `agentmux-tray.exe` process attaches a
+**coloured circle icon** to your Windows tray:
+
+- **gray** — broker offline or no sessions
+- **green** — sessions exist, all idle
+- **yellow** — at least one session has an attached viewer
+- **red** — at least one session waiting on tool approval / crashed
+
+**Right-click** the icon for a per-session menu (Attach / Interrupt /
+Hibernate / Restart / Kill), Open web viewer, Stop broker, Quit tray.
+
+**Toasts** pop up automatically on three event kinds:
+
+| Event | Toast looks like | Click does |
+|---|---|---|
+| `assistant_message` | `✅ [default] turn complete · "<answer preview>..."` | Spawns Windows Terminal with `claude-attach.exe --session default` |
+| `notification` | `⚠️ [default] needs attention · <message>` | Opens that session |
+| `tool_request` | `🔐 [default] approve Bash? · $ rm -rf /tmp/x` plus `[Allow]` `[Deny]` buttons | The buttons fire `agentmux://approve/<id>` / `agentmux://deny/<id>` deeplinks; the running tray catches them and POSTs the decision back to broker |
+
+Toast action buttons + Discord button cards run **in parallel** for tool
+approvals — whichever you click first wins, the other path is idempotent
+(broker 404s the loser).
+
+The tray registers the `agentmux://` URL scheme in `HKCU` on first launch
+(no admin needed). Single-instance handshake via a named pipe makes
+sure protocol-activation re-launches forward URLs to the running tray
+rather than starting duplicate copies.
+
 ## Tool-use approval (PreToolUse)
 
-Whenever claude wants to run a "risky" tool (e.g. `Bash` with `rm -rf` / `curl`, or `Write` / `Edit` outside the session's working directory), the bot posts a Discord message with `✅ Allow` / `❌ Deny` buttons. The hook waits up to 5 minutes; on timeout it returns `deny` and claude moves on.
+Whenever claude wants to run a "risky" tool (e.g. `Bash` with `rm -rf` / `curl`, or `Write` / `Edit` outside the session's working directory), agentmux fans the request out to **both** Discord (button card) and the local tray (toast with action buttons). The hook waits up to 5 minutes; on timeout it returns `deny` and claude moves on.
 
 Most turns trigger **zero** prompts — `Read` / `Glob` / `Grep` / `cargo` / `git status` / `ls` and 30-odd other dev verbs auto-allow. The classifier's logic lives in `crates/hook-pretool/src/main.rs` if you want to read or tweak the rules.
 
 When the broker is unreachable, the hook fails *open* (allows the tool) so a busted Discord doesn't grind claude to a halt — the tradeoff is "approval surface degrades to no-op when the broker is down".
+
+## Live progress narration (PostToolUse)
+
+After every tool call, the `hook-posttool` hook posts a `tool_progress`
+event to broker. Discord turns this into edit-in-place updates: the
+`💭 working…` placeholder grows a running list of one-liners
+(`✏️ edit src/x.rs`, `🖥 $ cargo test`, `🔎 grep "AuthMiddleware"`) so you
+can see what claude's doing while the turn is still in flight, instead of
+staring at an idle placeholder for minutes. When the turn completes, the
+whole timeline is replaced with claude's actual answer.
+
+Throttled at one Discord edit per 800 ms; history capped at the last 8
+entries to keep mobile-Discord readable. The system tray doesn't render
+this stream (would be too noisy as toast spam) — it's a Discord-only
+feature for now.
 
 ## Editing config files
 
