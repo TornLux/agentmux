@@ -905,7 +905,15 @@ async fn http_state(
         .get_by_id_or_name(&key)
         .ok_or(StatusCode::NOT_FOUND)?;
     let attached = session.attached_clients();
-    let local_viewer_attached = attached.iter().any(|c| c.client_kind == "terminal");
+    // "Local" here means "the user is actively watching this session
+    // live" — covers both `claude-attach` (`terminal`) and the
+    // browser-based web viewer (`web`). Discord-bot subscribers
+    // (`discord`) explicitly do *not* count: they're a remote relay,
+    // and silencing hooks while a Discord bot is connected would
+    // defeat the whole IM bridge.
+    let local_viewer_attached = attached
+        .iter()
+        .any(|c| c.client_kind == "terminal" || c.client_kind == "web");
     Ok(Json(StateView {
         id: session.id.clone(),
         name: session.name.clone(),

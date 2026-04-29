@@ -109,8 +109,29 @@ impl Config {
         }
     }
 
+    /// URL local clients (hooks, agentmux-tray, agentmux-cli probes,
+    /// claude-attach in --broker mode against the same host) use to
+    /// reach the broker.
+    ///
+    /// Substitutes the IPv4/IPv6 wildcard hosts with loopback because
+    /// connecting to `0.0.0.0` / `[::]` is invalid on Windows
+    /// (`WSAEADDRNOTAVAIL`, error 10049) — wildcard addresses are a
+    /// listen-side concept ("any local interface"), not a valid
+    /// destination. Without this substitution, switching `http_addr`
+    /// to `0.0.0.0:8765` for LAN access silently breaks every hook
+    /// (`AGENT_BROKER_URL` would inherit `http://0.0.0.0:8765` and
+    /// every POST /event would fail).
     pub fn http_url(&self) -> String {
-        format!("http://{}", self.http_addr)
+        let (host, port) = match self.http_addr.rsplit_once(':') {
+            Some((h, p)) => (h, p),
+            None => ("127.0.0.1", self.http_addr.as_str()),
+        };
+        let host = match host {
+            "" | "0.0.0.0" => "127.0.0.1",
+            "[::]" | "[::0]" | "[0:0:0:0:0:0:0:0]" => "[::1]",
+            h => h,
+        };
+        format!("http://{host}:{port}")
     }
 
     /// Resolved sessions.toml path: explicit override if set, otherwise
@@ -164,6 +185,22 @@ mod tests {
         assert_eq!(c.default_command[0], "claude");
         assert_eq!(c.ring_cap_bytes, 512 * 1024);
         assert_eq!(c.http_url(), "http://127.0.0.1:8765");
+    }
+
+    #[test]
+    fn http_url_substitutes_wildcard_for_loopback() {
+        // 0.0.0.0 as a destination is invalid on Windows (error 10049);
+        // local clients (hooks etc.) need a real address.
+        let mut c = Config::default();
+        c.http_addr = "0.0.0.0:8765".to_string();
+        assert_eq!(c.http_url(), "http://127.0.0.1:8765");
+
+        c.http_addr = "[::]:9000".to_string();
+        assert_eq!(c.http_url(), "http://[::1]:9000");
+
+        // Non-wildcard hosts pass through unchanged.
+        c.http_addr = "192.168.1.5:8765".to_string();
+        assert_eq!(c.http_url(), "http://192.168.1.5:8765");
     }
 
     #[test]
