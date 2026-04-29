@@ -104,6 +104,12 @@ slash_command_guild_id = 0
 # different channel and claude wouldn't otherwise have it in context.
 # Reply-thread session routing is independent of this flag.
 reply_quote_in_prompt = true
+
+# Treat 🛑 / 💤 / 🔄 reactions on bot-posted assistant messages as
+# broker actions on the source session (interrupt / hibernate /
+# restart). Only reactions from `allowed_user_ids` count. Set to false
+# if you'd rather use those emojis purely for human chat.
+react_with_actions = true
 '@
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

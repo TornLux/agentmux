@@ -161,6 +161,7 @@ Daily ops
   status                Show what's running and active sessions
   attach [name]         Open a local terminal viewer (named pipe)
                         --broker http://host:port --token <t>: connect over LAN
+                        Or: open http://<broker>:8765/ in any browser
   logs [broker|discord|events]
                         Tail a log stream
 
@@ -252,6 +253,11 @@ Usage: .\agentmux attach [name | --new [name] | --session name | --debug]
                      (default omits this and uses the local named pipe)
   --token  <token>:  Bearer token for non-loopback brokers
                      (also picked up from `$env:AGENT_ATTACH_TOKEN)
+
+  Browser alternative: open http://<broker>:8765/ — no install needed,
+  works on phones/tablets too. Loopback browsers skip the token prompt;
+  LAN browsers paste the same token. Auto-reconnect, soft-key bar on
+  touch devices.
 
   Detach with Ctrl+Q or Ctrl+]. Ctrl+C escalation:
     1×           interrupt claude's current turn
