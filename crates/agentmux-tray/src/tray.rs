@@ -31,6 +31,13 @@ use crate::UserEvent;
 const STATIC_ID_OPEN_WEB: &str = "static:open_web";
 const STATIC_ID_QUIT_BROKER: &str = "static:quit_broker";
 const STATIC_ID_QUIT_TRAY: &str = "static:quit_tray";
+/// Stop everything in one click: discord bot first (so it doesn't
+/// churn reconnects when broker drops out), then broker via HTTP
+/// `/shutdown`, then exit the tray itself. Useful when you suspect
+/// stale processes from a previous run that the wrapper script
+/// somehow missed (e.g. `agentmux stop` not run before reboot, or
+/// the bot was started outside `agentmux start`).
+const STATIC_ID_QUIT_ALL: &str = "static:quit_all";
 
 /// What an icon should look like in a given health state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +47,11 @@ enum IconState {
     AllIdle,
     AnyRunning,
     NeedsAttention,
+    /// At least one session is locally-owned (demoted) — broker has
+    /// no claude in it, the user's local terminal owns the
+    /// transcript. Distinct color so the user remembers without
+    /// hovering.
+    AnyLocallyOwned,
 }
 
 pub struct TrayState {
@@ -111,6 +123,30 @@ impl TrayState {
                 info!("quit tray requested via menu");
                 std::process::exit(0);
             }
+            STATIC_ID_QUIT_ALL => {
+                info!("quit all requested via menu");
+                let broker = self.broker.clone();
+                self.runtime.spawn(async move {
+                    // Discord first: if we shut broker down before
+                    // killing the bot, the bot's WS subscriber would
+                    // see a disconnect and start its reconnect loop,
+                    // which is harmless but pollutes logs.
+                    // taskkill is fire-and-forget — we just want the
+                    // bot gone, don't care if it wasn't running.
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/F", "/IM", "platform-discord.exe"])
+                        .output();
+                    if let Err(e) = broker.shutdown().await {
+                        warn!("shutdown broker: {e}");
+                    }
+                    // Brief wait so broker can release its named
+                    // pipe + HTTP port before tray exits — otherwise
+                    // a quick `agentmux start` after Quit all races
+                    // the still-closing socket.
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    std::process::exit(0);
+                });
+            }
             other => {
                 if let Some((session, action)) = parse_session_id(other) {
                     self.run_session_action(session, action);
@@ -139,6 +175,7 @@ impl TrayState {
                 SessionAction::Hibernate => broker.hibernate(&session).await,
                 SessionAction::Restart => broker.restart(&session).await,
                 SessionAction::Kill => broker.kill(&session).await,
+                SessionAction::ReAdopt => broker.re_adopt(&session).await,
             };
             if let Err(e) = result {
                 warn!("session action {action:?} on {session}: {e}");
@@ -177,12 +214,19 @@ impl TrayState {
     }
 
     fn refresh_icon_and_tooltip(&mut self) {
+        // Priority ordering: a crashed session (NeedsAttention) trumps
+        // everything because it implies the user lost work. Locally-
+        // owned beats AnyRunning because it's a UI affordance the
+        // user explicitly opted into and likely wants visible. Plain
+        // running activity stays "yellow" as before.
         let state = if !self.connected {
             IconState::Disconnected
         } else if self.last_snapshot.is_empty() {
             IconState::NoSessions
         } else if self.last_snapshot.iter().any(needs_attention) {
             IconState::NeedsAttention
+        } else if self.last_snapshot.iter().any(is_locally_owned) {
+            IconState::AnyLocallyOwned
         } else if self.last_snapshot.iter().any(is_running) {
             IconState::AnyRunning
         } else {
@@ -206,6 +250,9 @@ enum SessionAction {
     Hibernate,
     Restart,
     Kill,
+    /// Re-adopt a LocallyOwned session: tray POSTs /adopt; broker
+    /// spawns claude with --resume.
+    ReAdopt,
 }
 
 fn parse_session_id(id: &str) -> Option<(String, SessionAction)> {
@@ -220,6 +267,7 @@ fn parse_session_id(id: &str) -> Option<(String, SessionAction)> {
         "hibernate" => SessionAction::Hibernate,
         "restart" => SessionAction::Restart,
         "kill" => SessionAction::Kill,
+        "adopt" => SessionAction::ReAdopt,
         _ => return None,
     };
     Some((name.to_string(), action))
@@ -251,38 +299,66 @@ fn build_session_menu(sessions: &[SessionInfo]) -> Result<Menu> {
         for s in sessions {
             let label = format!("{} · {}", s.name, render_state(&s.state));
             let sub = Submenu::new(&label, true);
-            sub.append(&MenuItem::with_id(
-                format!("session:{}:attach", s.name),
-                "Attach",
-                true,
-                None,
-            ))?;
-            sub.append(&PredefinedMenuItem::separator())?;
-            sub.append(&MenuItem::with_id(
-                format!("session:{}:interrupt", s.name),
-                "Interrupt (Ctrl+C)",
-                true,
-                None,
-            ))?;
-            sub.append(&MenuItem::with_id(
-                format!("session:{}:hibernate", s.name),
-                "Hibernate",
-                true,
-                None,
-            ))?;
-            sub.append(&MenuItem::with_id(
-                format!("session:{}:restart", s.name),
-                "Restart claude",
-                true,
-                None,
-            ))?;
-            sub.append(&PredefinedMenuItem::separator())?;
-            sub.append(&MenuItem::with_id(
-                format!("session:{}:kill", s.name),
-                "Kill session",
-                true,
-                None,
-            ))?;
+            if s.state == "locally_owned" {
+                // Broker has no claude in this session: Attach would
+                // show an empty TUI, Interrupt/Hibernate/Restart/Kill
+                // either no-op or 409. Replace with the only useful
+                // action: bring the session back under broker.
+                // Kill stays available so the user can permanently
+                // discard a demoted session.
+                sub.append(&MenuItem::with_id(
+                    format!("session:{}:adopt", s.name),
+                    "Re-adopt to broker",
+                    true,
+                    None,
+                ))?;
+                sub.append(&PredefinedMenuItem::separator())?;
+                sub.append(&MenuItem::new(
+                    "(local terminal owns this session)",
+                    false,
+                    None,
+                ))?;
+                sub.append(&PredefinedMenuItem::separator())?;
+                sub.append(&MenuItem::with_id(
+                    format!("session:{}:kill", s.name),
+                    "Discard session record",
+                    true,
+                    None,
+                ))?;
+            } else {
+                sub.append(&MenuItem::with_id(
+                    format!("session:{}:attach", s.name),
+                    "Attach",
+                    true,
+                    None,
+                ))?;
+                sub.append(&PredefinedMenuItem::separator())?;
+                sub.append(&MenuItem::with_id(
+                    format!("session:{}:interrupt", s.name),
+                    "Interrupt (Ctrl+C)",
+                    true,
+                    None,
+                ))?;
+                sub.append(&MenuItem::with_id(
+                    format!("session:{}:hibernate", s.name),
+                    "Hibernate",
+                    true,
+                    None,
+                ))?;
+                sub.append(&MenuItem::with_id(
+                    format!("session:{}:restart", s.name),
+                    "Restart claude",
+                    true,
+                    None,
+                ))?;
+                sub.append(&PredefinedMenuItem::separator())?;
+                sub.append(&MenuItem::with_id(
+                    format!("session:{}:kill", s.name),
+                    "Kill session",
+                    true,
+                    None,
+                ))?;
+            }
             m.append(&sub)?;
         }
     }
@@ -301,6 +377,12 @@ fn build_session_menu(sessions: &[SessionInfo]) -> Result<Menu> {
         None,
     ))?;
     m.append(&MenuItem::with_id(
+        STATIC_ID_QUIT_ALL,
+        "Quit all (broker + discord + tray)",
+        true,
+        None,
+    ))?;
+    m.append(&MenuItem::with_id(
         STATIC_ID_QUIT_TRAY,
         "Quit tray",
         true,
@@ -313,6 +395,16 @@ fn build_offline_menu() -> Result<Menu> {
     let m = Menu::new();
     m.append(&MenuItem::new("Broker offline", false, None))?;
     m.append(&PredefinedMenuItem::separator())?;
+    // Even with broker offline, a stray discord-platform.exe may
+    // still be running (the case that motivated adding Quit all
+    // in the first place). Offer it here too — broker.shutdown()
+    // will fail harmlessly, taskkill on the bot still works.
+    m.append(&MenuItem::with_id(
+        STATIC_ID_QUIT_ALL,
+        "Quit all (kill discord + tray)",
+        true,
+        None,
+    ))?;
     m.append(&MenuItem::with_id(
         STATIC_ID_QUIT_TRAY,
         "Quit tray",
@@ -339,12 +431,17 @@ fn render_state(s: &str) -> &'static str {
         "idle" => "idle",
         "hibernated" => "💤 hib",
         "crashed" => "❌ crash",
+        "locally_owned" => "🌐 local",
         _ => "?",
     }
 }
 
 fn needs_attention(s: &SessionInfo) -> bool {
     matches!(s.state.as_str(), "crashed")
+}
+
+fn is_locally_owned(s: &SessionInfo) -> bool {
+    s.state.as_str() == "locally_owned"
 }
 
 fn is_running(s: &SessionInfo) -> bool {
@@ -368,6 +465,10 @@ fn format_tooltip(connected: bool, snapshot: &[SessionInfo]) -> String {
         .filter(|s| s.state == "hibernated")
         .count();
     let crashed = snapshot.iter().filter(|s| s.state == "crashed").count();
+    let local = snapshot
+        .iter()
+        .filter(|s| s.state == "locally_owned")
+        .count();
     let mut parts = Vec::new();
     parts.push(format!("{} session(s)", snapshot.len()));
     if active > 0 {
@@ -378,6 +479,9 @@ fn format_tooltip(connected: bool, snapshot: &[SessionInfo]) -> String {
     }
     if crashed > 0 {
         parts.push(format!("{crashed} crashed"));
+    }
+    if local > 0 {
+        parts.push(format!("{local} local"));
     }
     format!("agentmux · {}", parts.join(", "))
 }
@@ -390,9 +494,10 @@ fn build_icon(state: IconState) -> Icon {
     let (r, g, b) = match state {
         IconState::Disconnected => (160, 160, 160),
         IconState::NoSessions => (128, 128, 128),
-        IconState::AllIdle => (40, 167, 69),     // green
-        IconState::AnyRunning => (255, 193, 7),  // yellow
-        IconState::NeedsAttention => (220, 53, 69), // red
+        IconState::AllIdle => (40, 167, 69),         // green
+        IconState::AnyRunning => (255, 193, 7),      // yellow
+        IconState::NeedsAttention => (220, 53, 69),  // red
+        IconState::AnyLocallyOwned => (138, 99, 210), // purple
     };
     const SIZE: u32 = 32;
     let mut data = Vec::with_capacity((SIZE * SIZE * 4) as usize);

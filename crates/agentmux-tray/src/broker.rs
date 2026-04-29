@@ -101,6 +101,16 @@ impl BrokerClient {
         Ok(())
     }
 
+    /// Re-adopt a `LocallyOwned` session: broker spawns claude with
+    /// `--resume <stored-id>`. User is responsible for having exited
+    /// any local `claude --resume` first; broker can't detect a
+    /// third-party process holding the same conversation.
+    pub async fn re_adopt(&self, key: &str) -> Result<()> {
+        let url = format!("{}/sessions/{key}/adopt", self.cfg.http_url());
+        self.http.post(&url).send().await?.error_for_status()?;
+        Ok(())
+    }
+
     /// Resolve a parked `/tool-request` long-poll. The broker's
     /// `/tool-decision/:id` returns 404 if the request already
     /// timed out or another consumer (Discord) resolved it first —
