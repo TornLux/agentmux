@@ -515,6 +515,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hook-posttool"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "shared",
+]
+
+[[package]]
 name = "hook-pretool"
 version = "0.2.1"
 dependencies = [

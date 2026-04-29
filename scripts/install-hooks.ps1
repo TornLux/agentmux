@@ -9,10 +9,12 @@
 #
 # Behaviour:
 #   * Backs up settings.json to settings.json.bak before touching it.
-#   * Recognises our hook entries by exe-path equality (slash-normalised,
-#     case-insensitive) so we don't duplicate, and we migrate legacy
-#     backslash-shaped entries to the canonical forward-slash form
-#     (Claude Code's bash mangles unquoted `\` in commands).
+#   * Recognises our hook entries by **basename** (`hook-stop.exe` /
+#     `hook-notification.exe` / `hook-pretool.exe` — names unique to
+#     agentmux), not by full path. Reinstalling from a different folder
+#     therefore dedups + repoints the single remaining entry at the
+#     current build's exe rather than appending a second one. Forward
+#     slashes always (Claude Code's bash mangles unquoted `\` in commands).
 #   * Tolerant of accidentally-nested arrays from prior buggy runs.
 #
 # PowerShell array gotcha note: functions that build arrays return them
@@ -46,15 +48,16 @@ function Find-HookExe([string]$name) {
 $hookStop         = Find-HookExe "hook-stop.exe"
 $hookNotification = Find-HookExe "hook-notification.exe"
 $hookPreTool      = Find-HookExe "hook-pretool.exe"
+$hookPostTool     = Find-HookExe "hook-posttool.exe"
 
-if (-not $hookStop -or -not $hookNotification -or -not $hookPreTool) {
+if (-not $hookStop -or -not $hookNotification -or -not $hookPreTool -or -not $hookPostTool) {
     $msg = @"
 Hook binaries not found. Looked in:
   $root\bin\               (release zip layout)
   $root\target\release\    (cargo build layout)
 
 If you extracted from a release zip, re-extract — the zip should contain a bin\ folder
-with hook-stop.exe / hook-notification.exe / hook-pretool.exe.
+with hook-stop.exe / hook-notification.exe / hook-pretool.exe / hook-posttool.exe.
 If you cloned from source, build with: cargo build --release
 "@
     throw $msg
@@ -66,6 +69,7 @@ If you cloned from source, build with: cargo build --release
 $hookStop         = ((Resolve-Path -LiteralPath $hookStop).Path        -replace '\\', '/')
 $hookNotification = ((Resolve-Path -LiteralPath $hookNotification).Path -replace '\\', '/')
 $hookPreTool      = ((Resolve-Path -LiteralPath $hookPreTool).Path     -replace '\\', '/')
+$hookPostTool     = ((Resolve-Path -LiteralPath $hookPostTool).Path    -replace '\\', '/')
 
 function ConvertTo-OrderedHashtable {
     param($obj)
@@ -91,14 +95,35 @@ function Test-PathEqual {
     return ($a -replace '\\', '/').ToLowerInvariant() -eq ($b -replace '\\', '/').ToLowerInvariant()
 }
 
-# True iff any group anywhere (incl. nested arrays from older bugs) has a
-# hook command exactly equal to $cmd (byte-for-byte).
-function Test-ExactCommand {
-    param($eventArr, $cmd)
+# Extracts the lowercased file basename from a hook command string.
+# A hook command is normally just an exe path; if it grows arguments
+# in future, only the first whitespace-separated token is examined,
+# which matches how shells resolve the program.
+function Get-CommandBasename {
+    param([string]$cmd)
+    if ([string]::IsNullOrWhiteSpace($cmd)) { return "" }
+    $first = ($cmd -split '\s', 2)[0]
+    $norm  = $first -replace '\\', '/'
+    $parts = $norm -split '/'
+    return $parts[$parts.Count - 1].ToLowerInvariant()
+}
+
+function Test-BasenameEqual {
+    param([string]$cmd, [string]$basename)
+    return (Get-CommandBasename $cmd) -eq $basename.ToLowerInvariant()
+}
+
+# Walks the (possibly nested) event array and emits every hook command
+# whose basename matches $basename, one per pipeline item. Caller wraps
+# in @(...) to collect into an array. Pipeline-emission avoids the
+# `$arr += ,$x` PowerShell quirk where the empty-array seed gets
+# unrolled and subsequent appends silently coerce to string concat.
+function Get-OurCommands {
+    param($eventArr, $basename)
     foreach ($item in @($eventArr)) {
         if ($null -eq $item) { continue }
         if ($item -is [System.Collections.IList] -and -not ($item -is [string])) {
-            if (Test-ExactCommand $item $cmd) { return $true }
+            Get-OurCommands $item $basename
             continue
         }
         if (-not ($item -is [System.Collections.IDictionary])) { continue }
@@ -108,48 +133,23 @@ function Test-ExactCommand {
             if ($null -eq $entry) { continue }
             if (($entry -is [System.Collections.IDictionary]) `
                 -and ($entry["type"] -eq "command") `
-                -and ($entry["command"] -eq $cmd)) {
-                return $true
+                -and (Test-BasenameEqual $entry["command"] $basename)) {
+                $entry["command"]
             }
         }
     }
-    return $false
 }
 
-# True iff any entry's command resolves to the same path (slash- and
-# case-normalised) — used to detect entries we should migrate.
-function Test-HasCommand {
-    param($eventArr, $cmd)
-    foreach ($item in @($eventArr)) {
-        if ($null -eq $item) { continue }
-        if ($item -is [System.Collections.IList] -and -not ($item -is [string])) {
-            if (Test-HasCommand $item $cmd) { return $true }
-            continue
-        }
-        if (-not ($item -is [System.Collections.IDictionary])) { continue }
-        $hList = $item["hooks"]
-        if ($null -eq $hList) { continue }
-        foreach ($entry in @($hList)) {
-            if ($null -eq $entry) { continue }
-            if (($entry -is [System.Collections.IDictionary]) `
-                -and ($entry["type"] -eq "command") `
-                -and (Test-PathEqual $entry["command"] $cmd)) {
-                return $true
-            }
-        }
-    }
-    return $false
-}
-
-# Returns a flat Object[] of groups with our entries removed (matching
-# by Test-PathEqual). Flattens any nested-array shapes from prior bugs.
-function Remove-OurCommand {
-    param($eventArr, $cmd)
+# Returns a flat Object[] of groups with all entries whose command
+# basename matches $basename removed. Flattens any nested-array shapes
+# from prior buggy runs as a side effect.
+function Remove-ByBasename {
+    param($eventArr, $basename)
     $kept = @()
     foreach ($item in @($eventArr)) {
         if ($null -eq $item) { continue }
         if ($item -is [System.Collections.IList] -and -not ($item -is [string])) {
-            $sub = Remove-OurCommand $item $cmd
+            $sub = Remove-ByBasename $item $basename
             foreach ($s in $sub) { $kept += ,$s }
             continue
         }
@@ -163,7 +163,7 @@ function Remove-OurCommand {
         foreach ($entry in @($hList)) {
             $isOurs = ($entry -is [System.Collections.IDictionary]) `
                       -and ($entry["type"] -eq "command") `
-                      -and (Test-PathEqual $entry["command"] $cmd)
+                      -and (Test-BasenameEqual $entry["command"] $basename)
             if (-not $isOurs) { $newList += ,$entry }
         }
         if ($newList.Count -gt 0) {
@@ -191,52 +191,65 @@ if (-not $settings.Contains("hooks")) { $settings["hooks"] = [ordered]@{} }
 $hooks = $settings["hooks"]
 
 $pairs = @(
-    @{ Event = "Stop";         Exe = $hookStop }
-    @{ Event = "Notification"; Exe = $hookNotification }
-    @{ Event = "PreToolUse";   Exe = $hookPreTool }
+    @{ Event = "Stop";         Exe = $hookStop;         Basename = "hook-stop.exe" }
+    @{ Event = "Notification"; Exe = $hookNotification; Basename = "hook-notification.exe" }
+    @{ Event = "PreToolUse";   Exe = $hookPreTool;      Basename = "hook-pretool.exe" }
+    @{ Event = "PostToolUse";  Exe = $hookPostTool;     Basename = "hook-posttool.exe" }
 )
 
 $changed = $false
 foreach ($p in $pairs) {
     $evt = $p.Event
     $exe = $p.Exe
+    $bn  = $p.Basename
 
     $current = @()
     if ($hooks.Contains($evt) -and $null -ne $hooks[$evt]) {
         $current = @($hooks[$evt])
     }
 
+    $ours = @(Get-OurCommands $current $bn)
+
     if ($Uninstall) {
-        if (Test-HasCommand $current $exe) {
-            $cleaned = Remove-OurCommand $current $exe
+        if ($ours.Count -gt 0) {
+            $cleaned = Remove-ByBasename $current $bn
             if ($cleaned.Count -eq 0) {
                 $hooks.Remove($evt)
             } else {
                 $hooks[$evt] = $cleaned
             }
-            Write-Host "removed: $evt -> $exe"
+            Write-Host "removed: $evt ($($ours.Count) entr$( if ($ours.Count -eq 1) {'y'} else {'ies'} ))"
             $changed = $true
         }
-    } else {
-        if (Test-ExactCommand $current $exe) {
-            Write-Host "already installed: $evt -> $exe"
-        } elseif (Test-HasCommand $current $exe) {
-            $cleaned = Remove-OurCommand $current $exe
-            $newGroup = [ordered]@{
-                hooks = @([ordered]@{ type = "command"; command = $exe })
-            }
-            $hooks[$evt] = $cleaned + ,$newGroup
-            Write-Host "migrated to canonical path: $evt -> $exe"
-            $changed = $true
-        } else {
-            $newGroup = [ordered]@{
-                hooks = @([ordered]@{ type = "command"; command = $exe })
-            }
-            $hooks[$evt] = $current + ,$newGroup
-            Write-Host "installed: $evt -> $exe"
-            $changed = $true
-        }
+        continue
     }
+
+    # Install: enforce exactly one entry pointing at the current build's
+    # exe. Sweep every basename match (regardless of which path it points
+    # at), then add a fresh entry — that way reinstall from any folder
+    # converges to a single, canonical entry.
+    $alreadyCanonical = ($ours.Count -eq 1) -and (Test-PathEqual $ours[0] $exe)
+    if ($alreadyCanonical) {
+        Write-Host "already installed: $evt -> $exe"
+        continue
+    }
+
+    $cleaned = Remove-ByBasename $current $bn
+    $newGroup = [ordered]@{
+        hooks = @([ordered]@{ type = "command"; command = $exe })
+    }
+    $hooks[$evt] = $cleaned + ,$newGroup
+
+    if ($ours.Count -eq 0) {
+        Write-Host "installed: $evt -> $exe"
+    } elseif ($ours.Count -eq 1) {
+        Write-Host "migrated:  $evt -> $exe"
+        Write-Host "             (was: $($ours[0]))"
+    } else {
+        Write-Host "consolidated $($ours.Count) duplicate $evt entries -> $exe"
+        foreach ($o in $ours) { Write-Host "             dropped: $o" }
+    }
+    $changed = $true
 }
 
 if ($Uninstall -and $hooks.Count -eq 0) {

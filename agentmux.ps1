@@ -383,22 +383,25 @@ function Cmd-Init([string[]]$Argv) {
     Write-Host ""
 
     # 2 — hooks
+    # install-hooks.ps1 is idempotent and dedups by basename, so running
+    # it again is always safe — it converges existing entries to a single
+    # canonical one pointing at this folder's build. We always offer to
+    # run it; the script's own output ("already installed" vs "migrated"
+    # vs "consolidated N duplicates") is the source of truth.
     Write-Host "[2/5] Claude Code hooks" -ForegroundColor Cyan
     if (Test-HooksInstalled) {
-        Write-Host "  ✓ Stop / Notification / PreToolUse hooks already installed in $hooksCfg"
-        $ans = Read-Host "  Reinstall (e.g. after moving the agentmux folder)? [y/N]"
-        if ($ans -eq "y" -or $ans -eq "Y") {
-            & (Join-Path $scriptsDir "install-hooks.ps1")
-        }
+        Write-Host "  ✓ Existing agentmux hooks detected in $hooksCfg"
+        Write-Host "    (re-running is safe — it dedups + repoints to this folder's build)"
+        $ans = Read-Host "  Re-run installer to dedup / repoint? [Y/n]"
     } else {
         Write-Host "  Three hooks plug into ~\.claude\settings.json:"
         Write-Host "    Stop         → 'turn complete' events for IM replies"
         Write-Host "    Notification → permission prompts / idle pings"
         Write-Host "    PreToolUse   → Discord tool-use approval (auto-allows safe verbs)"
         $ans = Read-Host "  Install hooks now? [Y/n]"
-        if ($ans -ne "n" -and $ans -ne "N") {
-            & (Join-Path $scriptsDir "install-hooks.ps1")
-        }
+    }
+    if ($ans -ne "n" -and $ans -ne "N") {
+        & (Join-Path $scriptsDir "install-hooks.ps1")
     }
     Write-Host ""
 
