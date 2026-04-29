@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>agentmux web viewer</title>
+
+<!-- xterm.js + fit addon are baked into broker.exe via include_bytes!
+     and served from /web/vendor/. No CDN, no runtime fetch — works
+     offline / on isolated LANs. To upgrade, fetch new versions into
+     crates/broker/web/vendor/ and rebuild. -->
+<link rel="stylesheet" href="/web/vendor/xterm.min.css">
+<script src="/web/vendor/xterm.min.js"></script>
+<script src="/web/vendor/addon-fit.min.js"></script>
+
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; padding: 0; height: 100%; width: 100%;
+                background: #1e1e1e; color: #ddd; font-family: -apple-system, "Segoe UI", system-ui, sans-serif; }
+  body { display: flex; align-items: center; justify-content: center; }
+  #login, #picker { width: min(520px, calc(100% - 32px)); padding: 24px;
+                    background: #2a2a2a; border-radius: 8px; box-sizing: border-box; }
+  h1 { margin: 0 0 12px; font-size: 1.4rem; font-weight: 500; }
+  p { margin: 8px 0; color: #aaa; }
+  input { width: 100%; padding: 10px; box-sizing: border-box; background: #1e1e1e;
+          color: #ddd; border: 1px solid #444; border-radius: 4px; font-family: monospace; }
+  input:focus { outline: none; border-color: #0e639c; }
+  button { padding: 10px 18px; background: #0e639c; color: white; border: none;
+           border-radius: 4px; cursor: pointer; font-size: 0.95rem; }
+  button:hover:not(:disabled) { background: #1177bb; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; margin-top: 12px; align-items: center; }
+  .err { color: #f48771; min-height: 1.2em; margin-top: 8px; }
+  .muted { color: #888; font-size: 0.85rem; }
+  ul { list-style: none; padding: 0; margin: 8px 0 0; max-height: 50vh; overflow-y: auto; }
+  li { padding: 12px; margin: 4px 0; background: #333; border-radius: 4px; cursor: pointer;
+       display: flex; flex-direction: column; gap: 2px; }
+  li:hover { background: #3d3d3d; }
+  li .name { font-weight: 600; }
+  li .meta { color: #888; font-size: 0.8rem; }
+  li.disabled { opacity: 0.6; cursor: default; }
+  li.disabled:hover { background: #333; }
+  .hidden { display: none !important; }
+
+  #term-host { position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+               padding: 4px; box-sizing: border-box; }
+  #term-host .xterm-viewport,
+  #term-host .xterm-screen { background: #1e1e1e !important; }
+  #toolbar { position: fixed; top: 4px; right: 4px; z-index: 10; display: flex; gap: 4px;
+             background: rgba(20,20,20,0.7); padding: 4px 6px; border-radius: 4px;
+             font-size: 0.75rem; color: #aaa; }
+  #toolbar button { padding: 2px 8px; font-size: 0.75rem; background: #444; }
+  #toolbar button:hover { background: #555; }
+  #status { font-style: italic; }
+  #status.live { color: #4caf50; }
+  #status.dead { color: #f48771; }
+
+  /* Soft keys for touch devices — virtual keyboards on phones don't
+     have Esc/Tab/Ctrl/arrows, and Ctrl+letter combos are basically
+     impossible, so we surface them as tap-buttons. Hidden on
+     pointer:fine devices (desktop with mouse). */
+  #softkeys { position: fixed; bottom: 0; left: 0; right: 0; height: 44px;
+              display: none; align-items: center; gap: 6px; padding: 4px 8px;
+              background: #2a2a2a; border-top: 1px solid #444;
+              overflow-x: auto; -webkit-overflow-scrolling: touch;
+              font-family: monospace; font-size: 0.85rem; user-select: none; }
+  #softkeys button { flex: 0 0 auto; padding: 6px 10px; min-width: 44px;
+                     background: #3d3d3d; color: #ddd; border: 1px solid #555;
+                     border-radius: 4px; }
+  #softkeys button:active { background: #555; }
+  @media (pointer: coarse) {
+    #softkeys:not(.hidden) { display: flex; }
+    #term-host.has-softkeys { bottom: 44px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- 1. token entry -->
+<div id="login">
+  <h1>agentmux web viewer</h1>
+  <p>Paste your <code>attach_token</code>. Loopback browsers can leave it blank.</p>
+  <input type="password" id="tok" placeholder="attach_token" autocomplete="off" autofocus>
+  <div class="row">
+    <button id="login-btn">Connect</button>
+    <span class="muted">stored in this browser's localStorage</span>
+  </div>
+  <div class="err" id="login-err"></div>
+</div>
+
+<!-- 2. session picker -->
+<div id="picker" class="hidden">
+  <h1>Pick a session</h1>
+  <ul id="ses-list"></ul>
+  <div class="row">
+    <button id="refresh-btn">Refresh</button>
+    <button id="logout-btn">Use a different token</button>
+  </div>
+  <div class="err" id="picker-err"></div>
+</div>
+
+<!-- 3. terminal -->
+<div id="term-host" class="hidden"></div>
+<div id="toolbar" class="hidden">
+  <span id="status">connecting…</span>
+  <button id="detach-btn" title="Close this viewer; broker keeps running">detach</button>
+</div>
+<!-- Soft keys for touch devices. Each button's data-bytes is a hex
+     string sent verbatim as TAG_PTY_DATA payload when tapped.
+     CSS `@media (pointer: coarse)` decides visibility. -->
+<div id="softkeys" class="hidden">
+  <button data-bytes="1b">Esc</button>
+  <button data-bytes="09">Tab</button>
+  <button data-bytes="1b5b41">↑</button>
+  <button data-bytes="1b5b42">↓</button>
+  <button data-bytes="1b5b44">←</button>
+  <button data-bytes="1b5b43">→</button>
+  <button data-bytes="03">^C</button>
+  <button data-bytes="04">^D</button>
+  <button data-bytes="0c">^L</button>
+  <button data-bytes="1a">^Z</button>
+</div>
+
+<script>
+(() => {
+  const TOKEN_KEY = 'agentmux_token';
+  const $ = id => document.getElementById(id);
+  let token = localStorage.getItem(TOKEN_KEY) || '';
+  $('tok').value = token;
+
+  // ---- frame protocol mirrors crates/shared/src/frame.rs ----
+  const TAG_PTY_DATA = 0x01;
+  const TAG_RESIZE = 0x02;
+  const TAG_HELLO = 0x03;
+  const TAG_REPLAY_END = 0x04;
+  const TAG_CONTROL = 0x06;
+
+  function encodeFrame(tag, payload) {
+    const buf = new Uint8Array(5 + payload.length);
+    buf[0] = tag;
+    const len = payload.length;
+    buf[1] = (len >>> 24) & 0xff;
+    buf[2] = (len >>> 16) & 0xff;
+    buf[3] = (len >>> 8) & 0xff;
+    buf[4] = len & 0xff;
+    buf.set(payload, 5);
+    return buf;
+  }
+  function decodeFrame(buf) {
+    if (buf.byteLength < 5) return null;
+    const v = new DataView(buf);
+    const tag = v.getUint8(0);
+    const len = v.getUint32(1, false);
+    if (buf.byteLength < 5 + len) return null;
+    return { tag, payload: new Uint8Array(buf, 5, len) };
+  }
+  const enc = new TextEncoder();
+
+  function authHeaders() {
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  }
+
+  // ---- screen transitions ----
+  function show(which) {
+    for (const id of ['login', 'picker', 'term-host', 'toolbar', 'softkeys']) {
+      $(id).classList.toggle('hidden', !which.includes(id));
+    }
+    // Reserve bottom space for the softkey bar on touch devices.
+    $('term-host').classList.toggle('has-softkeys', which.includes('softkeys'));
+  }
+
+  // Soft-key dispatch: each button has a data-bytes hex attribute we
+  // decode and ship as a TAG_PTY_DATA payload. The xterm onData() path
+  // is for keyboard input only; sending here bypasses the Ctrl+C
+  // escalation tracker on purpose (tapping ^C three times rapidly on
+  // mobile shouldn't shut down the broker).
+  $('softkeys').addEventListener('click', e => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    const hex = btn.dataset.bytes;
+    if (!hex || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const bytes = new Uint8Array(hex.match(/.{2}/g).map(h => parseInt(h, 16)));
+    ws.send(encodeFrame(TAG_PTY_DATA, bytes));
+    // Refocus the terminal so the on-screen keyboard stays open after
+    // a soft-key tap (otherwise iOS Safari hides it).
+    if (term) term.focus();
+  });
+
+  // ---- login + session list ----
+  async function fetchSessions() {
+    const r = await fetch('/sessions', { headers: authHeaders() });
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
+    return r.json();
+  }
+
+  async function tryLogin() {
+    $('login-err').textContent = '';
+    try {
+      await fetchSessions();          // implicit token check
+      localStorage.setItem(TOKEN_KEY, token);
+      await renderPicker();
+    } catch (e) {
+      $('login-err').textContent = `${e.message}` +
+        (e.message.includes('401') ? ' — invalid or missing token' : '');
+    }
+  }
+
+  async function renderPicker() {
+    show(['picker']);
+    $('picker-err').textContent = '';
+    let list;
+    try {
+      list = await fetchSessions();
+    } catch (e) {
+      $('picker-err').textContent = e.message;
+      return;
+    }
+    const ul = $('ses-list');
+    ul.innerHTML = '';
+    if (list.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'disabled';
+      li.innerHTML = '<span class="name">no sessions yet</span><span class="meta">create one with <code>!new</code> in Discord, or <code>claude-attach --new</code></span>';
+      ul.appendChild(li);
+      return;
+    }
+    list.sort((a, b) => a.created_at_ms - b.created_at_ms);
+    for (const s of list) {
+      const li = document.createElement('li');
+      const meta = `${s.state} · ${s.viewers} viewer(s) · ${s.cwd}`;
+      li.innerHTML = `<span class="name">${escapeHtml(s.name)}</span><span class="meta">${escapeHtml(meta)}</span>`;
+      li.onclick = () => attach(s.name);
+      ul.appendChild(li);
+    }
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+  }
+
+  // ---- terminal + WS attach ----
+  // Invariants:
+  //   * `term` and `fit` survive across reconnects — we don't clear the
+  //     scrollback when WS drops, so the user keeps the history they had.
+  //   * `ws` is null between connection attempts; `userDetached` blocks
+  //     reconnect when the user clicks the detach button.
+  //   * `currentSession` remembers the session for reconnects.
+  let term, fit, ws, currentSession = null;
+  let ctrlCStamps = [], lastSize = null;
+  let userDetached = false;
+  let reconnectAttempt = 0;
+  let reconnectTimer = null;
+
+  function attach(sessionName) {
+    currentSession = sessionName;
+    userDetached = false;
+    reconnectAttempt = 0;
+    show(['term-host', 'toolbar', 'softkeys']);
+
+    // Build the terminal once per session attach (preserves output
+    // across reconnects within the same session).
+    if (term) { term.dispose(); }
+    term = new Terminal({
+      cursorBlink: true,
+      fontFamily: '"Cascadia Code", Consolas, "DejaVu Sans Mono", monospace',
+      fontSize: 13,
+      scrollback: 5000,
+      theme: { background: '#1e1e1e' },
+      allowProposedApi: true,
+    });
+    fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open($('term-host'));
+    fit.fit();
+    term.focus();
+
+    // Input forwarding + Ctrl+C escalation. Lives outside connect() so
+    // we don't double-register the handler on reconnect — `ws` is read
+    // dynamically each time the user types.
+    term.onData((data) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (data === '\x03') {
+        const now = Date.now();
+        ctrlCStamps = ctrlCStamps.filter(t => now - t < 1500);
+        ctrlCStamps.push(now);
+        if (ctrlCStamps.length === 1) {
+          ws.send(encodeFrame(TAG_PTY_DATA, new Uint8Array([0x03])));
+        } else if (ctrlCStamps.length === 2) {
+          ws.send(encodeFrame(TAG_CONTROL, enc.encode('{"cmd":"restart-claude"}')));
+          term.write('\r\n\x1b[33m[Ctrl+C ×2: restart claude]\x1b[0m\r\n');
+        } else {
+          ws.send(encodeFrame(TAG_CONTROL, enc.encode('{"cmd":"shutdown"}')));
+          term.write('\r\n\x1b[31m[Ctrl+C ×3: shutting broker down]\x1b[0m\r\n');
+          ctrlCStamps = [];
+        }
+        return;
+      }
+      ws.send(encodeFrame(TAG_PTY_DATA, enc.encode(data)));
+    });
+
+    window.addEventListener('resize', onResize);
+    connect();
+  }
+
+  function connect() {
+    if (userDetached || !currentSession) return;
+    setStatus(reconnectAttempt > 0 ? `reconnecting (#${reconnectAttempt})…` : 'connecting…', '');
+
+    const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
+    const protocols = token ? [`bearer.${token}`] : [];
+    ws = new WebSocket(`${wsScheme}://${location.host}/attach`, protocols);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      reconnectAttempt = 0;
+      setStatus('connected', 'live');
+      const helloJson = JSON.stringify({
+        client_id: (crypto.randomUUID && crypto.randomUUID()) || (Date.now() + '-' + Math.random()),
+        client_kind: 'web',
+        mode: 'rw',
+        session: currentSession,
+      });
+      ws.send(encodeFrame(TAG_HELLO, enc.encode(helloJson)));
+      // Force-send the current size so the broker matches our viewport
+      // immediately (vs. waiting for the first window resize event).
+      lastSize = null;
+      sendResize();
+    };
+
+    ws.onmessage = (ev) => {
+      if (!(ev.data instanceof ArrayBuffer)) return;
+      const f = decodeFrame(ev.data);
+      if (!f) return;
+      if (f.tag === TAG_PTY_DATA) {
+        term.write(f.payload);
+      }
+      // TAG_REPLAY_END is just a marker — broker has finished replaying
+      // the ring buffer and is now in live mode. Nothing to do UI-side.
+    };
+
+    ws.onerror = () => { /* onclose runs right after, do all logic there */ };
+
+    ws.onclose = (ev) => {
+      ws = null;
+      if (userDetached) {
+        setStatus('detached', '');
+        return;
+      }
+      // Exponential backoff capped at 30 s. Each tick the toolbar shows
+      // the upcoming attempt number so the user can see something is
+      // happening rather than assume the page is dead.
+      reconnectAttempt += 1;
+      const delay = Math.min(30_000, 1000 * Math.pow(2, reconnectAttempt - 1));
+      const sec = Math.round(delay / 1000);
+      setStatus(`disconnected (${ev.code || 'closed'}) — retry in ${sec}s`, 'dead');
+      if (reconnectAttempt === 1) {
+        // Print the marker once, not every retry, to keep the scrollback clean.
+        term.write(`\r\n\x1b[33m[broker disconnected — auto-reconnecting]\x1b[0m\r\n`);
+      }
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, delay);
+    };
+  }
+
+  function onResize() {
+    if (!fit) return;
+    fit.fit();
+    sendResize(false);
+  }
+
+  function sendResize(force) {
+    if (!term || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const cols = term.cols, rows = term.rows;
+    if (!force && lastSize && lastSize.cols === cols && lastSize.rows === rows) return;
+    lastSize = { cols, rows };
+    const buf = new Uint8Array(4);
+    new DataView(buf.buffer).setUint16(0, cols, false);
+    new DataView(buf.buffer).setUint16(2, rows, false);
+    ws.send(encodeFrame(TAG_RESIZE, buf));
+  }
+
+  function setStatus(text, cls) {
+    const el = $('status');
+    el.textContent = text;
+    el.className = cls || '';
+  }
+
+  function detach() {
+    userDetached = true;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    currentSession = null;
+    if (ws) { try { ws.close(); } catch {} ws = null; }
+    if (term) { term.dispose(); term = null; }
+    window.removeEventListener('resize', onResize);
+    renderPicker();
+  }
+
+  // ---- wiring ----
+  $('login-btn').onclick = () => { token = $('tok').value.trim(); tryLogin(); };
+  $('tok').addEventListener('keydown', e => { if (e.key === 'Enter') $('login-btn').click(); });
+  $('refresh-btn').onclick = () => renderPicker();
+  $('logout-btn').onclick = () => {
+    localStorage.removeItem(TOKEN_KEY);
+    token = '';
+    $('tok').value = '';
+    show(['login']);
+  };
+  $('detach-btn').onclick = detach;
+
+  // ---- entry: jump straight to picker if we already have a token (or
+  //      we're loopback and don't need one) ----
+  if (token || location.hostname === '127.0.0.1' || location.hostname === 'localhost' || location.hostname === '::1') {
+    tryLogin();
+  } else {
+    show(['login']);
+  }
+})();
+</script>
+</body>
+</html>

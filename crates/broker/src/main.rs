@@ -487,7 +487,10 @@ async fn main() -> Result<()> {
 
 async fn run_http_server(app_state: AppState) {
     let addr = app_state.config.http_addr.clone();
-    let app = Router::new()
+
+    // Private routes — wrapped in auth middleware (loopback bypass + Bearer
+    // / WS subprotocol token check for non-loopback peers).
+    let private = Router::new()
         .route("/sessions", get(http_list).post(http_create))
         .route("/sessions/:key", get(http_get).delete(http_delete))
         .route("/sessions/:key/state", get(http_state))
@@ -506,8 +509,22 @@ async fn run_http_server(app_state: AppState) {
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             auth_middleware,
-        ))
-        .with_state(app_state);
+        ));
+
+    // Public routes — the web viewer's static page must be reachable
+    // before the user has a chance to enter their token, so it's not
+    // gated. The page itself only triggers privileged calls (/sessions,
+    // /attach) once the user pastes a token, and those still go through
+    // the auth middleware.
+    let public = Router::new()
+        .route("/", get(serve_web_index))
+        .route("/web", get(serve_web_index))
+        .route("/web/", get(serve_web_index))
+        .route("/web/vendor/xterm.min.js", get(serve_xterm_js))
+        .route("/web/vendor/xterm.min.css", get(serve_xterm_css))
+        .route("/web/vendor/addon-fit.min.js", get(serve_addon_fit_js));
+
+    let app = public.merge(private).with_state(app_state);
 
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -555,11 +572,28 @@ async fn auth_middleware(
         );
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let presented = headers
+    // Primary: Authorization: Bearer <token>. Native CLI viewer and
+    // anyone who can set arbitrary headers (curl, claude-attach) use
+    // this path.
+    let presented_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .unwrap_or("");
+        .and_then(|s| s.strip_prefix("Bearer "));
+
+    // Fallback: WebSocket subprotocol auth. Browsers cannot set
+    // arbitrary headers on `new WebSocket(...)`, but they CAN offer
+    // subprotocols. We accept any offered protocol formatted
+    // `bearer.<token>`; the upgrade handler echoes it back so the
+    // browser doesn't reject the upgrade response.
+    let presented_subprotocol = headers
+        .get_all("sec-websocket-protocol")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix("bearer."));
+
+    let presented = presented_header.or(presented_subprotocol).unwrap_or("");
     if !ct_eq_str(presented, token) {
         warn!("denied non-loopback request from {addr}: invalid token");
         return Err(StatusCode::UNAUTHORIZED);
@@ -1292,12 +1326,78 @@ async fn http_ws_upgrade(
 /// (handle_client) but with each broker↔viewer frame riding on one
 /// WebSocket Binary message instead of being length-framed over a
 /// raw byte stream. Same protocol, different transport.
+/// Single-file web viewer. The HTML inlines its CSS + JS and pulls
+/// xterm.js + the fit addon from sibling `/web/vendor/` routes
+/// (served from `crates/broker/web/vendor/`, baked into the binary
+/// via `include_bytes!`). No runtime fetch from a CDN — works
+/// fully offline / on isolated LANs.
+const WEB_INDEX_HTML: &str = include_str!("../web/index.html");
+const WEB_VENDOR_XTERM_JS: &[u8] = include_bytes!("../web/vendor/xterm.min.js");
+const WEB_VENDOR_XTERM_CSS: &[u8] = include_bytes!("../web/vendor/xterm.min.css");
+const WEB_VENDOR_FIT_JS: &[u8] = include_bytes!("../web/vendor/addon-fit.min.js");
+
+async fn serve_web_index() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/html; charset=utf-8",
+        )],
+        WEB_INDEX_HTML,
+    )
+}
+
+/// Generic vendor asset response. `Cache-Control` is generous (1 day)
+/// because these files are content-addressed by the broker version
+/// they shipped with — when the broker upgrades the binary, the bytes
+/// change and `If-Modified-Since` would re-fetch on its own.
+fn vendor_response(content_type: &'static str, body: &'static [u8]) -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        body,
+    )
+}
+
+async fn serve_xterm_js() -> impl IntoResponse {
+    vendor_response("application/javascript; charset=utf-8", WEB_VENDOR_XTERM_JS)
+}
+async fn serve_xterm_css() -> impl IntoResponse {
+    vendor_response("text/css; charset=utf-8", WEB_VENDOR_XTERM_CSS)
+}
+async fn serve_addon_fit_js() -> impl IntoResponse {
+    vendor_response("application/javascript; charset=utf-8", WEB_VENDOR_FIT_JS)
+}
+
 async fn http_attach_upgrade(
     ws: WebSocketUpgrade,
     State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let manager = s.manager.clone();
     let app_state = s.clone();
+
+    // Browsers reject the upgrade if the server doesn't echo back one
+    // of the offered subprotocols. The auth middleware already
+    // validated any `bearer.<token>` subprotocol; here we just need to
+    // tell axum which protocol(s) to acknowledge so the handshake
+    // completes. Native CLI viewer doesn't offer a subprotocol so the
+    // list is empty and axum responds without the header (also fine).
+    let offered: Vec<String> = headers
+        .get_all("sec-websocket-protocol")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let ws = if offered.is_empty() {
+        ws
+    } else {
+        ws.protocols(offered)
+    };
+
     ws.on_upgrade(move |socket| handle_ws_attach(socket, manager, app_state))
 }
 
