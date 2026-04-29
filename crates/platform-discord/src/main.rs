@@ -18,6 +18,7 @@ mod attachments;
 mod broker;
 mod config;
 mod handler;
+mod progress;
 mod slash;
 mod state;
 
@@ -182,9 +183,81 @@ async fn relay_event_to_discord(
         "tool_request" => {
             relay_tool_request(http, config, state, &session_name, event).await;
         }
+        "tool_progress" => {
+            let tool_name = event
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if tool_name.is_empty() {
+                return;
+            }
+            let tool_input = event
+                .get("tool_input")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            relay_tool_progress(http, state, &session_name, tool_name, &tool_input).await;
+        }
         other => {
             tracing::debug!("ws event ignored: type={other}");
         }
+    }
+}
+
+/// Edit the in-flight placeholder with a running narrative of tool
+/// calls. We **peek** rather than pop: the placeholder stays in the
+/// queue until `assistant_message` arrives and `pop_pending` consumes
+/// it for the final answer. Throttled (`PROGRESS_EDIT_THROTTLE`) so
+/// fast bursts of tools don't melt Discord's per-message edit budget;
+/// skipped events still mutate the in-memory history, so the next
+/// allowed edit shows the cumulative state.
+async fn relay_tool_progress(
+    http: &Arc<Http>,
+    state: &Arc<BotState>,
+    session_name: &str,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) {
+    let pending = match state.peek_pending(session_name).await {
+        Some(p) => p,
+        None => {
+            // No Discord-originated turn in flight for this session
+            // (e.g. user is driving from Terminal and hook-posttool's
+            // local-viewer bail didn't trigger because the viewer
+            // detached mid-turn). Silently drop.
+            tracing::debug!("tool_progress session={session_name} dropped: no pending");
+            return;
+        }
+    };
+    let line = progress::render_tool_progress(tool_name, tool_input);
+    let body = {
+        let mut prog = match pending.progress.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("progress mutex poisoned for session={session_name}: {e}");
+                return;
+            }
+        };
+        prog.history.push(line);
+        let now = std::time::Instant::now();
+        if let Some(last) = prog.last_edit_at {
+            if now.duration_since(last) < progress::PROGRESS_EDIT_THROTTLE {
+                // Throttled: skip the edit but keep the line in
+                // history so the next non-throttled event renders the
+                // cumulative state.
+                return;
+            }
+        }
+        prog.last_edit_at = Some(now);
+        progress::render_placeholder(&prog.history)
+    };
+
+    let channel = ChannelId::new(pending.channel_id);
+    let mid = MessageId::new(pending.message_id);
+    if let Err(e) = channel
+        .edit_message(http, mid, EditMessage::new().content(body))
+        .await
+    {
+        warn!("edit progress for session={session_name}: {e}");
     }
 }
 

@@ -270,13 +270,12 @@ impl EventHandler for Handler {
         match self.broker.send_input(&session, &prompt).await {
             Ok(_) => {
                 let typing_cancel = Arc::new(AtomicBool::new(false));
-                let pending = PendingReply {
-                    channel_id: placeholder.channel_id.get(),
-                    message_id: placeholder.id.get(),
-                    deadline_unix_ms: now_unix_ms()
-                        .saturating_add(PENDING_TTL.as_millis() as u64),
-                    typing_cancel: typing_cancel.clone(),
-                };
+                let pending = PendingReply::new(
+                    placeholder.channel_id.get(),
+                    placeholder.id.get(),
+                    now_unix_ms().saturating_add(PENDING_TTL.as_millis() as u64),
+                    typing_cancel.clone(),
+                );
                 self.state.push_pending(&session, pending).await;
                 spawn_typing_task(
                     ctx.http.clone(),

@@ -25,8 +25,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -51,6 +51,38 @@ pub struct PendingReply {
     /// exits as soon as it's set. Shared between the pending entry
     /// and the typing task so neither has to know about the other.
     pub typing_cancel: Arc<AtomicBool>,
+    /// Per-placeholder progress narrative — a list of "✏️ editing
+    /// src/x.rs", "🖥 cargo test" … strings, one per PostToolUse hook
+    /// firing during this turn. The WS relay edits the placeholder
+    /// content from this list (throttled). On `assistant_message` the
+    /// pop_pending consumer drops the entry and the final answer
+    /// replaces the progress lines wholesale. Std mutex is fine: every
+    /// critical section is a push/clone with no `.await` inside.
+    pub progress: Arc<StdMutex<ProgressState>>,
+}
+
+#[derive(Debug, Default)]
+pub struct ProgressState {
+    pub history: Vec<String>,
+    pub last_edit_at: Option<Instant>,
+}
+
+impl PendingReply {
+    /// Build a fresh `PendingReply`. `progress` is initialised empty.
+    pub fn new(
+        channel_id: u64,
+        message_id: u64,
+        deadline_unix_ms: u64,
+        typing_cancel: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            channel_id,
+            message_id,
+            deadline_unix_ms,
+            typing_cancel,
+            progress: Arc::new(StdMutex::new(ProgressState::default())),
+        }
+    }
 }
 
 pub fn now_unix_ms() -> u64 {
@@ -263,6 +295,28 @@ impl BotState {
             snapshot_pending(&map)
         };
         self.save_pending(snapshot).await;
+    }
+
+    /// Clone the oldest non-expired placeholder for `session` without
+    /// removing it. Used by `tool_progress` events: they want to update
+    /// the in-flight placeholder's content, not consume it. Expired
+    /// entries at the front are discarded as a side effect, mirroring
+    /// `pop_pending` so the queue's head invariant ("front is current")
+    /// holds for both readers.
+    pub async fn peek_pending(&self, session: &str) -> Option<PendingReply> {
+        let mut map = self.pending_replies.lock().await;
+        let queue = map.get_mut(session)?;
+        let now_ms = now_unix_ms();
+        while let Some(front) = queue.front() {
+            if front.deadline_unix_ms < now_ms {
+                if let Some(expired) = queue.pop_front() {
+                    expired.typing_cancel.store(true, Ordering::Release);
+                }
+            } else {
+                return queue.front().cloned();
+            }
+        }
+        None
     }
 
     /// Pop the oldest non-expired placeholder for `session`. Expired
