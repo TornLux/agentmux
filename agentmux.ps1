@@ -521,7 +521,7 @@ function Cmd-Attach([string[]]$Argv) {
             return
         }
     }
-    & $attachExe @args
+    & $attachExe @Argv
 }
 
 function Cmd-Logs([string[]]$Argv) {

@@ -28,12 +28,36 @@ param(
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
-$hookStop         = Join-Path $root "target\release\hook-stop.exe"
-$hookNotification = Join-Path $root "target\release\hook-notification.exe"
-$hookPreTool      = Join-Path $root "target\release\hook-pretool.exe"
 
-if (-not (Test-Path $hookStop) -or -not (Test-Path $hookNotification) -or -not (Test-Path $hookPreTool)) {
-    throw "Hook binaries missing. Run: cargo build --release"
+# Prefer bin/ (release-zip layout); fall back to target/release/ (cargo
+# builds). Two layouts so the same script works for both release-zip
+# users (no Rust toolchain) and from-source developers.
+function Find-HookExe([string]$name) {
+    $candidates = @(
+        (Join-Path $root "bin\$name"),
+        (Join-Path $root "target\release\$name")
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path -LiteralPath $c) { return $c }
+    }
+    return $null
+}
+
+$hookStop         = Find-HookExe "hook-stop.exe"
+$hookNotification = Find-HookExe "hook-notification.exe"
+$hookPreTool      = Find-HookExe "hook-pretool.exe"
+
+if (-not $hookStop -or -not $hookNotification -or -not $hookPreTool) {
+    $msg = @"
+Hook binaries not found. Looked in:
+  $root\bin\               (release zip layout)
+  $root\target\release\    (cargo build layout)
+
+If you extracted from a release zip, re-extract — the zip should contain a bin\ folder
+with hook-stop.exe / hook-notification.exe / hook-pretool.exe.
+If you cloned from source, build with: cargo build --release
+"@
+    throw $msg
 }
 # Forward slashes — Claude Code on Windows runs hook commands via
 # /usr/bin/bash, which silently eats unquoted backslashes. Forward
