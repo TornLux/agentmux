@@ -2,7 +2,8 @@
 #
 # Layout produced:
 #   agentmux-vX.Y.Z-windows-x86_64/
-#     bin/{broker,claude-attach,hook-stop,hook-notification,hook-pretool,platform-discord,agentmux-cli}.exe
+#     bin/{broker,claude-attach,hook-stop,hook-notification,hook-pretool,
+#          hook-posttool,platform-discord,agentmux-tray,agentmux-cli}.exe
 #     scripts/        (all .ps1 + terminal-profile.json)
 #     agentmux.ps1
 #     README.md
@@ -78,7 +79,9 @@ try {
         "hook-stop.exe",
         "hook-notification.exe",
         "hook-pretool.exe",
+        "hook-posttool.exe",
         "platform-discord.exe",
+        "agentmux-tray.exe",
         "agentmux-cli.exe"
     )
     foreach ($b in $binaries) {
