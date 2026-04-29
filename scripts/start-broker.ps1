@@ -42,18 +42,58 @@ $dataDir = Join-Path $env:LOCALAPPDATA "agentmux"
 New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
 $pidFile = Join-Path $dataDir "broker.pid"
 
-# Singleton check.
+# Singleton check. Three states for an existing pid:
+#   1. dead pid          → stale file, clear and proceed
+#   2. live + responsive → broker is up, refuse
+#   3. live + unresponsive on /sessions → broker is mid-shutdown
+#      (e.g. user just clicked tray "Stop broker"); the http handler
+#      replied "ok" but the 200ms graceful-exit window hasn't elapsed.
+#      Wait up to 5s for it to exit, then proceed.
 if (Test-Path -LiteralPath $pidFile) {
     $existingPid = (Get-Content -LiteralPath $pidFile -Raw).Trim()
     if ($existingPid) {
         $proc = Get-Process -Id $existingPid -ErrorAction SilentlyContinue
         if ($proc -and $proc.ProcessName -eq 'broker') {
-            Write-Warning "broker is already running (pid $existingPid)."
-            Write-Warning "Stop it first via .\scripts\stop-broker.ps1 if you want to relaunch."
-            return
+            # Double-probe with a 300ms gap. axum's graceful exit
+            # writes the /shutdown response BEFORE actually closing
+            # the listener, so a single probe right after a tray
+            # "Stop broker" click can land in that ~50-300ms window
+            # where the broker still answers /sessions but is
+            # tearing down. Two consecutive successful probes mean
+            # the broker is genuinely serving.
+            $responsive = $false
+            try {
+                $null = Invoke-RestMethod "http://127.0.0.1:8765/sessions" `
+                    -TimeoutSec 1 -ErrorAction Stop
+                Start-Sleep -Milliseconds 300
+                $null = Invoke-RestMethod "http://127.0.0.1:8765/sessions" `
+                    -TimeoutSec 1 -ErrorAction Stop
+                $responsive = $true
+            } catch {}
+
+            if ($responsive) {
+                Write-Warning "broker is already running (pid $existingPid)."
+                Write-Warning "Stop it first via .\scripts\stop-broker.ps1 if you want to relaunch."
+                return
+            }
+
+            Write-Host "broker (pid $existingPid) is mid-shutdown — waiting up to 5s for exit..."
+            $deadline = (Get-Date).AddSeconds(5)
+            while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Milliseconds 100
+                $proc.Refresh()
+            }
+            if (-not $proc.HasExited) {
+                Write-Warning "broker (pid $existingPid) did not exit within 5s; aborting."
+                Write-Warning "Force-stop with: .\scripts\stop-broker.ps1"
+                return
+            }
+            Write-Host "broker exited; clearing pid file and continuing"
+            Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Host "stale pid file (pid $existingPid no longer a broker) — clearing"
+            Remove-Item -LiteralPath $pidFile -Force
         }
-        Write-Host "stale pid file (pid $existingPid no longer a broker) — clearing"
-        Remove-Item -LiteralPath $pidFile -Force
     }
 }
 

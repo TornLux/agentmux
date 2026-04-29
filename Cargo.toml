@@ -10,6 +10,7 @@ members = [
     "crates/hook-posttool",
     "crates/platform-discord",
     "crates/agentmux-cli",
+    "crates/agentmux-tray",
 ]
 
 [workspace.package]

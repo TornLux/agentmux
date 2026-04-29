@@ -1,0 +1,52 @@
+[package]
+name = "agentmux-tray"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "agentmux-tray"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+
+# System integration: tray icon + Win32 message-pump-compatible event loop.
+tray-icon = { version = "0.20", default-features = false }
+tao = { version = "0.31", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# WinRT toast notifications: we drive the API directly via the
+# `windows` crate (raw XML + protocol activation) so non-packaged
+# tray exe can post action-button toasts without registering a COM
+# server.
+windows = { version = "0.58", features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_Foundation",
+] }
+
+# URL scheme registration in HKCU.
+winreg = "0.55"
+
+# Single-instance + cross-process URL forwarding. Cross-platform named-pipe
+# abstraction; on Windows it sits on \\.\pipe\<name>. tokio feature enables
+# the async listener / stream types we use in `ipc.rs`.
+interprocess = { version = "2", features = ["tokio"] }
+
+# Async runtime + WS subscription (mirrors platform-discord's stack).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+# Loopback HTTP client — same pattern as platform-discord. We don't reuse
+# shared::http here because the tray issues several concurrent requests
+# (poll loop + decision posts) and benefits from connection reuse.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+once_cell = "1"

@@ -58,24 +58,26 @@ function Require-Binary([string]$path, [string]$label) {
 }
 
 function Test-HooksInstalled {
-    # Returns $true iff Claude Code's settings.json has all three
-    # agentmux hook entries (Stop, Notification, PreToolUse) wired
-    # to their respective exes. Match is by basename (case-insensitive)
-    # so it stays robust to slash-shape and path-move changes;
-    # install-hooks.ps1 handles re-canonicalisation if asked.
+    # Returns $true iff Claude Code's settings.json has all four
+    # agentmux hook entries (Stop, Notification, PreToolUse,
+    # PostToolUse) wired to their respective exes. Match is by basename
+    # (case-insensitive) so it stays robust to slash-shape and path-
+    # move changes; install-hooks.ps1 handles re-canonicalisation if
+    # asked.
     if (-not (Test-Path $hooksCfg)) { return $false }
     try {
         $raw = Get-Content -LiteralPath $hooksCfg -Raw -ErrorAction Stop
         if (-not $raw -or $raw.Trim().Length -eq 0) { return $false }
         $json = $raw | ConvertFrom-Json
         if (-not $json.hooks) { return $false }
-        $found = @{ Stop = $false; Notification = $false; PreToolUse = $false }
+        $found = @{ Stop = $false; Notification = $false; PreToolUse = $false; PostToolUse = $false }
         $needles = @{
             Stop         = "hook-stop.exe"
             Notification = "hook-notification.exe"
             PreToolUse   = "hook-pretool.exe"
+            PostToolUse  = "hook-posttool.exe"
         }
-        foreach ($evt in @("Stop", "Notification", "PreToolUse")) {
+        foreach ($evt in @("Stop", "Notification", "PreToolUse", "PostToolUse")) {
             $groups = $json.hooks.$evt
             if (-not $groups) { continue }
             foreach ($g in @($groups)) {
@@ -89,7 +91,7 @@ function Test-HooksInstalled {
                 }
             }
         }
-        return ($found.Stop -and $found.Notification -and $found.PreToolUse)
+        return ($found.Stop -and $found.Notification -and $found.PreToolUse -and $found.PostToolUse)
     } catch {
         return $false
     }
@@ -150,19 +152,21 @@ Usage: .\agentmux <command> [args]
 
 Setup
   init                  Run the first-time setup wizard
-  hooks install         Wire Claude Code Stop / Notification / PreToolUse hooks
+  hooks install         Wire Claude Code Stop / Notification / PreToolUse / PostToolUse hooks
   hooks uninstall       Remove hooks from ~\.claude\settings.json
   hooks check           Validate hooks configuration
 
 Daily ops
-  start [--no-discord]  Start broker (and Discord bot if configured)
+  start [--no-tray] [--no-discord]
+                        Start broker + tray + Discord bot (if configured)
   start --foreground    Start broker in the current shell (Ctrl+C to stop)
-  stop                  Stop broker and Discord bot
+  stop                  Stop broker, tray, and Discord bot
   status                Show what's running and active sessions
   attach [name]         Open a local terminal viewer (named pipe)
                         --broker http://host:port --token <t>: connect over LAN
                         Or: open http://<broker>:8765/ in any browser
-  logs [broker|discord|events]
+                        Or: right-click the tray icon → Attach <session>
+  logs [broker|discord|tray|events]
                         Tail a log stream
 
 Configuration
@@ -200,33 +204,39 @@ Usage: .\agentmux init
 
   Interactive first-time wizard. Five steps:
     1. prerequisite check (binaries, claude on PATH)
-    2. install Claude Code hooks (Stop + Notification + PreToolUse)
-       — idempotent; already-installed entries are detected and skipped
+    2. install Claude Code hooks (Stop + Notification + PreToolUse + PostToolUse)
+       — idempotent; entries are dedup'd by basename, so reinstalling from
+         a different folder converges to a single canonical entry
     3. write broker config template (skipped if exists)
     4. optional Discord setup (token + channels + users)
        — re-detects an already-configured Discord and skips
-    5. start broker in the background
+    5. start broker (and tray + Discord) in the background
 
   Re-runnable; already-done steps are skipped.
 "@
         }
         "start" {
             @"
-Usage: .\agentmux start [--no-discord | --foreground]
+Usage: .\agentmux start [--no-tray] [--no-discord | --foreground]
 
   Default: starts broker as a detached background process, then the
+  agentmux-tray (Windows tray icon + toast notifications), then the
   Discord bot if discord.toml exists and DISCORD_BOT_TOKEN is set.
 
+  Idempotent: existing tray / Discord processes are detected and left
+  alone (their WS subscribers reconnect to the new broker on their own).
+
+  --no-tray       Skip the tray (no icon, no toasts).
   --no-discord    Skip the bot even if configured.
-  --foreground    Run broker inline (Ctrl+C to stop). Skips the bot;
-                  use a separate shell if you need both.
+  --foreground    Run broker inline (Ctrl+C to stop). Skips tray and bot;
+                  use a separate shell if you need them.
 "@
         }
         "stop" {
             @"
 Usage: .\agentmux stop
 
-  Stops platform-discord (any matching pid) and broker (via the PID
+  Stops platform-discord, agentmux-tray, and broker (via the PID
   file under %LOCALAPPDATA%\agentmux\). Safe to run when nothing is
   running — exits cleanly.
 "@
@@ -267,10 +277,11 @@ Usage: .\agentmux attach [name | --new [name] | --session name | --debug]
         }
         "logs" {
             @"
-Usage: .\agentmux logs [broker | discord | events]
+Usage: .\agentmux logs [broker | discord | tray | events]
 
   broker  (default)  tail today's broker.YYYY-MM-DD.log
   discord            tail platform-discord.stdout.log
+  tray               tail agentmux-tray.stderr.log
   events             tail events.jsonl (audit trail of hook events)
 
   Live follow (Get-Content -Wait); Ctrl+C to exit.
@@ -394,10 +405,11 @@ function Cmd-Init([string[]]$Argv) {
         Write-Host "    (re-running is safe — it dedups + repoints to this folder's build)"
         $ans = Read-Host "  Re-run installer to dedup / repoint? [Y/n]"
     } else {
-        Write-Host "  Three hooks plug into ~\.claude\settings.json:"
-        Write-Host "    Stop         → 'turn complete' events for IM replies"
+        Write-Host "  Four hooks plug into ~\.claude\settings.json:"
+        Write-Host "    Stop         → 'turn complete' events for IM replies / toasts"
         Write-Host "    Notification → permission prompts / idle pings"
-        Write-Host "    PreToolUse   → Discord tool-use approval (auto-allows safe verbs)"
+        Write-Host "    PreToolUse   → tool-use approval (Discord buttons + tray toast, auto-allows safe verbs)"
+        Write-Host "    PostToolUse  → live tool-progress narration in Discord placeholder"
         $ans = Read-Host "  Install hooks now? [Y/n]"
     }
     if ($ans -ne "n" -and $ans -ne "N") {
@@ -468,8 +480,54 @@ function Cmd-Start([string[]]$Argv) {
 
     & (Join-Path $scriptsDir "start-broker.ps1")
 
+    # Verify broker actually came up before launching tray / discord.
+    # Without this guard, a failed broker launch (port collision,
+    # pid-file race, etc.) silently leaves tray + discord pointed at
+    # a void, AND each subsequent `agentmux start` stacks another
+    # discord process. Probe up to 2s; abort the rest of start if
+    # broker isn't responding.
+    $brokerUp = $false
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 100
+        if (Get-BrokerPid) {
+            try {
+                $null = Invoke-RestMethod "http://127.0.0.1:8765/sessions" -TimeoutSec 1 -ErrorAction Stop
+                $brokerUp = $true
+                break
+            } catch {}
+        }
+    }
+    if (-not $brokerUp) {
+        Write-Host "broker did not come up within 2s — skipping tray and discord" -ForegroundColor Yellow
+        Write-Host "  check: .\agentmux logs broker" -ForegroundColor Yellow
+        return
+    }
+
+    # Tray runs by default — same lifecycle as the broker. Skipped only
+    # if --no-tray was passed or the binary isn't built (older release).
+    # If a tray is already running, leave it (its WS subscriber will
+    # reconnect to the freshly-started broker on its own).
+    if (-not ($Argv -contains "--no-tray")) {
+        if (Get-Process agentmux-tray -ErrorAction SilentlyContinue) {
+            Write-Host "agentmux-tray already running — leaving it (will reconnect to fresh broker)"
+        } else {
+            $trayExe = (Join-Path $scriptsDir "..\target\release\agentmux-tray.exe")
+            $trayBinExe = (Join-Path $scriptsDir "..\bin\agentmux-tray.exe")
+            if ((Test-Path $trayExe) -or (Test-Path $trayBinExe)) {
+                & (Join-Path $scriptsDir "start-tray.ps1")
+            }
+        }
+    }
+
     if ($Argv -contains "--no-discord") { return }
     if (-not (Test-Path $discordCfg)) { return }
+
+    # Same idempotent-start logic for the Discord bot — its WS
+    # subscriber will reconnect on its own when the broker comes back.
+    if (Get-Process platform-discord -ErrorAction SilentlyContinue) {
+        Write-Host "platform-discord already running — leaving it (will reconnect to fresh broker)"
+        return
+    }
 
     $token = [Environment]::GetEnvironmentVariable("DISCORD_BOT_TOKEN", "User")
     if (-not $token) {
@@ -486,6 +544,10 @@ function Cmd-Stop([string[]]$Argv) {
     Get-Process -Name platform-discord -ErrorAction SilentlyContinue | ForEach-Object {
         Stop-Process -Id $_.Id -Force
         Write-Host "stopped platform-discord (pid $($_.Id))"
+    }
+    Get-Process -Name agentmux-tray -ErrorAction SilentlyContinue | ForEach-Object {
+        Stop-Process -Id $_.Id -Force
+        Write-Host "stopped agentmux-tray (pid $($_.Id))"
     }
     & (Join-Path $scriptsDir "stop-broker.ps1")
 }
@@ -516,6 +578,13 @@ function Cmd-Status([string[]]$Argv) {
         Write-Host "discord: configured but not running" -ForegroundColor Gray
     } else {
         Write-Host "discord: not configured" -ForegroundColor Gray
+    }
+
+    $tray = Get-Process -Name agentmux-tray -ErrorAction SilentlyContinue
+    if ($tray) {
+        Write-Host "tray:    running (pid $($tray.Id))" -ForegroundColor Green
+    } else {
+        Write-Host "tray:    not running" -ForegroundColor Gray
     }
 }
 
@@ -549,13 +618,18 @@ function Cmd-Logs([string[]]$Argv) {
             if (Test-Path $f) { Get-Content $f -Wait -Tail 30 }
             else { Write-Host "no discord log at $f" }
         }
+        "tray" {
+            $f = Join-Path $dataDir "agentmux-tray.stderr.log"
+            if (Test-Path $f) { Get-Content $f -Wait -Tail 30 }
+            else { Write-Host "no tray log at $f" }
+        }
         "events" {
             $f = Join-Path $dataDir "events.jsonl"
             if (Test-Path $f) { Get-Content $f -Wait -Tail 20 }
             else { Write-Host "no events log at $f" }
         }
         default {
-            Write-Host "usage: .\agentmux logs [broker|discord|events]"
+            Write-Host "usage: .\agentmux logs [broker|discord|tray|events]"
         }
     }
 }
