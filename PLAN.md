@@ -902,7 +902,7 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 ### 进度速览
 
-截至 v0.2.2。原 plan 里的核心 phase 1-9 全部落地,additional 的 LAN /
+截至 v0.2.3。原 plan 里的核心 phase 1-9 全部落地,additional 的 LAN /
 web viewer / release pipeline / **PostToolUse 驱动的工具进度流** /
 **system tray + Windows toast(本地通知 + 审批)** 等都做了。剩下的开放项是新方向(跨平台、vendor-agnostic backend、cost dashboard
 等),见末尾 §11.
