@@ -43,7 +43,7 @@ use tracing::{info, warn};
 
 use crate::ansi;
 use crate::attachments;
-use crate::broker::{BrokerClient, SessionLite};
+use crate::broker::{BrokerClient, SendInputError, SessionLite};
 use crate::config::DiscordConfig;
 use crate::slash;
 use crate::state::{now_unix_ms, BotState, PendingReply};
@@ -283,7 +283,33 @@ impl EventHandler for Handler {
                     typing_cancel,
                 );
             }
-            Err(e) => {
+            Err(SendInputError::LocallyOwned { session, message }) => {
+                // The session was demoted: broker has no claude to
+                // write into, and auto-resuming would race the user's
+                // local `claude --resume` and corrupt the transcript.
+                // UX: drop the placeholder (no work to track), react
+                // 💤 on the user's message, and post an explanation
+                // ONLY on the first rejection in a 5-min window per
+                // channel — repeated attempts get just the reaction
+                // so the channel doesn't fill with the same notice.
+                info!("forward to {session}: locally-owned, refused");
+                let _ = placeholder.delete(&ctx.http).await;
+                let _ = msg
+                    .react(&ctx.http, ReactionType::Unicode("💤".into()))
+                    .await;
+                if self
+                    .state
+                    .should_post_full_locally_owned_notice(cid)
+                    .await
+                {
+                    let body = format!(
+                        "💤 {}\n\nRun `\\agentmux adopt {}` on the broker host to bring it back.",
+                        message, session,
+                    );
+                    let _ = msg.reply(&ctx.http, body).await;
+                }
+            }
+            Err(SendInputError::Other(e)) => {
                 warn!("forward to {session}: {e:#}");
                 // Switch to react-on-original-message UX: delete our
                 // placeholder, react ❌ on user's msg, post a brief
@@ -643,7 +669,7 @@ impl Handler {
             for s in &list {
                 let marker = if s.name == bound { "▶ " } else { "  " };
                 out.push_str(&format!(
-                    "{marker}{:<18}  {:<11}  viewers={}  cwd={}\n",
+                    "{marker}{:<18}  {:<14}  viewers={}  cwd={}\n",
                     truncate(&s.name, 18),
                     s.state,
                     s.viewers,

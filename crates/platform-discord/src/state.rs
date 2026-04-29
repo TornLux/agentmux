@@ -134,7 +134,18 @@ pub struct BotState {
     /// records, persisted on push/pop so a crashed bot can clean up
     /// orphaned `💭 working…` messages on next start.
     pending_file: PathBuf,
+    /// `channel_id -> last full LocallyOwned-notice Instant`.
+    /// Drives the "first time post a full message, then react with
+    /// 💤 within a 5-min window" UX: the bot avoids spamming the
+    /// channel when the user keeps trying to talk to a demoted
+    /// session, but the first rejection always carries the explanation.
+    locally_owned_last_full: Mutex<HashMap<u64, Instant>>,
 }
+
+/// How long after a full "session is locally-owned" message the bot
+/// suppresses repeats in the same channel. Subsequent rejections in
+/// this window get only a 💤 reaction on the user's message.
+pub const LOCALLY_OWNED_NOTICE_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Default)]
 struct RecentMessages {
@@ -189,7 +200,28 @@ impl BotState {
             recent_messages: Mutex::new(RecentMessages::default()),
             state_file,
             pending_file,
+            locally_owned_last_full: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Decide whether to post a full "session is locally-owned"
+    /// message in `channel_id` or just react 💤 on the user's
+    /// message. Returns `true` if a full message should go out
+    /// (no notice in the last `LOCALLY_OWNED_NOTICE_WINDOW`); the
+    /// caller is expected to follow through. Always updates the
+    /// window stamp so back-to-back rejections collapse to a single
+    /// full notice + N reactions.
+    pub async fn should_post_full_locally_owned_notice(&self, channel_id: u64) -> bool {
+        let mut map = self.locally_owned_last_full.lock().await;
+        let now = Instant::now();
+        let post_full = match map.get(&channel_id) {
+            Some(prev) => now.duration_since(*prev) >= LOCALLY_OWNED_NOTICE_WINDOW,
+            None => true,
+        };
+        if post_full {
+            map.insert(channel_id, now);
+        }
+        post_full
     }
 
     /// Read and **delete** any persisted pending records. Called once

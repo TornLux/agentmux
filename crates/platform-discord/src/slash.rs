@@ -241,7 +241,7 @@ async fn slash_ls(handler: &Handler, cid: u64) -> String {
         for s in &list {
             let marker = if s.name == bound { "▶ " } else { "  " };
             out.push_str(&format!(
-                "{marker}{:<18}  {:<11}  viewers={}  cwd={}\n",
+                "{marker}{:<18}  {:<14}  viewers={}  cwd={}\n",
                 truncate(&s.name, 18),
                 s.state,
                 s.viewers,

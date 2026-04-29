@@ -26,6 +26,29 @@ pub struct SessionLite {
     pub cwd: String,
 }
 
+/// Outcome of a `send_input` call. Splits the LocallyOwned case out
+/// of the general error bag so the handler can render a friendlier
+/// "session is local-only" message + the 5-min-window reaction
+/// suppression.
+#[derive(Debug)]
+pub enum SendInputError {
+    LocallyOwned { session: String, message: String },
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for SendInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendInputError::LocallyOwned { session, message } => {
+                write!(f, "session '{session}' is locally-owned: {message}")
+            }
+            SendInputError::Other(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for SendInputError {}
+
 impl Default for SessionLite {
     fn default() -> Self {
         Self {
@@ -70,22 +93,53 @@ impl BrokerClient {
     /// Forward one user message to a session as a typed prompt.
     /// `\r` is appended on the broker side so claude treats it as
     /// "Enter pressed".
-    pub async fn send_input(&self, session: &str, text: &str) -> Result<()> {
+    ///
+    /// Returns a typed error so callers can render distinct UX for
+    /// `LocallyOwned` (refused because the user demoted this session
+    /// — show "this session is local-only now" guidance) vs generic
+    /// failures (broker down, claude crash, etc.).
+    pub async fn send_input(
+        &self,
+        session: &str,
+        text: &str,
+    ) -> std::result::Result<(), SendInputError> {
         let url = format!("{}/sessions/{}/input", self.base_http, session);
         let body = json!({ "text": text });
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("/input → {status}: {text}");
+        let resp = match self.http.post(&url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(SendInputError::Other(
+                    anyhow::Error::new(e).context(format!("POST {url}")),
+                ));
+            }
+        };
+        if resp.status().is_success() {
+            return Ok(());
         }
-        Ok(())
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        // Broker emits a structured 409 body for LocallyOwned with a
+        // stable `error` discriminator — see locally_owned_409 in the
+        // broker. Generic 409s (e.g. duplicate session create) won't
+        // carry that key and fall through to Other.
+        if status.as_u16() == 409 {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&body_text) {
+                if parsed.get("error").and_then(|v| v.as_str()) == Some("locally_owned") {
+                    let message = parsed
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("session is locally-owned")
+                        .to_string();
+                    return Err(SendInputError::LocallyOwned {
+                        session: session.to_string(),
+                        message,
+                    });
+                }
+            }
+        }
+        Err(SendInputError::Other(anyhow::anyhow!(
+            "/input → {status}: {body_text}"
+        )))
     }
 
     /// Create a session. `auto_resume = None` lets the broker fall
