@@ -36,11 +36,20 @@ const INITIAL_SIZE: PtySize = PtySize {
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SessionState {
     Idle,
     Hibernated,
     Crashed,
+    /// User has explicitly handed control of this conversation back to a
+    /// local terminal (`agentmux demote`). claude is **not** running
+    /// under broker — the user's local `claude --resume <id>` owns the
+    /// transcript. broker keeps id/name/cwd/claude_session_id so the
+    /// user can later `agentmux adopt <name>` to re-spawn under broker.
+    /// While in this state, broker refuses /input /interrupt /restart
+    /// /hibernate /demote with 409, and Discord/tray surface the
+    /// state distinctly. The hibernate scanner skips it.
+    LocallyOwned,
 }
 
 /// Snapshot of a session as it appears on disk in `sessions.toml`.
@@ -59,10 +68,25 @@ pub struct PersistedSession {
     pub auto_resume: bool,
     #[serde(default)]
     pub created_at_ms: u64,
+    /// Was the session demoted at last save? Old sessions.toml files
+    /// without this key default to `false` — i.e. classic
+    /// "broker-owned, restore as Hibernated" behaviour.
+    #[serde(default)]
+    pub locally_owned: bool,
 }
 
 fn default_auto_resume() -> bool {
     true
+}
+
+/// Returned by `Session::demote`. Surfaced verbatim to the CLI so it
+/// can print the precise resume command to the user; `graceful` lets
+/// us warn when the `/exit` window timed out and we had to TerminateProcess.
+#[derive(Debug, Clone, Serialize)]
+pub struct DemoteOutcome {
+    pub claude_session_id: Option<String>,
+    pub cwd: String,
+    pub graceful: bool,
 }
 
 pub struct PtyOutput {
@@ -182,17 +206,23 @@ fn now_ms() -> u64 {
 }
 
 impl Session {
-    /// Build a Session and bring its claude up. New sessions start
-    /// with no `claude_session_id`; it'll be captured from the first
-    /// hook event.
+    /// Build a Session and bring its claude up. When
+    /// `resume_claude_session_id` is `Some`, claude is spawned with
+    /// `--resume <id>` so it picks up an existing transcript — that's
+    /// the path used by `agentmux adopt --resume <id>` to bring an
+    /// independently-running claude conversation under broker control.
+    /// `None` starts a brand-new conversation; the id is then captured
+    /// from the first hook event.
     pub fn create_and_start(
         name: String,
         cwd: PathBuf,
         argv: Vec<String>,
         config: Arc<Config>,
         auto_resume: bool,
+        resume_claude_session_id: Option<String>,
     ) -> Result<Arc<Self>> {
         let id = uuid::Uuid::new_v4().to_string();
+        let use_resume = resume_claude_session_id.is_some();
         let session = Self::build_hibernated(
             id,
             name,
@@ -200,24 +230,28 @@ impl Session {
             argv,
             config,
             auto_resume,
-            None,
+            resume_claude_session_id,
             now_ms(),
         );
-        session.start_pty(false)?;
+        session.start_pty(use_resume)?;
         *session.state.lock().unwrap() = SessionState::Idle;
         Ok(session)
     }
 
     /// Reconstruct a Session from `sessions.toml`. The session is
-    /// returned in `Hibernated` state — the next attach (or explicit
-    /// resume()) will spawn claude with `--resume`.
+    /// returned in `Hibernated` state by default — the next attach (or
+    /// explicit resume()) will spawn claude with `--resume`. If the
+    /// stored record was demoted at last save (`locally_owned: true`),
+    /// the state comes back as `LocallyOwned` instead, and broker will
+    /// refuse to spawn claude until the user explicitly re-adopts.
     pub fn from_persisted(persisted: PersistedSession, config: Arc<Config>) -> Arc<Self> {
         let argv = if persisted.argv.is_empty() {
             config.default_command.clone()
         } else {
             persisted.argv.clone()
         };
-        Self::build_hibernated(
+        let was_locally_owned = persisted.locally_owned;
+        let session = Self::build_hibernated(
             persisted.id,
             persisted.name,
             PathBuf::from(persisted.cwd),
@@ -226,7 +260,11 @@ impl Session {
             persisted.auto_resume,
             persisted.claude_session_id,
             persisted.created_at_ms,
-        )
+        );
+        if was_locally_owned {
+            *session.state.lock().unwrap() = SessionState::LocallyOwned;
+        }
+        session
     }
 
     fn build_hibernated(
@@ -446,6 +484,109 @@ impl Session {
         self.write_to_pty(&[0x03]);
     }
 
+    /// Outcome of a successful demote. Surfaced to the CLI so it can
+    /// print the exact `claude --resume <id>` command the user should
+    /// run in their terminal, and warn when the graceful `/exit`
+    /// timed out (transcript may be missing the last few lines).
+    pub fn demote(&self) -> Result<DemoteOutcome> {
+        info!("session {} ({}): demote starting", self.id, self.name);
+
+        // Step 1: graceful — type "/exit\r" into claude's TUI. claude
+        // treats Ctrl+C (0x03) as "interrupt the current turn", NOT
+        // exit, so we use the TUI's own /exit command which lets
+        // claude flush its transcript before quitting.
+        self.write_to_pty(b"/exit\r");
+
+        // Step 2: wait up to 2s for the child to actually exit.
+        let graceful = self.wait_for_child_exit(Duration::from_millis(2000));
+
+        // Step 3: if still alive, escalate to TerminateProcess.
+        if !graceful {
+            warn!(
+                "session {} ({}): /exit graceful window timed out, killing",
+                self.id, self.name
+            );
+            let mut g = self.inner.lock().unwrap();
+            if let Some(c) = g.child.as_mut() {
+                if let Err(e) = c.kill() {
+                    warn!("session {}: kill: {e}", self.id);
+                }
+            }
+        }
+
+        // Step 4: another wait window for the kill to take effect.
+        // If we *still* see a live child at the end of this, we
+        // refuse to transition state — handing back a "demoted"
+        // status while a broker-owned claude is still running would
+        // race the user's local `claude --resume <id>` and corrupt
+        // the transcript, which is the whole reason demote exists.
+        let killed = if graceful {
+            true
+        } else {
+            self.wait_for_child_exit(Duration::from_millis(1000))
+        };
+        if !killed {
+            anyhow::bail!(
+                "claude failed to exit within graceful + kill windows; \
+                 refusing to mark session locally-owned. \
+                 Investigate via Task Manager (PID lookup in broker.log). \
+                 Session left in current state."
+            );
+        }
+
+        // Now safe to drop resources and flip state. The crash watcher
+        // may have already taken the child slot and tried to mark
+        // state=Crashed; either way we overwrite to LocallyOwned next.
+        {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(mut c) = g.child.take() {
+                let _ = c.wait();
+            }
+            g.writer = None;
+        }
+        *self.size_table.master_handle.lock().unwrap() = None;
+        // Clear the ring so a future re-adopt + attach replays only
+        // the new claude's output, not stale pre-demote frames.
+        self.pty_out.ring.lock().unwrap().clear();
+        *self.state.lock().unwrap() = SessionState::LocallyOwned;
+
+        let claude_id = self.claude_session_id();
+        info!(
+            "session {} ({}) demoted (graceful={}, claude_session_id={:?})",
+            self.id, self.name, graceful, claude_id
+        );
+        Ok(DemoteOutcome {
+            claude_session_id: claude_id,
+            cwd: self.cwd.to_string_lossy().to_string(),
+            graceful,
+        })
+    }
+
+    /// Polls `try_wait()` on the child every 100ms until it exits or
+    /// the deadline passes. Returns true on observed exit (including
+    /// "child slot already None" — crash watcher beat us). Releases
+    /// the inner mutex between polls so other threads (the crash
+    /// watcher, hooks) can make progress.
+    fn wait_for_child_exit(&self, max_wait: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            let exited = {
+                let mut g = self.inner.lock().unwrap();
+                match g.child.as_mut() {
+                    Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
+                    None => true,
+                }
+            };
+            if exited {
+                return true;
+            }
+            if start.elapsed() >= max_wait {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Kill claude, drop the PTY, and mark Hibernated. The ring is
     /// cleared so the next attach doesn't replay stale frames before
     /// the resumed claude paints. Metadata (id/name/cwd/claude id)
@@ -569,6 +710,7 @@ impl Session {
             claude_session_id: self.claude_session_id(),
             auto_resume: self.auto_resume(),
             created_at_ms: self.created_at_ms,
+            locally_owned: self.state() == SessionState::LocallyOwned,
         }
     }
 

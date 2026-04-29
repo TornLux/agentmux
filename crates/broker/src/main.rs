@@ -24,7 +24,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use shared::config::Config;
+use shared::config::{Config, DefaultCwdSource};
 use shared::frame::{
     decode_control, decode_frame, decode_hello, decode_resize, encode_frame, read_frame,
     write_frame, HelloPayload, CTRL_INTERRUPT, CTRL_RESTART, CTRL_SHUTDOWN, TAG_CONTROL,
@@ -379,10 +379,36 @@ async fn main() -> Result<()> {
     } else {
         raw
     };
-    let cwd = match cwd_override {
+    // Three-layer cwd resolution:
+    //   1. CLI `--cwd <path>` (highest — explicit per-launch override)
+    //   2. config.toml `default_cwd` (per-machine pin — what most users want)
+    //   3. broker's own startup directory (legacy fallback)
+    // The chosen cwd becomes the `default_cwd` of the AppState, which
+    // is the seed for the initial `default` session AND the fallback
+    // for any POST /sessions that doesn't pass `cwd`.
+    let runtime_cwd = match cwd_override {
         Some(c) => c,
-        None => std::env::current_dir().context("get cwd")?,
+        None => {
+            let startup = std::env::current_dir().context("get cwd")?;
+            let (resolved, src) = config.resolve_default_cwd(startup);
+            match src {
+                DefaultCwdSource::Configured => {
+                    info!("using configured default_cwd: {}", resolved.display());
+                }
+                DefaultCwdSource::ConfiguredButMissing => {
+                    warn!(
+                        "config.toml default_cwd = {:?} does not exist; \
+                         falling back to broker's startup cwd: {}",
+                        config.default_cwd,
+                        resolved.display()
+                    );
+                }
+                DefaultCwdSource::Fallback => {} // boring; no log
+            }
+            resolved
+        }
     };
+    let cwd = runtime_cwd;
     if !cwd.is_dir() {
         anyhow::bail!("cwd does not exist or is not a directory: {:?}", cwd);
     }
@@ -410,7 +436,7 @@ async fn main() -> Result<()> {
     // fresh one so existing UX still works on a clean install.
     if manager.get_by_id_or_name(DEFAULT_SESSION_NAME).is_none() {
         let default_session = manager
-            .create(DEFAULT_SESSION_NAME.to_string(), cwd.clone(), true)
+            .create(DEFAULT_SESSION_NAME.to_string(), cwd.clone(), true, None)
             .context("create default session")?;
         info!(
             "default session id={} (name={}, fresh)",
@@ -497,6 +523,8 @@ async fn run_http_server(app_state: AppState) {
         .route("/sessions/:key/interrupt", post(http_interrupt))
         .route("/sessions/:key/restart", post(http_restart))
         .route("/sessions/:key/hibernate", post(http_hibernate))
+        .route("/sessions/:key/demote", post(http_demote))
+        .route("/sessions/:key/adopt", post(http_adopt))
         .route("/sessions/:key/input", post(http_input))
         .route("/sessions/:key/persist", post(http_set_persist))
         .route("/sessions/:key/ring", get(http_ring_snapshot))
@@ -777,6 +805,12 @@ async fn wait_for_hello(
                     // resumed — viewer sees a brief blank screen until
                     // claude paints, but pty_out broadcast/ring are
                     // already wired so no extra glue is needed here.
+                    // LocallyOwned is deliberately *not* auto-resumed:
+                    // the user's local `claude --resume` owns the
+                    // transcript and starting a second under broker
+                    // would corrupt it. Viewer connects, sees an
+                    // empty screen until the user runs `agentmux
+                    // adopt <name>` to bring it back.
                     if matches!(s.state(), SessionState::Hibernated | SessionState::Crashed) {
                         info!(
                             "viewer #{viewer_id} attaching {:?} session {} ({}) — auto-resuming",
@@ -790,6 +824,12 @@ async fn wait_for_hello(
                                 error!("auto-resume on attach: {e}");
                             }
                         });
+                    } else if s.state() == SessionState::LocallyOwned {
+                        info!(
+                            "viewer #{viewer_id} attaching LocallyOwned session {} ({}) — \
+                             not auto-resuming (user's local claude owns the transcript)",
+                            s.id, s.name
+                        );
                     }
                     Some((s, hello))
                 }
@@ -846,6 +886,13 @@ struct CreateBody {
     /// the system policy.
     #[serde(default)]
     auto_resume: Option<bool>,
+    /// Adopt path: spawn claude with `--resume <id>` so the new
+    /// process picks up an existing transcript. None = brand-new
+    /// conversation. Used by `agentmux adopt --resume <id>` after the
+    /// user exits a stand-alone `claude` and wants broker to take
+    /// over the same conversation.
+    #[serde(default)]
+    resume_session_id: Option<String>,
 }
 
 async fn http_create(
@@ -867,9 +914,116 @@ async fn http_create(
         .unwrap_or(s.config.auto_resume_default);
     let session = s
         .manager
-        .create(body.name, cwd, auto_resume)
+        .create(body.name, cwd, auto_resume, body.resume_session_id)
         .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
     Ok(Json(session.info()))
+}
+
+#[derive(Serialize)]
+struct DemoteResponse {
+    claude_session_id: Option<String>,
+    cwd: String,
+    /// True iff claude exited within the `/exit` graceful window.
+    /// False means broker had to TerminateProcess — transcript may
+    /// be missing the last few lines (very rare; documented).
+    graceful: bool,
+    /// Ready-to-paste shell command for the user.
+    suggested_command: String,
+}
+
+/// Demote a broker-owned session. Kills the claude child (graceful
+/// `/exit\r` → 2 s wait → TerminateProcess fallback → 1 s wait;
+/// returns 500 if claude survives all of that, leaving state intact),
+/// flips state to LocallyOwned, returns the recorded
+/// `claude_session_id` so the CLI can tell the user exactly which
+/// command to run locally.
+async fn http_demote(
+    Path(key): Path<String>,
+    State(s): State<AppState>,
+) -> Result<Json<DemoteResponse>, (StatusCode, String)> {
+    let session = s
+        .manager
+        .get_by_id_or_name(&key)
+        .ok_or((StatusCode::NOT_FOUND, format!("session not found: {key}")))?;
+    let cur = session.state();
+    if cur == SessionState::LocallyOwned {
+        return Err((
+            StatusCode::CONFLICT,
+            "session is already locally-owned".to_string(),
+        ));
+    }
+    if cur == SessionState::Hibernated {
+        // Nothing to kill — but the state is still "broker owns this
+        // record". Treat demote as "transition to LocallyOwned without
+        // killing", since the previous claude already exited.
+        // We deliberately use a separate code path rather than calling
+        // demote() because /exit on an already-dead PTY is a no-op
+        // and the wait loops would burn 3 seconds for no benefit.
+        // Doing this inline keeps the logic local.
+    }
+
+    // Safe to demote. spawn_blocking because demote() does sync sleeps.
+    let manager = s.manager.clone();
+    let key2 = key.clone();
+    let outcome = tokio::task::spawn_blocking(move || manager.demote(&key2))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let suggested = match (&outcome.claude_session_id, &outcome.cwd) {
+        (Some(id), cwd) => format!(
+            "cd \"{}\" ; claude --resume {}",
+            cwd.replace('\\', "\\\\"),
+            id
+        ),
+        (None, cwd) => format!(
+            "cd \"{}\" ; claude   # no claude_session_id recorded — start fresh",
+            cwd.replace('\\', "\\\\")
+        ),
+    };
+
+    Ok(Json(DemoteResponse {
+        claude_session_id: outcome.claude_session_id,
+        cwd: outcome.cwd,
+        graceful: outcome.graceful,
+        suggested_command: suggested,
+    }))
+}
+
+/// Re-adopt a LocallyOwned session: spawn claude under broker with
+/// `--resume <stored-id>`. The user is responsible for having exited
+/// their local `claude --resume` first; the broker can't detect a
+/// third-party process holding the same conversation.
+async fn http_adopt(
+    Path(key): Path<String>,
+    State(s): State<AppState>,
+) -> Result<Json<SessionInfo>, (StatusCode, String)> {
+    let manager = s.manager.clone();
+    let key2 = key.clone();
+    let session = tokio::task::spawn_blocking(move || manager.re_adopt(&key2))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?
+        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    Ok(Json(session.info()))
+}
+
+/// Returns 409 + a stable error code in the body when a write
+/// operation can't proceed because the session is locally-owned.
+/// Discord/CLI parse the JSON to decide UX. Bare strings would force
+/// substring matching on the next round of changes.
+fn locally_owned_409(name: &str) -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        serde_json::json!({
+            "error": "locally_owned",
+            "session": name,
+            "message": format!(
+                "session '{name}' is locally-owned; broker has no claude to act on. \
+                 Run `agentmux adopt {name}` to bring it back."
+            ),
+        })
+        .to_string(),
+    )
 }
 
 async fn http_get(
@@ -928,15 +1082,18 @@ async fn http_state(
 async fn http_hibernate(
     Path(key): Path<String>,
     State(s): State<AppState>,
-) -> Result<&'static str, StatusCode> {
+) -> Result<&'static str, (StatusCode, String)> {
     let session = s
         .manager
         .get_by_id_or_name(&key)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or((StatusCode::NOT_FOUND, "session not found".to_string()))?;
+    if session.state() == SessionState::LocallyOwned {
+        return Err(locally_owned_409(&session.name));
+    }
     let to_hibernate = session.clone();
     tokio::task::spawn_blocking(move || to_hibernate.hibernate())
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?;
     Ok("ok")
 }
 
@@ -953,11 +1110,14 @@ async fn http_delete(
 async fn http_interrupt(
     Path(key): Path<String>,
     State(s): State<AppState>,
-) -> Result<&'static str, StatusCode> {
+) -> Result<&'static str, (StatusCode, String)> {
     let session = s
         .manager
         .get_by_id_or_name(&key)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or((StatusCode::NOT_FOUND, "session not found".to_string()))?;
+    if session.state() == SessionState::LocallyOwned {
+        return Err(locally_owned_409(&session.name));
+    }
     session.interrupt();
     Ok("ok")
 }
@@ -970,6 +1130,9 @@ async fn http_restart(
         .manager
         .get_by_id_or_name(&key)
         .ok_or((StatusCode::NOT_FOUND, "session not found".to_string()))?;
+    if session.state() == SessionState::LocallyOwned {
+        return Err(locally_owned_409(&session.name));
+    }
     let res = tokio::task::spawn_blocking(move || session.restart())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1129,7 +1292,11 @@ async fn http_event(
         .to_string();
 
     // Capture claude's own session id from the transcript path the
-    // first time we see it so future restart/resume can pass --resume.
+    // first time we see it so future restart/resume/demote can pass
+    // --resume. Runs *before* the kind-specific filtering below so
+    // the dedicated "session_seen" pings hooks emit while a local
+    // viewer is attached still teach broker the id, even though the
+    // hooks bail out of fanning the user-visible event itself.
     if let Some(transcript_path) = event.get("transcript_path").and_then(|v| v.as_str()) {
         if let Some(broker_session_id) = event.get("session_id").and_then(|v| v.as_str()) {
             if let Some(session) = s.manager.get_by_id_or_name(broker_session_id) {
@@ -1146,6 +1313,15 @@ async fn http_event(
                 }
             }
         }
+    }
+
+    // session_seen is an internal capture-only nudge — hooks emit it
+    // unconditionally so broker learns claude_session_id even when
+    // the hook is about to bail-on-local-viewer for the user-facing
+    // event. Don't broadcast to WS subscribers (Discord/tray would
+    // see noisy duplicates) and don't persist to events.jsonl.
+    if kind == "session_seen" {
+        return "ok";
     }
 
     // Annotate session_name so WS subscribers don't need a second
@@ -1269,6 +1445,16 @@ async fn http_input(
         body.append_enter,
         session.state()
     );
+
+    // Locally-owned sessions have no broker-managed claude to write
+    // into. Auto-resuming would race the user's local
+    // `claude --resume <id>` and corrupt the transcript — exactly
+    // what demote exists to prevent. Refuse with 409 + a structured
+    // error code so Discord/CLI can render guidance instead of
+    // silently dropping the message.
+    if session.state() == SessionState::LocallyOwned {
+        return Err(locally_owned_409(&session.name));
+    }
 
     if matches!(
         session.state(),
@@ -1464,6 +1650,12 @@ async fn handle_ws_attach(
                 error!("auto-resume on ws-attach: {e}");
             }
         });
+    } else if session.state() == SessionState::LocallyOwned {
+        info!(
+            "ws-attach #{viewer_id} attaching LocallyOwned session {} ({}) — \
+             not auto-resuming (user's local claude owns the transcript)",
+            session.id, session.name
+        );
     }
 
     info!(

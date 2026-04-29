@@ -106,10 +106,6 @@ impl RingBuffer {
         self.buf.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
-    }
-
     pub fn clear(&mut self) {
         self.buf.clear();
     }

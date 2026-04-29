@@ -52,6 +52,13 @@ pub struct Config {
     /// LAN access disabled (non-loopback connections rejected with
     /// 401). Generate via `agentmux config token`.
     pub attach_token: String,
+    /// Default working directory for newly-created sessions when the
+    /// caller doesn't specify one (POST /sessions without `cwd`, the
+    /// initial `default` session at first boot, etc.). Empty = use
+    /// the broker process's startup cwd (legacy behaviour). Set this
+    /// to make new-session cwd insensitive to which directory you
+    /// happened to be in when you ran `.\agentmux start`.
+    pub default_cwd: String,
 }
 
 impl Default for Config {
@@ -70,6 +77,7 @@ impl Default for Config {
             log_dir: String::new(),
             auto_resume_default: false,
             attach_token: String::new(),
+            default_cwd: String::new(),
         }
     }
 }
@@ -160,6 +168,35 @@ impl Config {
         }
         local_appdata_dir().join("logs")
     }
+
+    /// Resolved default cwd for newly-created sessions:
+    ///   * config.default_cwd if non-empty AND points at an existing
+    ///     directory,
+    ///   * otherwise `fallback` (typically broker's startup cwd).
+    /// Returns the path that was chosen plus a `bool` flagging
+    /// whether the configured value was used (caller can log a
+    /// startup warning when it had to fall back).
+    pub fn resolve_default_cwd(&self, fallback: PathBuf) -> (PathBuf, DefaultCwdSource) {
+        if self.default_cwd.is_empty() {
+            return (fallback, DefaultCwdSource::Fallback);
+        }
+        let candidate = PathBuf::from(&self.default_cwd);
+        if !candidate.is_dir() {
+            return (fallback, DefaultCwdSource::ConfiguredButMissing);
+        }
+        (candidate, DefaultCwdSource::Configured)
+    }
+}
+
+/// Where the resolved default-cwd actually came from. Plumbed up so
+/// the caller (broker startup) can log a one-line notice — without
+/// this, a typo in `default_cwd` would silently degrade to "broker's
+/// startup cwd" and the user would chase a phantom bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultCwdSource {
+    Configured,
+    ConfiguredButMissing,
+    Fallback,
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -225,6 +262,7 @@ pid_file_path = "C:\\custom\\broker.pid"
 log_dir = "C:\\custom\\logs"
 auto_resume_default = true
 attach_token = "k7Rj9_secrettoken"
+default_cwd = "C:\\projects\\me"
 "#;
         let c: Config = toml::from_str(toml_src).unwrap();
         assert_eq!(c.http_addr, "0.0.0.0:1234");
@@ -237,6 +275,37 @@ attach_token = "k7Rj9_secrettoken"
         assert_eq!(c.log_dir, "C:\\custom\\logs");
         assert!(c.auto_resume_default);
         assert_eq!(c.attach_token, "k7Rj9_secrettoken");
+        assert_eq!(c.default_cwd, "C:\\projects\\me");
+    }
+
+    #[test]
+    fn resolve_default_cwd_falls_back_when_unset() {
+        let c = Config::default();
+        let fallback = std::env::temp_dir();
+        let (resolved, src) = c.resolve_default_cwd(fallback.clone());
+        assert_eq!(resolved, fallback);
+        assert_eq!(src, DefaultCwdSource::Fallback);
+    }
+
+    #[test]
+    fn resolve_default_cwd_uses_configured_when_present() {
+        let mut c = Config::default();
+        let real = std::env::temp_dir();
+        c.default_cwd = real.to_string_lossy().to_string();
+        let (resolved, src) = c.resolve_default_cwd(PathBuf::from(r"C:\never-used"));
+        assert_eq!(resolved, real);
+        assert_eq!(src, DefaultCwdSource::Configured);
+    }
+
+    #[test]
+    fn resolve_default_cwd_warns_when_configured_path_missing() {
+        let mut c = Config::default();
+        // Path that almost certainly does not exist.
+        c.default_cwd = r"C:\agentmux-missing-test-dir-9f4a".to_string();
+        let fallback = std::env::temp_dir();
+        let (resolved, src) = c.resolve_default_cwd(fallback.clone());
+        assert_eq!(resolved, fallback);
+        assert_eq!(src, DefaultCwdSource::ConfiguredButMissing);
     }
 
     #[test]

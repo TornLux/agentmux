@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use shared::config::Config;
 use tracing::{info, warn};
 
-use crate::session::{PersistedSession, Session, SessionInfo};
+use crate::session::{DemoteOutcome, PersistedSession, Session, SessionInfo};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PersistedRoot {
@@ -116,6 +116,7 @@ impl Manager {
         name: String,
         cwd: PathBuf,
         auto_resume: bool,
+        resume_claude_session_id: Option<String>,
     ) -> Result<Arc<Session>> {
         if name.is_empty() {
             anyhow::bail!("session name must not be empty");
@@ -129,6 +130,7 @@ impl Manager {
             self.argv_template.clone(),
             self.config.clone(),
             auto_resume,
+            resume_claude_session_id,
         )?;
         {
             let mut sessions = self.sessions.write().unwrap();
@@ -138,6 +140,54 @@ impl Manager {
         }
         if let Err(e) = self.save() {
             warn!("sessions.toml save after create: {e}");
+        }
+        Ok(session)
+    }
+
+    /// Demote a session: kill claude (graceful → TerminateProcess
+    /// fallback), keep the session record so the user can re-adopt
+    /// later. Auto-flips `auto_resume=true` so the demoted state
+    /// survives broker restart — losing the channel binding because
+    /// the user happened to demote an ephemeral session would be
+    /// surprising.
+    pub fn demote(&self, key: &str) -> Result<DemoteOutcome> {
+        let session = self
+            .get_by_id_or_name(key)
+            .ok_or_else(|| anyhow::anyhow!("session not found: {key}"))?;
+        let outcome = session.demote()?;
+        // Demoted sessions should always survive broker restart so
+        // re-adopt works after a reboot. Idempotent if already true.
+        session.set_auto_resume(true);
+        if let Err(e) = self.save() {
+            warn!("sessions.toml save after demote: {e}");
+        }
+        Ok(outcome)
+    }
+
+    /// Re-adopt a `LocallyOwned` session: spawn claude with
+    /// `--resume <stored-id>` under broker. Caller is responsible
+    /// for ensuring the user's local `claude --resume` was exited
+    /// first; the broker can't detect a third-party process holding
+    /// the same session id.
+    pub fn re_adopt(&self, key: &str) -> Result<Arc<Session>> {
+        let session = self
+            .get_by_id_or_name(key)
+            .ok_or_else(|| anyhow::anyhow!("session not found: {key}"))?;
+        if session.state() != crate::session::SessionState::LocallyOwned {
+            anyhow::bail!(
+                "session is not locally-owned (state={:?}); nothing to re-adopt",
+                session.state()
+            );
+        }
+        if session.claude_session_id().is_none() {
+            anyhow::bail!(
+                "session has no recorded claude_session_id; cannot --resume. \
+                 Delete this session and re-adopt with `agentmux adopt --resume <id>`."
+            );
+        }
+        session.resume()?;
+        if let Err(e) = self.save() {
+            warn!("sessions.toml save after re-adopt: {e}");
         }
         Ok(session)
     }
