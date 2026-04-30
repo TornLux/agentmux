@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# Build a Linux release tarball ready for end users to download + extract.
+# Build a Unix release tarball ready for end users to download + extract.
 #
-# Layout produced:
-#   agentmux-vX.Y.Z-linux-x86_64/
+# Detects the host OS + arch via uname and produces one of:
+#   agentmux-vX.Y.Z-linux-x86_64.tar.gz
+#   agentmux-vX.Y.Z-macos-aarch64.tar.gz   (Apple Silicon)
+#   agentmux-vX.Y.Z-macos-x86_64.tar.gz    (Intel Mac)
+#
+# Inner layout:
+#   agentmux-vX.Y.Z-<platform>/
 #     bin/{broker,claude-attach,hook-stop,hook-notification,hook-pretool,
 #          hook-posttool,platform-discord,agentmux-cli}
 #     README.md
@@ -10,12 +15,10 @@
 #     PLAN.md
 #     LICENSE  (if present)
 #
-# Then tars + gzips it to ./dist/agentmux-vX.Y.Z-linux-x86_64.tar.gz.
-#
-# Note: agentmux-tray is omitted (Windows-only at the moment), and the
-# .ps1 scripts under scripts/ are skipped because they're PowerShell.
-# Linux users invoke binaries directly from bin/ for now; a shell-based
-# entry point script can be added later.
+# Notes:
+#   - agentmux-tray is omitted on every Unix variant (Win32-only crate).
+#   - The .ps1 files under scripts/ are skipped because they're PowerShell;
+#     Unix users invoke binaries directly from bin/ for now.
 #
 # Usage:
 #   ./scripts/build-release.sh                  # build + tar
@@ -26,6 +29,19 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+# --- detect platform --------------------------------------------------------
+case "$(uname -s)" in
+    Linux)   OS=linux ;;
+    Darwin)  OS=macos ;;
+    *)       echo "build-release.sh: unsupported OS $(uname -s) — Linux and macOS only" >&2; exit 1 ;;
+esac
+case "$(uname -m)" in
+    x86_64|amd64)   ARCH=x86_64 ;;
+    arm64|aarch64)  ARCH=aarch64 ;;
+    *)              echo "build-release.sh: unsupported arch $(uname -m)" >&2; exit 1 ;;
+esac
+PLATFORM="${OS}-${ARCH}"
 
 # --- read workspace version from root Cargo.toml ----------------------------
 VERSION="$(awk '
@@ -44,7 +60,6 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 TAG="v$VERSION"
-PLATFORM="linux-x86_64"
 STEM="agentmux-${TAG}-${PLATFORM}"
 
 echo "agentmux release builder"

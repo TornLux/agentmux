@@ -5,7 +5,7 @@
   </p>
   <p align="center">
     <img src="https://img.shields.io/badge/-Rust-000000?logo=rust" alt="Rust">
-    <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D6?logo=windows" alt="Windows | Linux">
+    <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-0078D6?logo=windows" alt="Windows | Linux | macOS">
     <a href="https://claude.ai/code"><img src="https://img.shields.io/badge/Claude%20Code-companion-D97757" alt="Claude Code"></a>
     <a href="README.zh-CN.md"><img src="https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-red" alt="中文"></a>
   </p>
@@ -93,7 +93,7 @@ Produces nine binaries in `target\release\`:
 `hook-pretool`, `hook-posttool`, `platform-discord`,
 `agentmux-tray`, `agentmux-cli`.
 
-**Linux (broker / viewer / Discord / hooks; no tray):**
+**Linux / macOS (broker / viewer / Discord / hooks; no tray):**
 
 ```bash
 git clone https://github.com/<your-fork>/agentmux.git
@@ -103,10 +103,11 @@ cargo build --release --workspace --exclude agentmux-tray
 
 Produces eight binaries in `target/release/` (no `.exe` suffix). The
 `agentmux-tray` crate uses Windows-only WinRT toast + tray APIs and
-is excluded; everything else compiles cleanly on Linux x86_64. Most
-users on Linux will rely on the Discord bot, the browser-based web
-viewer, or `claude-attach` over SSH/LAN for at-a-distance access —
-you don't actually need the tray to use the daemon.
+is excluded; everything else compiles on Linux x86_64 and macOS
+(Apple Silicon or Intel). Most users on these platforms will rely on
+the Discord bot, the browser-based web viewer, or `claude-attach`
+over SSH/LAN for at-a-distance access — you don't actually need the
+tray to use the daemon.
 
 ### 2. First-time setup
 
@@ -120,10 +121,11 @@ Walks an interactive wizard: prerequisite check → install hooks → write
 broker config template → optional Discord setup → start broker. Idempotent;
 re-run any time without harm.
 
-**Linux (manual for now — no `init` wrapper yet):**
+**Linux / macOS (manual for now — no `init` wrapper yet):**
 
 ```bash
-mkdir -p ~/.local/share/agentmux                                  # data dir
+# data dir — Linux: ~/.local/share/agentmux/; macOS: ~/Library/Application Support/agentmux/
+mkdir -p "$(case "$(uname -s)" in Darwin) echo "$HOME/Library/Application Support";; *) echo "${XDG_DATA_HOME:-$HOME/.local/share}";; esac)/agentmux"
 ROOT="$(pwd)/target/release"                                      # absolute path to your binaries
 # Wire the four hooks into ~/.claude/settings.json under "hooks".
 # Each hook entry runs the matching binary; the binary itself reads
@@ -140,18 +142,20 @@ ROOT="$(pwd)/target/release"                                      # absolute pat
 "$ROOT/claude-attach"                                             # menu picker
 ```
 
-Linux config files live under `~/.local/share/agentmux/`
-(`config.toml`, `sessions.toml`, `discord.toml`, `logs/`, …) — the
-same data as `%LOCALAPPDATA%\agentmux\` on Windows, just at the XDG
-standard location.
+Linux config files live under `~/.local/share/agentmux/`; macOS at
+`~/Library/Application Support/agentmux/` (`config.toml`,
+`sessions.toml`, `discord.toml`, `logs/`, …) — the same data as
+`%LOCALAPPDATA%\agentmux\` on Windows, just at the platform-native
+location.
 
 ### 3. Day-to-day
 
 The PowerShell wrapper (`.\agentmux <verb>`) only ships on Windows.
-On Linux the verbs below map directly to invoking the matching
-binary; e.g. `agentmux attach default` ≡ `./claude-attach --session default`,
-`agentmux start` ≡ launching `./broker` and (optionally) `./platform-discord`
-as background processes (`nohup ./broker >/dev/null 2>&1 &` works).
+On Linux / macOS the verbs below map directly to invoking the
+matching binary; e.g. `agentmux attach default` ≡
+`./claude-attach --session default`, `agentmux start` ≡ launching
+`./broker` and (optionally) `./platform-discord` as background
+processes (`nohup ./broker >/dev/null 2>&1 &` works).
 
 ```powershell
 .\agentmux start             # broker + tray + Discord bot (if configured)
@@ -246,14 +250,20 @@ Loopback callers (your Discord bot on the broker host, hooks, local `claude-atta
 
 ```bash
 bash scripts/build-release.sh
-# → dist/agentmux-vX.Y.Z-linux-x86_64.tar.gz
+# → dist/agentmux-vX.Y.Z-linux-x86_64.tar.gz   (on Linux x86_64)
+# → dist/agentmux-vX.Y.Z-macos-aarch64.tar.gz  (on Apple Silicon)
+# → dist/agentmux-vX.Y.Z-macos-x86_64.tar.gz   (on Intel Mac)
 ```
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`, which runs
-both packaging scripts in parallel — Windows zip on a `windows-latest`
-runner, Linux tarball on `ubuntu-latest` — and attaches both archives
-plus their `.sha256` checksums to a single GitHub Release.
-(`workflow_dispatch` is also wired so you can fire it manually.)
+`build-release.sh` detects the host OS + architecture via `uname` and
+names the tarball accordingly; one script handles all three Unix
+targets. Pushing a `v*` tag triggers `.github/workflows/release.yml`,
+which runs the three packaging scripts in parallel — Windows zip on a
+`windows-latest` runner, Linux tarball on `ubuntu-latest`, macOS
+tarball on `macos-latest` (Apple Silicon by default) — and attaches
+all archives plus their `.sha256` checksums to a single GitHub
+Release. (`workflow_dispatch` is also wired so you can fire it
+manually.)
 
 ### 8. Add the Windows Terminal profile (optional)
 
@@ -275,8 +285,9 @@ menu.
 3. baked-in defaults
 
 `.\scripts\init-config.ps1` writes a fully-commented template at the
-default path on Windows. On Linux, write your own `config.toml` under
-`~/.local/share/agentmux/` (every field is optional — unset means default).
+default path on Windows. On Linux / macOS, write your own
+`config.toml` at the platform-native location above (every field is
+optional — unset means default).
 
 ### `broker` config (`config.toml`)
 
@@ -352,7 +363,7 @@ All endpoints are loopback-only by default. When `attach_token` is set and `http
 | `hook-notification` | Claude Code `Notification` hook. Same `session_seen` capture, posts `notification` events for permission prompts / idle pings |
 | `hook-pretool` | Claude Code `PreToolUse` hook. Smart classifier auto-allows safe tools and dev-flow `Bash` patterns; long-polls `/tool-request` for the rest. Fails open on broker outage so claude isn't blocked by infrastructure failure |
 | `hook-posttool` | Claude Code `PostToolUse` hook. Posts `tool_progress` events that drive Discord's edit-in-place narration (`✏️ edit src/x.rs`, `🖥 $ cargo test`, …). Fail-open + local-viewer-bail like the others |
-| `agentmux-cli` | Helper for format-preserving TOML edits and per-kind config validation. Invoked by `agentmux.ps1` on Windows; usable directly as `./agentmux-cli ...` on Linux |
+| `agentmux-cli` | Helper for format-preserving TOML edits and per-kind config validation. Invoked by `agentmux.ps1` on Windows; usable directly as `./agentmux-cli ...` on Linux / macOS |
 | `shared` | Wire protocol (frame tags, HELLO / RESIZE / CONTROL / PTY_DATA, encode/decode-frame for WS), config loader, minimal blocking HTTP client (with optional Bearer auth + long-poll variant) |
 
 ## Repository layout
@@ -393,15 +404,18 @@ agentmux/
 ## Requirements
 
 - **Windows 10/11** for the full feature set (broker + viewer + Discord +
-  hooks + tray + Windows toast), or **Linux x86_64** for everything except
-  the tray (Linux build excludes `agentmux-tray`; broker, viewer, hooks,
-  Discord, and the web viewer all run headless on a server). macOS is not
-  routinely tested but the codebase no longer assumes Win32 — patches
-  welcome.
+  hooks + tray + Windows toast), or **Linux x86_64** / **macOS** (Apple
+  Silicon or Intel) for everything except the tray (the Unix builds
+  exclude `agentmux-tray`; broker, viewer, hooks, Discord, and the web
+  viewer all run headless on a server). The macOS path is exercised in
+  CI on every release tag but the maintainer doesn't run macOS daily, so
+  user reports / PRs are how regressions get caught.
 - **Rust 1.75+**. On Windows, MSVC toolchain (Visual Studio 2022 Build
-  Tools, "Desktop development with C++"). On Linux, the standard
-  `rustup default stable` is enough (no extra system libs). Only needed
-  for *building*; the release archives are self-contained.
+  Tools, "Desktop development with C++"). On Linux / macOS, the
+  standard `rustup default stable` is enough (Linux needs no extra
+  system libs; macOS needs Xcode Command Line Tools, install via
+  `xcode-select --install`). Only needed for *building*; the release
+  archives are self-contained.
 - **Claude Code CLI** on `PATH` — broker spawns `claude` as the default command
 
 ## Safety

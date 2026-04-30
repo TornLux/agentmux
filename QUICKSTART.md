@@ -2,9 +2,10 @@
 
 ## What you need
 
-- **Windows 10/11** for the full feature set, **or Linux x86_64** for everything
-  except the system-tray + Windows toast (which is Windows-only). The Linux
-  build is intended for headless servers — broker + Discord bot + browser
+- **Windows 10/11** for the full feature set, **or Linux x86_64 / macOS**
+  (Apple Silicon or Intel) for everything except the system-tray +
+  Windows toast (which is Windows-only). The Unix builds are intended
+  for headless servers and dev laptops — broker + Discord bot + browser
   web viewer + remote `claude-attach` over SSH/LAN.
 - **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** on `PATH` — install with `npm install -g @anthropic-ai/claude-code`
 
@@ -16,18 +17,29 @@ Download `agentmux-vX.Y.Z-windows-x86_64.zip` from the [releases page](https://g
 
 That folder is self-contained; no installer, no PATH changes, no admin rights needed.
 
-### Linux
+### Linux / macOS
 
-Download `agentmux-vX.Y.Z-linux-x86_64.tar.gz` from the [releases page](https://github.com/anthropics/agentmux/releases) and extract:
+Download the matching tarball from the [releases page](https://github.com/anthropics/agentmux/releases):
+
+- Linux x86_64 → `agentmux-vX.Y.Z-linux-x86_64.tar.gz`
+- Apple Silicon Mac → `agentmux-vX.Y.Z-macos-aarch64.tar.gz`
+- Intel Mac → `agentmux-vX.Y.Z-macos-x86_64.tar.gz`
+
+Extract:
 
 ```bash
-tar -xzf agentmux-v*-linux-x86_64.tar.gz
-cd agentmux-v*-linux-x86_64
+tar -xzf agentmux-v*-*.tar.gz
+cd agentmux-v*-*
 ls bin/   # broker, claude-attach, hook-stop, hook-notification, hook-pretool,
           # hook-posttool, platform-discord, agentmux-cli
 ```
 
-The folder is self-contained; the binaries link only against glibc.
+The folder is self-contained; the Linux binaries link only against
+glibc, the macOS binaries only against system libraries shipped with
+the OS. **macOS users:** the first launch may be blocked by Gatekeeper
+because the binaries aren't notarised — clear the quarantine attribute
+with `xattr -dr com.apple.quarantine bin/` or right-click → Open in
+Finder once.
 
 ## Set up
 
@@ -47,10 +59,15 @@ The wizard walks you through:
 4. **Discord IM** *(optional)* — prompts for bot token, channel ID, and your user ID. The token is verified against Discord before being saved to a User-scope environment variable. Wizard re-detects an already-configured Discord and skips
 5. **Start broker** — launches the daemon, the system-tray icon, and (if configured) the Discord bot, all as detached background processes
 
-### Linux (manual setup — `init` wrapper not yet ported)
+### Linux / macOS (manual setup — `init` wrapper not yet ported)
 
 ```bash
-mkdir -p ~/.local/share/agentmux                # data dir
+# data dir — Linux: ~/.local/share/agentmux/; macOS: ~/Library/Application Support/agentmux/
+case "$(uname -s)" in
+  Darwin) DATA_DIR="$HOME/Library/Application Support/agentmux" ;;
+  *)      DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/agentmux" ;;
+esac
+mkdir -p "$DATA_DIR"
 ROOT="$(pwd)/bin"                               # absolute path to bin/
 
 # 1. Wire the hooks. Edit ~/.claude/settings.json and add (merge with
@@ -86,13 +103,14 @@ $ROOT/broker
 # Then: systemctl --user daemon-reload && systemctl --user enable --now agentmux-broker
 ```
 
-Linux config / state lives under `~/.local/share/agentmux/`
-(`config.toml`, `sessions.toml`, `discord.toml`, `logs/`, …) — the
-same data as `%LOCALAPPDATA%\agentmux\` on Windows, just at the XDG
-standard location.
+Linux config / state lives under `~/.local/share/agentmux/`; macOS
+under `~/Library/Application Support/agentmux/` (`config.toml`,
+`sessions.toml`, `discord.toml`, `logs/`, …) — the same data as
+`%LOCALAPPDATA%\agentmux\` on Windows, just at the platform-native
+location.
 
-The system-tray + toast surfaces are Windows-only. On Linux, use
-the **browser web viewer** at `http://<broker>:8765/` (works from
+The system-tray + toast surfaces are Windows-only. On Linux / macOS,
+use the **browser web viewer** at `http://<broker>:8765/` (works from
 any device, including phones) for at-a-glance access, and rely on
 **Discord** for tool-approval prompts when you're away from the
 machine.
@@ -111,15 +129,15 @@ platform:
 ```
 
 ```bash
-./bin/claude-attach          # Linux: enter claude's TUI
-ps aux | grep agentmux       # Linux: see what's running (no wrapper yet)
-./bin/claude-attach --help   # Linux: viewer flags
+./bin/claude-attach          # Linux / macOS: enter claude's TUI
+ps aux | grep agentmux       # Linux / macOS: see what's running (no wrapper yet)
+./bin/claude-attach --help   # Linux / macOS: viewer flags
 ```
 
 ## Daily ops cheat sheet
 
-The PowerShell `.\agentmux <verb>` wrapper is Windows-only. Linux verbs
-below are the direct binary invocations.
+The PowerShell `.\agentmux <verb>` wrapper is Windows-only. The
+Linux / macOS column below shows the direct binary invocations.
 
 ```powershell
 .\agentmux start             # broker + tray + Discord bot (if configured)
@@ -142,9 +160,10 @@ below are the direct binary invocations.
 ```
 
 ```bash
-# Linux equivalents — invoke binaries directly. Most session-lifecycle
-# verbs (new / kill / demote / adopt / persist / interrupt / restart /
-# hibernate) are exposed over the broker's HTTP control plane:
+# Linux / macOS equivalents — invoke binaries directly. Most
+# session-lifecycle verbs (new / kill / demote / adopt / persist /
+# interrupt / restart / hibernate) are exposed over the broker's
+# HTTP control plane:
 #
 curl -s http://127.0.0.1:8765/sessions | jq                    # list
 curl -s http://127.0.0.1:8765/sessions/default/state           # one session
@@ -162,9 +181,13 @@ curl -sX POST http://127.0.0.1:8765/shutdown                   # broker stop
 ./bin/claude-attach --broker http://host:8765 \
                     --token "$AGENT_ATTACH_TOKEN"  # remote (LAN)
 #
-# Logs (daily-rotated under ~/.local/share/agentmux/logs/):
-tail -f ~/.local/share/agentmux/logs/broker.$(date +%F).log
-tail -f ~/.local/share/agentmux/events.$(date +%F).jsonl       # audit trail
+# Logs (daily-rotated under <data-dir>/logs/):
+case "$(uname -s)" in
+  Darwin) LOGS="$HOME/Library/Application Support/agentmux" ;;
+  *)      LOGS="${XDG_DATA_HOME:-$HOME/.local/share}/agentmux" ;;
+esac
+tail -f "$LOGS/logs/broker.$(date +%F).log"
+tail -f "$LOGS/events.$(date +%F).jsonl"                       # audit trail
 ```
 
 For the **local→broker handover** scenario (started a session locally,

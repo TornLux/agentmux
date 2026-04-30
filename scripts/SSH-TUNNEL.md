@@ -30,8 +30,8 @@ A、B 都跑同一个脚本,用 `-Side broker` / `-Side viewer` 区分。
 
 | 主机 | 必需 |
 |---|---|
-| A | Windows 10/11 或 Linux,agentmux broker 在跑、能 SSH 到 C |
-| B | Windows 10/11 或 Linux,能 SSH 到 C |
+| A | Windows 10/11、Linux 或 macOS,agentmux broker 在跑、能 SSH 到 C |
+| B | Windows 10/11、Linux 或 macOS,能 SSH 到 C |
 | C | sshd 接受登录、`AllowTcpForwarding yes`(默认值);任意 Unix 都行 |
 
 C 上 **不需要**:管理员权限、改 `sshd_config`、开放额外端口、`GatewayPorts`。
@@ -390,10 +390,10 @@ Get-WmiObject Win32_Process -Filter "Name='plink.exe'" | Select-Object CommandLi
 
 但这些都改了拓扑;现有 SSH 中继 5 分钟能用上,先用着,不够稳再换。
 
-## 8. Linux 原生 ssh 用法
+## 8. Linux / macOS 原生 ssh 用法
 
-Linux 上不需要 PowerShell 脚本 —— OpenSSH 自带 `-R` / `-L` 转发 +
-`-fN` 后台化,跟脚本干的事一样:
+Linux / macOS 上不需要 PowerShell 脚本 —— OpenSSH 自带 `-R` / `-L` 转发 +
+`-fN` 后台化,跟脚本干的事一样(下面命令在两个 OS 上一字不差):
 
 **A 端(broker,把 8765 推到 C 的 loopback 18765):**
 

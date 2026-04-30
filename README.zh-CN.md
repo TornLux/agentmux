@@ -5,7 +5,7 @@
   </p>
   <p align="center">
     <img src="https://img.shields.io/badge/-Rust-000000?logo=rust" alt="Rust">
-    <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D6?logo=windows" alt="Windows | Linux">
+    <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-0078D6?logo=windows" alt="Windows | Linux | macOS">
     <a href="https://claude.ai/code"><img src="https://img.shields.io/badge/Claude%20Code-companion-D97757" alt="Claude Code"></a>
     <a href="README.md"><img src="https://img.shields.io/badge/lang-English-blue" alt="English"></a>
   </p>
@@ -88,7 +88,7 @@ cargo build --release
 
 产物:`target\release\` 下 9 个 binary —— `broker`、`claude-attach`、`hook-stop`、`hook-notification`、`hook-pretool`、`hook-posttool`、`platform-discord`、`agentmux-tray`、`agentmux-cli`。
 
-**Linux(broker / viewer / Discord / hooks;不含 tray):**
+**Linux / macOS(broker / viewer / Discord / hooks;不含 tray):**
 
 ```bash
 git clone https://github.com/<your-fork>/agentmux.git
@@ -96,7 +96,7 @@ cd agentmux
 cargo build --release --workspace --exclude agentmux-tray
 ```
 
-产物:`target/release/` 下 8 个 binary(无 `.exe` 后缀)。`agentmux-tray` 用了 Windows-only 的 WinRT toast + tray-icon API,所以排除掉;其它 crate 在 Linux x86_64 上都干净编过。Linux 上多数用户会用 Discord bot、浏览器 web viewer,或者通过 SSH/LAN 让 `claude-attach` 远程接入 —— tray 不是必需的。
+产物:`target/release/` 下 8 个 binary(无 `.exe` 后缀)。`agentmux-tray` 用了 Windows-only 的 WinRT toast + tray-icon API,所以排除掉;其它 crate 在 Linux x86_64 和 macOS(Apple Silicon 或 Intel)上都能干净编过。这两个平台上多数用户会用 Discord bot、浏览器 web viewer,或者通过 SSH/LAN 让 `claude-attach` 远程接入 —— tray 不是必需的。
 
 ### 2. 首次设置
 
@@ -108,10 +108,11 @@ cargo build --release --workspace --exclude agentmux-tray
 
 交互式向导:先决条件检查 → 装 hooks → 写 broker config 模板 → 可选 Discord 设置 → 启动 broker。幂等的,可随时重跑,已完成的步骤会跳过。
 
-**Linux(暂时手工配置 —— init 包装还没移植):**
+**Linux / macOS(暂时手工配置 —— init 包装还没移植):**
 
 ```bash
-mkdir -p ~/.local/share/agentmux                                  # 数据目录
+# 数据目录:Linux 是 ~/.local/share/agentmux/;macOS 是 ~/Library/Application Support/agentmux/
+mkdir -p "$(case "$(uname -s)" in Darwin) echo "$HOME/Library/Application Support";; *) echo "${XDG_DATA_HOME:-$HOME/.local/share}";; esac)/agentmux"
 ROOT="$(pwd)/target/release"                                      # binary 绝对路径
 # 把四个 hook 写到 ~/.claude/settings.json 的 "hooks" 字段下:
 #   "hooks": {
@@ -125,11 +126,11 @@ ROOT="$(pwd)/target/release"                                      # binary 绝�
 "$ROOT/claude-attach"                                             # 走会话菜单
 ```
 
-Linux 配置文件落在 `~/.local/share/agentmux/`(`config.toml`、`sessions.toml`、`discord.toml`、`logs/`,等等) —— 跟 Windows 上 `%LOCALAPPDATA%\agentmux\` 是同一份数据,只是放在 XDG 标准位置。
+Linux 配置文件落在 `~/.local/share/agentmux/`,macOS 在 `~/Library/Application Support/agentmux/`(`config.toml`、`sessions.toml`、`discord.toml`、`logs/`,等等) —— 跟 Windows 上 `%LOCALAPPDATA%\agentmux\` 是同一份数据,只是放在各平台原生位置。
 
 ### 3. 日常运维
 
-PowerShell 包装(`.\agentmux <verb>`)只在 Windows 上有。Linux 上把这些命令直接对应到二进制调用 —— `agentmux attach default` ≡ `./claude-attach --session default`,`agentmux start` ≡ 起 `./broker`,有需要再起 `./platform-discord`(`nohup ./broker >/dev/null 2>&1 &` 即可后台化)。
+PowerShell 包装(`.\agentmux <verb>`)只在 Windows 上有。Linux / macOS 上把这些命令直接对应到二进制调用 —— `agentmux attach default` ≡ `./claude-attach --session default`,`agentmux start` ≡ 起 `./broker`,有需要再起 `./platform-discord`(`nohup ./broker >/dev/null 2>&1 &` 即可后台化)。
 
 ```powershell
 .\agentmux start             # broker + tray + Discord bot(如已配置)
@@ -215,10 +216,12 @@ $env:AGENT_ATTACH_TOKEN = "rjVBS19l...43字符..."
 
 ```bash
 bash scripts/build-release.sh
-# → dist/agentmux-vX.Y.Z-linux-x86_64.tar.gz
+# → dist/agentmux-vX.Y.Z-linux-x86_64.tar.gz   (Linux x86_64)
+# → dist/agentmux-vX.Y.Z-macos-aarch64.tar.gz  (Apple Silicon)
+# → dist/agentmux-vX.Y.Z-macos-x86_64.tar.gz   (Intel Mac)
 ```
 
-推 `v*` tag 触发 `.github/workflows/release.yml`,Windows runner + Ubuntu runner 并行跑各自的 packaging 脚本,把 Windows zip、Linux tarball 以及它们的 `.sha256` 校验和一起 attach 到同一个 GitHub Release。(也支持 `workflow_dispatch` 手动触发。)
+`build-release.sh` 通过 `uname` 自动识别宿主 OS + 架构,一份脚本搞定三种 Unix 目标。推 `v*` tag 触发 `.github/workflows/release.yml`,Windows runner + Ubuntu runner + macOS runner 三路并行跑各自的 packaging 脚本(macOS 默认 Apple Silicon),把全部 archive 以及它们的 `.sha256` 校验和一起 attach 到同一个 GitHub Release。(也支持 `workflow_dispatch` 手动触发。)
 
 ### 8. Windows Terminal 配置（可选）
 
@@ -235,7 +238,7 @@ bash scripts/build-release.sh
     - **macOS:** `~/Library/Application Support/agentmux/`
 3. 内建默认值
 
-Windows 上 `.\scripts\init-config.ps1` 在默认路径写一份注释齐全的模板。Linux 上手工建一个 `~/.local/share/agentmux/config.toml`(所有字段都可选 —— 不写就用默认)。
+Windows 上 `.\scripts\init-config.ps1` 在默认路径写一份注释齐全的模板。Linux / macOS 上在上面对应平台的位置手工建一个 `config.toml`(所有字段都可选 —— 不写就用默认)。
 
 ### `broker` 配置（`config.toml`）
 
@@ -311,7 +314,7 @@ Windows 上 `.\scripts\init-config.ps1` 在默认路径写一份注释齐全的�
 | `hook-notification` | Claude Code `Notification` hook。POST `notification` 事件 |
 | `hook-pretool` | Claude Code `PreToolUse` hook。本地分类器自动放行安全工具 + 开发流的 `Bash` 模式；其余长轮询 `/tool-request` 走 Discord / toast 审批。broker 不可达时**失败放行**，避免基础设施故障让 claude 工作中断 |
 | `hook-posttool` | Claude Code `PostToolUse` hook。POST `tool_progress` 事件驱动 Discord 占位符的就地编辑(`✏️ edit src/x.rs` / `🖥 $ cargo test` / …)。同样 fail-open + 本地 viewer 在场静默 |
-| `agentmux-cli` | 保留格式的 TOML 编辑器 + 各类配置校验。Windows 上由 `agentmux.ps1` 调用;Linux 上直接 `./agentmux-cli ...` |
+| `agentmux-cli` | 保留格式的 TOML 编辑器 + 各类配置校验。Windows 上由 `agentmux.ps1` 调用;Linux / macOS 上直接 `./agentmux-cli ...` |
 | `shared` | 帧协议（HELLO / RESIZE / CONTROL / PTY_DATA 等 tag、用于 WS 的 encode/decode-frame）、配置加载器、最小阻塞式 HTTP 客户端（含可选 Bearer 鉴权 + 长轮询版） |
 
 ## 仓库结构
@@ -351,8 +354,8 @@ agentmux/
 
 ## 系统要求
 
-- **Windows 10/11**(完整功能,含 broker + viewer + Discord + hooks + tray + Windows toast),或 **Linux x86_64**(除 tray 外的全部能力 —— Linux 构建排除 `agentmux-tray`;broker、viewer、hooks、Discord、web viewer 都在服务器无头跑没问题)。macOS 没有日常测试,但代码不再依赖 Win32,欢迎 PR。
-- **Rust 1.75+**。Windows 上需要 MSVC 工具链(Visual Studio 2022 Build Tools,"Desktop development with C++");Linux 上 `rustup default stable` 就够(不需要额外系统库)。仅构建时需要;release archive 自包含。
+- **Windows 10/11**(完整功能,含 broker + viewer + Discord + hooks + tray + Windows toast),或 **Linux x86_64** / **macOS**(Apple Silicon 或 Intel,Unix 构建排除 `agentmux-tray`;broker、viewer、hooks、Discord、web viewer 都在服务器无头跑没问题)。macOS 路径每次发版都会跑 CI 构建,但维护者本人不日用 macOS,所以靠用户报告 / PR 抓回归。
+- **Rust 1.75+**。Windows 上需要 MSVC 工具链(Visual Studio 2022 Build Tools,"Desktop development with C++");Linux / macOS 上 `rustup default stable` 就够(Linux 不需要额外系统库;macOS 需要 Xcode Command Line Tools,`xcode-select --install` 装一下)。仅构建时需要;release archive 自包含。
 - **Claude Code CLI** 在 `PATH` 上 —— broker 默认拉起 `claude`
 
 ## 安全
