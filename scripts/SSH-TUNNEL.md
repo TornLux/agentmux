@@ -1,5 +1,9 @@
 # SSH 隧道使用指南
 
+> **平台说明:** 本文档描述的 `ssh-tunnel-start.ps1` / `ssh-tunnel-stop.ps1`
+> 是 PowerShell 脚本,Windows 上一键化用。Linux 用户用原生 `ssh -R` /
+> `ssh -L` 命令同样能达成效果 —— 见末尾 *Linux 原生 ssh 用法*。
+
 `ssh-tunnel-start.ps1` 和 `ssh-tunnel-stop.ps1` 用一台带公网 SSH 的中继机
 **C**,把没有公网的 broker 主机 **A** 上的 agentmux 暴露给同样没有公网的
 viewer 主机 **B**。agentmux 本身保持默认 `127.0.0.1:8765` 绑定不动,隧道
@@ -26,9 +30,9 @@ A、B 都跑同一个脚本,用 `-Side broker` / `-Side viewer` 区分。
 
 | 主机 | 必需 |
 |---|---|
-| A | Windows 10/11、agentmux broker 在跑、能 SSH 到 C |
-| B | Windows 10/11、能 SSH 到 C |
-| C | sshd 接受登录、`AllowTcpForwarding yes`(默认值) |
+| A | Windows 10/11 或 Linux,agentmux broker 在跑、能 SSH 到 C |
+| B | Windows 10/11 或 Linux,能 SSH 到 C |
+| C | sshd 接受登录、`AllowTcpForwarding yes`(默认值);任意 Unix 都行 |
 
 C 上 **不需要**:管理员权限、改 `sshd_config`、开放额外端口、`GatewayPorts`。
 默认 `GatewayPorts no` 让 18765 只在 C 的 loopback 可达,正是我们想要的最小
@@ -385,3 +389,52 @@ Get-WmiObject Win32_Process -Filter "Name='plink.exe'" | Select-Object CommandLi
 - **Cloudflare Tunnel**:A 跑 `cloudflared`,把 8765 暴露成 https 域名,B 用任何浏览器访问
 
 但这些都改了拓扑;现有 SSH 中继 5 分钟能用上,先用着,不够稳再换。
+
+## 8. Linux 原生 ssh 用法
+
+Linux 上不需要 PowerShell 脚本 —— OpenSSH 自带 `-R` / `-L` 转发 +
+`-fN` 后台化,跟脚本干的事一样:
+
+**A 端(broker,把 8765 推到 C 的 loopback 18765):**
+
+```bash
+ssh -fN -R 18765:127.0.0.1:8765 user@C
+# 看是否还活着
+pgrep -af "ssh.*-R 18765" || echo "tunnel down"
+# 停:
+pkill -f "ssh.*-R 18765:127.0.0.1:8765"
+```
+
+**B 端(viewer,把 C 的 loopback 18765 拉回本地 8765):**
+
+```bash
+ssh -fN -L 8765:127.0.0.1:18765 user@C
+# 测通:
+curl -fsS http://127.0.0.1:8765/sessions | head
+# 浏览器:打开 http://127.0.0.1:8765/
+# 或终端 attach(如果 LAN 模式开启):
+./bin/claude-attach --broker http://127.0.0.1:8765 --token "$AGENT_ATTACH_TOKEN"
+# 停:
+pkill -f "ssh.*-L 8765:127.0.0.1:18765"
+```
+
+可选用 `~/.ssh/config` 把这两条做成 ssh alias,例如:
+
+```
+Host agentmux-tunnel-broker
+    HostName C.example.com
+    User you
+    RemoteForward 18765 127.0.0.1:8765
+    ServerAliveInterval 30
+    ExitOnForwardFailure yes
+
+Host agentmux-tunnel-viewer
+    HostName C.example.com
+    User you
+    LocalForward 8765 127.0.0.1:18765
+    ServerAliveInterval 30
+    ExitOnForwardFailure yes
+```
+
+之后 `ssh -fN agentmux-tunnel-broker` / `ssh -fN agentmux-tunnel-viewer`
+即可。配 `autossh` 可以让隧道掉线自动重连(`autossh -M 0 -fN agentmux-tunnel-...`)。

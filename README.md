@@ -5,7 +5,7 @@
   </p>
   <p align="center">
     <img src="https://img.shields.io/badge/-Rust-000000?logo=rust" alt="Rust">
-    <img src="https://img.shields.io/badge/platform-Windows-0078D6?logo=windows" alt="Windows">
+    <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D6?logo=windows" alt="Windows | Linux">
     <a href="https://claude.ai/code"><img src="https://img.shields.io/badge/Claude%20Code-companion-D97757" alt="Claude Code"></a>
     <a href="README.zh-CN.md"><img src="https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-red" alt="中文"></a>
   </p>
@@ -17,7 +17,7 @@ agentmux turns Claude Code into an always-on, multi-session background service. 
 
 ## Highlights
 
-- **Sessions outlive their viewers.** Each session owns a ConPTY and a per-session ring buffer; closing the Windows Terminal window detaches the viewer but leaves the broker, the PTY, and the `claude` child untouched. Reattach later and the ring replays the last screen, so the TUI is already mid-conversation when you arrive — no `--resume`, no scrollback hunt.
+- **Sessions outlive their viewers.** Each session owns a PTY (ConPTY on Windows, openpty on Unix via `portable-pty`) and a per-session ring buffer; closing the terminal window detaches the viewer but leaves the broker, the PTY, and the `claude` child untouched. Reattach later and the ring replays the last screen, so the TUI is already mid-conversation when you arrive — no `--resume`, no scrollback hunt.
 - **Multi-session, switchable from a menu.** N concurrent `claude` instances, each with its own cwd, history, and Claude session id. `claude-attach.exe` shows a session picker on launch (`--new [NAME]` to create, `--session NAME` to skip the menu). Multiple viewers can attach to the same session — input is merged in arrival order, and resize is coordinated to the smallest pane so claude never overflows a tiny window.
 - **Ctrl+C escalation.** In raw terminal mode the viewer counts Ctrl+C presses within a 1.5 s window: **1** forwards `0x03` to claude (interrupt the turn), **2** restarts the underlying claude process, **3** shuts the broker down. **Ctrl+Q** / **Ctrl+]** detach the viewer only.
 - **HTTP control plane + WS event bus.** `127.0.0.1:8765` exposes full session lifecycle (`/sessions` CRUD, `/interrupt` `/restart` `/hibernate` `/input` `/persist`), the `/event` hook-ingest endpoint, the `/ws` event-stream subscriber, the `/tool-request` long-poll for synchronous PreToolUse approval, and `/attach` for remote viewers (see *Remote viewer over LAN* below).
@@ -44,25 +44,25 @@ agentmux turns Claude Code into an always-on, multi-session background service. 
 - **Remote viewer over LAN (opt-in).** Set `attach_token` and bind `http_addr = "0.0.0.0:8765"` and `claude-attach --broker http://host:8765` connects via WebSocket from another machine. Loopback callers (existing local tooling) bypass the auth check; non-loopback callers must present `Authorization: Bearer <token>`.
 - **Browser-based web viewer.** Navigate to `http://<broker>:8765/` from any device (laptop, phone, tablet) — the broker serves a single-file HTML page with xterm.js + the fit addon **embedded into broker.exe** (no CDN dependency, works on isolated networks). Token entry persists to localStorage; loopback browsers skip it entirely. WebSocket auto-reconnect with backoff handles broker restarts without losing scrollback. Touch devices get a soft-key bar with control keys (Esc / Tab / arrows / `^C` `^D` `^L` `^Z`), 28 ASCII punctuation buttons (`, . _ - / : ; ? ! ' " ( ) [ ] { } \ | = + * & < > # @ $` — iOS soft keyboards bury most of these, and several never make it through xterm's input pipeline), a **📋 paste modal** (a visible textarea you long-press-paste into then Send — works around iOS's refusal to long-press-paste into xterm's hidden helper textarea), and **⏫ ⇞ ⇟ ⏬ scroll controls** (xterm's touch-scroll on iOS is sluggish). Auth uses a `Sec-WebSocket-Protocol: bearer.<token>` subprotocol since browsers cannot set the Authorization header on WebSockets.
 - **One-command setup.** `.\agentmux init` walks an interactive wizard. Day-to-day is `.\agentmux start | stop | status | attach | logs | config | discord` — config edits are format-preserving via the bundled `agentmux-cli` helper. `.\agentmux config token --set` generates a 32-byte random LAN token and writes it to broker.toml.
-- **Singleton broker, daily-rotated logs and audit trail.** A PID file blocks a second broker on the same pipe; both `broker.YYYY-MM-DD.log` and `events.YYYY-MM-DD.jsonl` roll daily under `%LOCALAPPDATA%\agentmux\` with 7-day retention.
+- **Singleton broker, daily-rotated logs and audit trail.** A PID file blocks a second broker on the same socket; both `broker.YYYY-MM-DD.log` and `events.YYYY-MM-DD.jsonl` roll daily under the per-user app-data dir (`%LOCALAPPDATA%\agentmux\` on Windows, `~/.local/share/agentmux/` on Linux) with 7-day retention.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Term["Windows Terminal"]
+    Term["Terminal<br/>(Windows Terminal /<br/>any TTY on Linux)"]
     Browser["Browser<br/>(xterm.js, embedded)"]
     Hooks["Claude Code hooks<br/>(stop, notification,<br/>pretool, posttool)"]
-    Attach["claude-attach.exe<br/>(local: pipe / LAN: WS+token)"]
-    Discord["platform-discord.exe<br/>(IM adapter)"]
-    Tray["agentmux-tray.exe<br/>(tray icon + toast)"]
-    Broker["broker.exe<br/>(singleton daemon)"]
-    Sess["session × N<br/>ConPTY + ring buffer"]
+    Attach["claude-attach<br/>(local: socket / LAN: WS+token)"]
+    Discord["platform-discord<br/>(IM adapter)"]
+    Tray["agentmux-tray<br/>(tray icon + toast,<br/>Windows-only)"]
+    Broker["broker<br/>(singleton daemon)"]
+    Sess["session × N<br/>PTY + ring buffer"]
     Claude["claude<br/>(child per session)"]
     Events["events.YYYY-MM-DD.jsonl"]
 
     Term -- "spawn" --> Attach
-    Attach -- "named pipe<br/>or WS /attach" --> Broker
+    Attach -- "local socket<br/>or WS /attach" --> Broker
     Browser -- "GET /<br/>WS /attach (subprotocol)" --> Broker
     Hooks -- "POST /event<br/>POST /tool-request (long-poll)" --> Broker
     Discord -- "WS /ws<br/>POST /input + /tool-decision/:id" --> Broker
@@ -80,6 +80,8 @@ the developer / from-source flow.
 
 ### 1. Build
 
+**Windows (full feature set, including tray + toast):**
+
 ```powershell
 git clone https://github.com/<your-fork>/agentmux.git
 cd agentmux
@@ -91,7 +93,24 @@ Produces nine binaries in `target\release\`:
 `hook-pretool`, `hook-posttool`, `platform-discord`,
 `agentmux-tray`, `agentmux-cli`.
 
+**Linux (broker / viewer / Discord / hooks; no tray):**
+
+```bash
+git clone https://github.com/<your-fork>/agentmux.git
+cd agentmux
+cargo build --release --workspace --exclude agentmux-tray
+```
+
+Produces eight binaries in `target/release/` (no `.exe` suffix). The
+`agentmux-tray` crate uses Windows-only WinRT toast + tray APIs and
+is excluded; everything else compiles cleanly on Linux x86_64. Most
+users on Linux will rely on the Discord bot, the browser-based web
+viewer, or `claude-attach` over SSH/LAN for at-a-distance access —
+you don't actually need the tray to use the daemon.
+
 ### 2. First-time setup
+
+**Windows:**
 
 ```powershell
 .\agentmux init
@@ -101,7 +120,38 @@ Walks an interactive wizard: prerequisite check → install hooks → write
 broker config template → optional Discord setup → start broker. Idempotent;
 re-run any time without harm.
 
+**Linux (manual for now — no `init` wrapper yet):**
+
+```bash
+mkdir -p ~/.local/share/agentmux                                  # data dir
+ROOT="$(pwd)/target/release"                                      # absolute path to your binaries
+# Wire the four hooks into ~/.claude/settings.json under "hooks".
+# Each hook entry runs the matching binary; the binary itself reads
+# AGENT_BROKER_URL (default http://127.0.0.1:8765) to find broker.
+# Example settings.json fragment:
+#   "hooks": {
+#     "Stop":          [{"hooks": [{"type":"command","command":"'$ROOT'/hook-stop"}]}],
+#     "Notification":  [{"hooks": [{"type":"command","command":"'$ROOT'/hook-notification"}]}],
+#     "PreToolUse":    [{"matcher":"*","hooks":[{"type":"command","command":"'$ROOT'/hook-pretool"}]}],
+#     "PostToolUse":   [{"matcher":"*","hooks":[{"type":"command","command":"'$ROOT'/hook-posttool"}]}]
+#   }
+"$ROOT/broker"                                                    # foreground
+# or in another shell, after broker is up:
+"$ROOT/claude-attach"                                             # menu picker
+```
+
+Linux config files live under `~/.local/share/agentmux/`
+(`config.toml`, `sessions.toml`, `discord.toml`, `logs/`, …) — the
+same data as `%LOCALAPPDATA%\agentmux\` on Windows, just at the XDG
+standard location.
+
 ### 3. Day-to-day
+
+The PowerShell wrapper (`.\agentmux <verb>`) only ships on Windows.
+On Linux the verbs below map directly to invoking the matching
+binary; e.g. `agentmux attach default` ≡ `./claude-attach --session default`,
+`agentmux start` ≡ launching `./broker` and (optionally) `./platform-discord`
+as background processes (`nohup ./broker >/dev/null 2>&1 &` works).
 
 ```powershell
 .\agentmux start             # broker + tray + Discord bot (if configured)
@@ -194,10 +244,16 @@ Loopback callers (your Discord bot on the broker host, hooks, local `claude-atta
 # → dist\agentmux-vX.Y.Z-windows-x86_64.zip
 ```
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`, which runs the
-same packaging script on a Windows runner and uploads the zip + a `.sha256`
-checksum to a GitHub Release. (`workflow_dispatch` is also wired so you can
-fire it manually.)
+```bash
+bash scripts/build-release.sh
+# → dist/agentmux-vX.Y.Z-linux-x86_64.tar.gz
+```
+
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which runs
+both packaging scripts in parallel — Windows zip on a `windows-latest`
+runner, Linux tarball on `ubuntu-latest` — and attaches both archives
+plus their `.sha256` checksums to a single GitHub Release.
+(`workflow_dispatch` is also wired so you can fire it manually.)
 
 ### 8. Add the Windows Terminal profile (optional)
 
@@ -209,20 +265,25 @@ menu.
 
 ## Configuration
 
-`broker.exe` and `claude-attach.exe` resolve config in this order (first hit wins):
+`broker` and `claude-attach` resolve config in this order (first hit wins):
 
 1. `AGENT_CONFIG` env var → that file's path
-2. `%LOCALAPPDATA%\agentmux\config.toml`
+2. `<local-appdata>/agentmux/config.toml`, where `<local-appdata>` is:
+    - **Windows:** `%LOCALAPPDATA%\agentmux\` (e.g. `C:\Users\you\AppData\Local\agentmux\`)
+    - **Linux:** `$XDG_DATA_HOME/agentmux/` (default `~/.local/share/agentmux/`)
+    - **macOS:** `~/Library/Application Support/agentmux/`
 3. baked-in defaults
 
-`.\scripts\init-config.ps1` writes a fully-commented template at the default path. Every field is optional — unset means default.
+`.\scripts\init-config.ps1` writes a fully-commented template at the
+default path on Windows. On Linux, write your own `config.toml` under
+`~/.local/share/agentmux/` (every field is optional — unset means default).
 
 ### `broker` config (`config.toml`)
 
 | Key | Default | Meaning |
 |---|---|---|
 | `http_addr` | `127.0.0.1:8765` | Broker HTTP / WS bind address. Set `0.0.0.0:8765` for LAN (then **`attach_token` is mandatory**). |
-| `pipe_name` | `\\.\pipe\claude-broker` | Named pipe between broker and local viewers |
+| `pipe_name` | `claude-broker` | Local-socket name (`\\.\pipe\<name>` on Windows, abstract Unix socket on Linux) shared by broker and local viewers. Bare name; legacy `\\.\pipe\<name>` values from older configs are auto-stripped on load |
 | `default_command` | `["claude", "--dangerously-skip-permissions"]` | argv used to spawn each session |
 | `ring_cap_bytes` | `524288` | Per-session replay buffer size |
 | `hibernate_idle_secs` | `86400` | Auto-hibernate idle sessions after this many seconds (0 = off) |
@@ -283,22 +344,22 @@ All endpoints are loopback-only by default. When `attach_token` is set and `http
 
 | Crate | Role |
 |---|---|
-| `broker` | Multi-session daemon. Owns the ConPTY pool, ring buffers, named-pipe server, HTTP control plane (auth-middleware-protected), WS event bus, WS attach endpoint, hibernate scanner, decision-channel registry for PreToolUse, daily-rolling events log |
-| `claude-attach` | Terminal viewer. Frame-protocol client with two transports: named pipe (default, local) and WebSocket (`--broker http://host:port --token …` for LAN). Session-picker menu, raw-mode stdin forwarding, Ctrl+C escalation, resize coordination |
+| `broker` | Multi-session daemon. Owns the PTY pool (ConPTY on Windows, openpty on Unix via `portable-pty`), ring buffers, local-socket server (`interprocess` — Win32 named pipe on Windows, Unix domain socket on Linux), HTTP control plane (auth-middleware-protected), WS event bus, WS attach endpoint, hibernate scanner, decision-channel registry for PreToolUse, daily-rolling events log |
+| `claude-attach` | Terminal viewer. Frame-protocol client with two transports: local socket (default, on-host) and WebSocket (`--broker http://host:port --token …` for LAN). Session-picker menu, raw-mode stdin forwarding (cross-platform via `crossterm`), Ctrl+C escalation, resize coordination |
 | `platform-discord` | Discord IM adapter. Per-channel session bindings (persisted), edit-in-place placeholders with live tool-progress narration, reply-thread routing with optional quote injection, attachment forwarding (image/text), 12 slash commands with autocomplete, reaction commands, tool-use approval buttons, idle-ping suppression, mention wake, DM mode, orphan-placeholder recovery |
-| `agentmux-tray` | System-tray icon + Windows toast notifications. Subscribes to `/ws` for live events, polls `/sessions` for menu state. Per-session right-click submenu; toasts on `assistant_message` / `notification` / `tool_request` (with `[Allow]` `[Deny]` action buttons via the `agentmux://` URL scheme). Single-instance handshake (named pipe), HKCU URL-scheme registration on first run |
+| `agentmux-tray` | **Windows-only.** System-tray icon + Windows toast notifications. Subscribes to `/ws` for live events, polls `/sessions` for menu state. Per-session right-click submenu; toasts on `assistant_message` / `notification` / `tool_request` (with `[Allow]` `[Deny]` action buttons via the `agentmux://` URL scheme). Single-instance handshake (named pipe), HKCU URL-scheme registration on first run. Excluded from Linux builds |
 | `hook-stop` | Claude Code `Stop` hook. Reads transcript, posts `assistant_message` to broker. Always emits a tiny internal `session_seen` event first (so broker learns claude's session id even when the user-facing event is suppressed). Bails silently for the user-facing event when a local viewer is attached |
 | `hook-notification` | Claude Code `Notification` hook. Same `session_seen` capture, posts `notification` events for permission prompts / idle pings |
 | `hook-pretool` | Claude Code `PreToolUse` hook. Smart classifier auto-allows safe tools and dev-flow `Bash` patterns; long-polls `/tool-request` for the rest. Fails open on broker outage so claude isn't blocked by infrastructure failure |
 | `hook-posttool` | Claude Code `PostToolUse` hook. Posts `tool_progress` events that drive Discord's edit-in-place narration (`✏️ edit src/x.rs`, `🖥 $ cargo test`, …). Fail-open + local-viewer-bail like the others |
-| `agentmux-cli` | Helper invoked by `agentmux.ps1` for format-preserving TOML edits and per-kind config validation |
+| `agentmux-cli` | Helper for format-preserving TOML edits and per-kind config validation. Invoked by `agentmux.ps1` on Windows; usable directly as `./agentmux-cli ...` on Linux |
 | `shared` | Wire protocol (frame tags, HELLO / RESIZE / CONTROL / PTY_DATA, encode/decode-frame for WS), config loader, minimal blocking HTTP client (with optional Bearer auth + long-poll variant) |
 
 ## Repository layout
 
 ```
 agentmux/
-├── agentmux.ps1            # unified entrypoint — wraps the scripts below
+├── agentmux.ps1            # Windows entrypoint — wraps the scripts below
 ├── QUICKSTART.md           # 1-page user-facing onboarding
 ├── crates/
 │   ├── broker/             # Multi-session daemon
@@ -322,23 +383,32 @@ agentmux/
 │   ├── init-discord-config.ps1
 │   ├── open-config-dir.ps1
 │   ├── build-release.ps1   # produces dist\agentmux-vX.Y.Z-windows-x86_64.zip
+│   ├── build-release.sh    # produces dist/agentmux-vX.Y.Z-linux-x86_64.tar.gz
 │   └── terminal-profile.json
 ├── .github/workflows/
-│   └── release.yml         # Tag-triggered build + GitHub release
+│   └── release.yml         # Tag-triggered Windows + Linux build → GitHub release
 └── PLAN.md                 # Design doc + phase-by-phase implementation log
 ```
 
 ## Requirements
 
-- **Windows 10/11** — relies on ConPTY and Win32 named pipes; not portable to Unix
-- **Rust 1.75+** with the MSVC toolchain (Visual Studio 2022 Build Tools, "Desktop development with C++") — only needed for *building*; release zips are self-contained
+- **Windows 10/11** for the full feature set (broker + viewer + Discord +
+  hooks + tray + Windows toast), or **Linux x86_64** for everything except
+  the tray (Linux build excludes `agentmux-tray`; broker, viewer, hooks,
+  Discord, and the web viewer all run headless on a server). macOS is not
+  routinely tested but the codebase no longer assumes Win32 — patches
+  welcome.
+- **Rust 1.75+**. On Windows, MSVC toolchain (Visual Studio 2022 Build
+  Tools, "Desktop development with C++"). On Linux, the standard
+  `rustup default stable` is enough (no extra system libs). Only needed
+  for *building*; the release archives are self-contained.
 - **Claude Code CLI** on `PATH` — broker spawns `claude` as the default command
 
 ## Safety
 
-- **Default-loopback.** HTTP control plane and named pipe both bind to `127.0.0.1` out of the box — not reachable from the network. LAN access is opt-in via `http_addr = "0.0.0.0:8765"` **and** a non-empty `attach_token`; without the token, every non-loopback request is rejected with 401 (logged with source IP).
+- **Default-loopback.** HTTP control plane and the local socket both bind to `127.0.0.1` (resp. an abstract Unix socket name on Linux) out of the box — not reachable from the network. LAN access is opt-in via `http_addr = "0.0.0.0:8765"` **and** a non-empty `attach_token`; without the token, every non-loopback request is rejected with 401 (logged with source IP).
 - **Constant-time token comparison** for the bearer check.
-- **Loopback exemption** for the auth middleware so existing local tooling (the Discord bot on the same host, hooks, claude-attach over the named pipe) keeps working without any token configured.
+- **Loopback exemption** for the auth middleware so existing local tooling (the Discord bot on the same host, hooks, claude-attach over the local socket) keeps working without any token configured.
 - **PreToolUse fail-open.** When the broker is unreachable, `hook-pretool` allows the tool through rather than block claude on broken infrastructure. Set `AGENT_HOOK_DEBUG` to surface the fail-open reason on stderr (visible to humans, not to claude).
 - **Default command** is `claude --dangerously-skip-permissions`. The PreToolUse approval flow is intended to *replace* claude's own permission prompts with a more flexible regex-driven one; if you'd rather use claude's built-in prompts instead, override `default_command` in `config.toml` and disable / uninstall the PreToolUse hook.
 - **PID-file singleton** prevents two brokers from racing on the same pipe.

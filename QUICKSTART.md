@@ -2,16 +2,36 @@
 
 ## What you need
 
-- **Windows 10/11** — agentmux uses ConPTY and Win32 named pipes; not portable
+- **Windows 10/11** for the full feature set, **or Linux x86_64** for everything
+  except the system-tray + Windows toast (which is Windows-only). The Linux
+  build is intended for headless servers — broker + Discord bot + browser
+  web viewer + remote `claude-attach` over SSH/LAN.
 - **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** on `PATH` — install with `npm install -g @anthropic-ai/claude-code`
 
 ## Install
+
+### Windows
 
 Download `agentmux-vX.Y.Z-windows-x86_64.zip` from the [releases page](https://github.com/anthropics/agentmux/releases) and extract it anywhere — e.g. `C:\Tools\agentmux\`.
 
 That folder is self-contained; no installer, no PATH changes, no admin rights needed.
 
+### Linux
+
+Download `agentmux-vX.Y.Z-linux-x86_64.tar.gz` from the [releases page](https://github.com/anthropics/agentmux/releases) and extract:
+
+```bash
+tar -xzf agentmux-v*-linux-x86_64.tar.gz
+cd agentmux-v*-linux-x86_64
+ls bin/   # broker, claude-attach, hook-stop, hook-notification, hook-pretool,
+          # hook-posttool, platform-discord, agentmux-cli
+```
+
+The folder is self-contained; the binaries link only against glibc.
+
 ## Set up
+
+### Windows (interactive wizard)
 
 In a PowerShell window opened in the extracted folder:
 
@@ -27,15 +47,79 @@ The wizard walks you through:
 4. **Discord IM** *(optional)* — prompts for bot token, channel ID, and your user ID. The token is verified against Discord before being saved to a User-scope environment variable. Wizard re-detects an already-configured Discord and skips
 5. **Start broker** — launches the daemon, the system-tray icon, and (if configured) the Discord bot, all as detached background processes
 
-After that, you have a running agentmux. **Look at the Windows system tray (bottom-right of the taskbar)** — a small coloured circle is the agentmux tray icon. Right-click for the per-session menu. Or:
+### Linux (manual setup — `init` wrapper not yet ported)
+
+```bash
+mkdir -p ~/.local/share/agentmux                # data dir
+ROOT="$(pwd)/bin"                               # absolute path to bin/
+
+# 1. Wire the hooks. Edit ~/.claude/settings.json and add (merge with
+#    any existing "hooks" key):
+cat <<EOF
+{
+  "hooks": {
+    "Stop":         [{"hooks": [{"type":"command","command":"$ROOT/hook-stop"}]}],
+    "Notification": [{"hooks": [{"type":"command","command":"$ROOT/hook-notification"}]}],
+    "PreToolUse":   [{"matcher":"*","hooks":[{"type":"command","command":"$ROOT/hook-pretool"}]}],
+    "PostToolUse":  [{"matcher":"*","hooks":[{"type":"command","command":"$ROOT/hook-posttool"}]}]
+  }
+}
+EOF
+
+# 2. (Optional) Discord — set the bot token in your shell rc:
+#       export DISCORD_BOT_TOKEN='xxx'
+#    and write ~/.local/share/agentmux/discord.toml. See the
+#    "Discord IM bridge" section below for fields.
+
+# 3. Launch broker (foreground for first run; ^C exits):
+$ROOT/broker
+
+# Or as a background service via systemd (sample unit):
+#   ~/.config/systemd/user/agentmux-broker.service
+#       [Unit]
+#       Description=agentmux broker
+#       [Service]
+#       ExecStart=%h/agentmux/bin/broker
+#       Restart=on-failure
+#       [Install]
+#       WantedBy=default.target
+# Then: systemctl --user daemon-reload && systemctl --user enable --now agentmux-broker
+```
+
+Linux config / state lives under `~/.local/share/agentmux/`
+(`config.toml`, `sessions.toml`, `discord.toml`, `logs/`, …) — the
+same data as `%LOCALAPPDATA%\agentmux\` on Windows, just at the XDG
+standard location.
+
+The system-tray + toast surfaces are Windows-only. On Linux, use
+the **browser web viewer** at `http://<broker>:8765/` (works from
+any device, including phones) for at-a-glance access, and rely on
+**Discord** for tool-approval prompts when you're away from the
+machine.
+
+---
+
+After that, you have a running agentmux. On Windows, **look at the system
+tray (bottom-right of the taskbar)** — a small coloured circle is the
+agentmux tray icon. Right-click for the per-session menu. Or, on either
+platform:
 
 ```powershell
-.\agentmux attach            # enter claude's TUI
-.\agentmux status            # see what's running
-.\agentmux help              # full command list
+.\agentmux attach            # Windows: enter claude's TUI
+.\agentmux status            # Windows: see what's running
+.\agentmux help              # Windows: full command list
+```
+
+```bash
+./bin/claude-attach          # Linux: enter claude's TUI
+ps aux | grep agentmux       # Linux: see what's running (no wrapper yet)
+./bin/claude-attach --help   # Linux: viewer flags
 ```
 
 ## Daily ops cheat sheet
+
+The PowerShell `.\agentmux <verb>` wrapper is Windows-only. Linux verbs
+below are the direct binary invocations.
 
 ```powershell
 .\agentmux start             # broker + tray + Discord bot (if configured)
@@ -55,6 +139,32 @@ After that, you have a running agentmux. **Look at the Windows system tray (bott
 .\agentmux kill blog         # delete a session record (asks for confirmation)
 .\agentmux demote default    # hand a session back to local terminal
 .\agentmux adopt default     # bring a demoted session back under broker
+```
+
+```bash
+# Linux equivalents — invoke binaries directly. Most session-lifecycle
+# verbs (new / kill / demote / adopt / persist / interrupt / restart /
+# hibernate) are exposed over the broker's HTTP control plane:
+#
+curl -s http://127.0.0.1:8765/sessions | jq                    # list
+curl -s http://127.0.0.1:8765/sessions/default/state           # one session
+curl -sX POST -H "Content-Type: application/json" \
+  -d '{"name":"blog","cwd":"/home/me/projects/blog","auto_resume":true}' \
+  http://127.0.0.1:8765/sessions                               # create
+curl -sX POST http://127.0.0.1:8765/sessions/blog/interrupt    # ^C
+curl -sX DELETE http://127.0.0.1:8765/sessions/blog?force=true # kill
+curl -sX POST http://127.0.0.1:8765/shutdown                   # broker stop
+#
+# Attach a viewer:
+./bin/claude-attach                          # session menu
+./bin/claude-attach --session default        # direct
+./bin/claude-attach --new blog               # create + attach
+./bin/claude-attach --broker http://host:8765 \
+                    --token "$AGENT_ATTACH_TOKEN"  # remote (LAN)
+#
+# Logs (daily-rotated under ~/.local/share/agentmux/logs/):
+tail -f ~/.local/share/agentmux/logs/broker.$(date +%F).log
+tail -f ~/.local/share/agentmux/events.$(date +%F).jsonl       # audit trail
 ```
 
 For the **local→broker handover** scenario (started a session locally,
