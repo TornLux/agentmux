@@ -2,7 +2,10 @@
 //!
 //! Lookup order (first hit wins):
 //!   1. `AGENT_CONFIG` env var → that file's path
-//!   2. `%LOCALAPPDATA%\agentmux\config.toml`
+//!   2. `<local-appdata>/agentmux/config.toml`
+//!      (Windows: `%LOCALAPPDATA%\agentmux\`; Linux:
+//!      `~/.local/share/agentmux/`; macOS:
+//!      `~/Library/Application Support/agentmux/`).
 //!   3. baked-in defaults (matches Phase 1-7.6 hard-coded behaviour)
 //!
 //! Missing fields fall through to defaults, so a partial config file
@@ -228,11 +231,20 @@ pub fn default_config_path() -> PathBuf {
     local_appdata_dir().join("config.toml")
 }
 
-fn local_appdata_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("agentmux")
+/// Per-user, per-machine app data directory for agentmux state files.
+///
+/// Resolution (via `dirs::data_local_dir`):
+///   * Windows → `%LOCALAPPDATA%\agentmux\` — same path the
+///     pre-cross-platform builds used.
+///   * Linux   → `$XDG_DATA_HOME/agentmux/` (default `~/.local/share/agentmux/`).
+///   * macOS   → `~/Library/Application Support/agentmux/`.
+///   * If the OS lookup fails (very unusual — tests, sandboxes), we
+///     fall back to `./agentmux/` under the current working directory
+///     so a developer running from a checkout still gets a valid path.
+pub fn local_appdata_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("agentmux")
 }
 
 #[cfg(test)]

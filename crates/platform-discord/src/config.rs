@@ -154,8 +154,5 @@ impl DiscordConfig {
 }
 
 pub fn default_config_path() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("agentmux").join("discord.toml")
+    shared::config::local_appdata_dir().join("discord.toml")
 }

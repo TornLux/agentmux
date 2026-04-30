@@ -250,10 +250,7 @@ fn date_to_secs(s: &str) -> Option<u64> {
 }
 
 fn default_events_path() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("agentmux").join("events.jsonl")
+    shared::config::local_appdata_dir().join("events.jsonl")
 }
 
 #[derive(Clone)]

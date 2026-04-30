@@ -523,14 +523,11 @@ fn chunked(s: &str, max: usize) -> Vec<String> {
     out
 }
 
-/// Resolved path of `discord-bindings.toml` — `%LOCALAPPDATA%\agentmux\
-/// discord-bindings.toml` on Windows, falling back to `./agentmux/...`
-/// when LOCALAPPDATA is unset (test harness, headless env, …).
+/// Resolved path of `discord-bindings.toml` under the shared per-user
+/// app-data dir (Windows: `%LOCALAPPDATA%\agentmux\`; Linux:
+/// `~/.local/share/agentmux/`).
 fn default_bindings_path() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("agentmux").join("discord-bindings.toml")
+    shared::config::local_appdata_dir().join("discord-bindings.toml")
 }
 
 /// Resolved path of `discord-pending.toml` — sibling of bindings,
@@ -538,10 +535,7 @@ fn default_bindings_path() -> PathBuf {
 /// empty queue. Presence of a non-empty file at startup ⇔ previous
 /// bot instance exited mid-turn.
 fn default_pending_path() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("agentmux").join("discord-pending.toml")
+    shared::config::local_appdata_dir().join("discord-pending.toml")
 }
 
 /// Edit each orphaned `💭 working…` placeholder left over from a
