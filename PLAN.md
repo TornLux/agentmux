@@ -902,9 +902,12 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 ### 进度速览
 
-截至 v0.2.3。原 plan 里的核心 phase 1-9 全部落地,additional 的 LAN /
+截至 v0.3.1。原 plan 里的核心 phase 1-9 全部落地,additional 的 LAN /
 web viewer / release pipeline / **PostToolUse 驱动的工具进度流** /
-**system tray + Windows toast(本地通知 + 审批)** 等都做了。剩下的开放项是新方向(跨平台、vendor-agnostic backend、cost dashboard
+**system tray + Windows toast(本地通知 + 审批)** /
+**LocallyOwned 状态 + adopt/demote**(v0.3.0)/
+**web viewer 移动端 UX**(v0.3.1:扩展软键栏 + 📋 粘贴弹窗 + ⏫⇞⇟⏬ 滚动控件)
+等都做了。剩下的开放项是新方向(跨平台、vendor-agnostic backend、cost dashboard
 等),见末尾 §11.
 
 | Phase | 状态 | 备注 |
@@ -929,7 +932,7 @@ web viewer / release pipeline / **PostToolUse 驱动的工具进度流** /
 | 10. 运维 | ◐ 部分 | PID 文件 + 按天轮转日志 + events.YYYY-MM-DD.jsonl 7 日 retention 都已完成;开机自启 / claude crash 自动重启**主动跳过** |
 | 11. 打磨 | ◐ 部分 | 静态 CRT 链接、unified `agentmux.ps1` 入口、agentmux-cli TOML 助手、release zip + GitHub Actions 自动发布,都已完成;systray / 输入锁 等剩余项可选 |
 | **额外:LAN attach + token auth** | ✅ 完成 | `ebfd70f` `claude-attach --broker http://host:port`,`Authorization: Bearer` 鉴权,loopback 豁免,constant-time 比较 |
-| **额外:浏览器 web viewer** | ✅ 完成 | `1f67820` (v0.2.1) `http://broker:8765/` 单文件 HTML,xterm.js + addon-fit 通过 `include_bytes!` 嵌入(broker.exe 自包含),WS subprotocol auth 给浏览器,自动重连,移动端软键盘条 |
+| **额外:浏览器 web viewer** | ✅ 完成 | `1f67820` (v0.2.1) `http://broker:8765/` 单文件 HTML,xterm.js + addon-fit 通过 `include_bytes!` 嵌入(broker.exe 自包含),WS subprotocol auth 给浏览器,自动重连,移动端软键盘条。v0.3.1 移动端 UX 加强:28 个 ASCII 标点按钮(iOS 软键盘埋得深 / 部分键传不进 xterm)、📋 粘贴弹窗(可见 textarea 长按粘贴 → Send,绕开 iOS 在 xterm 隐藏 helper textarea 上不肯长按粘贴的限制)、⏫ ⇞ ⇟ ⏬ 滚动控件(jump-to-top / page-up / page-down / jump-to-bottom,xterm 在 iOS 触屏滚动迟钝) |
 | **额外:release pipeline** | ✅ 完成 | `scripts/build-release.ps1` + `.github/workflows/release.yml` —— 推 `v*` tag 自动 windows-latest 跑 cargo build + 打 zip + 创 GitHub Release + sha256 校验和 |
 | **额外:PostToolUse 进度流** | ✅ 完成 | `4063f40` 新 `hook-posttool` crate POST `tool_progress` 事件;Discord `platform-discord/src/progress.rs` 渲染单工具人话(`✏️ edit src/x.rs` / `🖥 $ cargo test` / `🔎 grep` / `🔌 mcp \`server.tool\`` 等);peek_pending + 800ms 节流 + 8 行 history 上限,`💭 working…` 占位符变成 live timeline,turn 完成时替换成最终答案 |
 | **额外:hooks 安装器消重** | ✅ 完成 | `3fd9ec0` `scripts/install-hooks.ps1` 改成 basename 匹配:不论上次装在哪个 zip / 源码目录,重装永远收敛到 1 条指向当前 build 的条目;agentmux.ps1 的 init 步骤撤掉 "skip if installed" 闸,改成无条件调 install-hooks.ps1 当自愈 |

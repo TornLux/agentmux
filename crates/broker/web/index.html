@@ -55,6 +55,23 @@
   #status.live { color: #4caf50; }
   #status.dead { color: #f48771; }
 
+  /* Paste modal — iOS Safari can't reliably long-press-paste into xterm's
+     invisible helper textarea, so we surface a real visible textarea for
+     pasting then ship its contents as a PTY_DATA frame. */
+  #paste-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100;
+                 display: flex; align-items: center; justify-content: center; padding: 16px;
+                 box-sizing: border-box; }
+  .paste-card { width: 100%; max-width: 480px; background: #2a2a2a; padding: 16px;
+                border-radius: 8px; box-sizing: border-box; }
+  .paste-card h2 { margin: 0 0 8px; font-size: 1.1rem; font-weight: 500; }
+  .paste-card p { margin: 0 0 12px; }
+  .paste-card textarea { width: 100%; min-height: 120px; padding: 8px;
+                         background: #1e1e1e; color: #ddd; border: 1px solid #444;
+                         border-radius: 4px; font-family: monospace; font-size: 14px;
+                         box-sizing: border-box; resize: vertical; }
+  .paste-card .row { justify-content: flex-end; }
+  .paste-card button.cancel { background: #444; }
+
   /* Soft keys for touch devices — virtual keyboards on phones don't
      have Esc/Tab/Ctrl/arrows, and Ctrl+letter combos are basically
      impossible, so we surface them as tap-buttons. Hidden on
@@ -99,6 +116,20 @@
   <div class="err" id="picker-err"></div>
 </div>
 
+<!-- Paste modal — separate from xterm's input pipeline because iOS soft
+     keyboards can't reliably long-press-paste into an invisible textarea. -->
+<div id="paste-modal" class="hidden">
+  <div class="paste-card">
+    <h2>Paste text</h2>
+    <p class="muted">Long-press the box → tap "Paste" → tap Send</p>
+    <textarea id="paste-text"></textarea>
+    <div class="row">
+      <button id="paste-cancel" class="cancel">Cancel</button>
+      <button id="paste-send">Send</button>
+    </div>
+  </div>
+</div>
+
 <!-- 3. terminal -->
 <div id="term-host" class="hidden"></div>
 <div id="toolbar" class="hidden">
@@ -111,6 +142,39 @@
 <div id="softkeys" class="hidden">
   <button data-bytes="1b">Esc</button>
   <button data-bytes="09">Tab</button>
+  <button data-action="paste" title="Paste text">📋</button>
+  <button data-action="scroll-top" title="Scroll to top">⏫</button>
+  <button data-action="scroll-page-up" title="Page up">⇞</button>
+  <button data-action="scroll-page-down" title="Page down">⇟</button>
+  <button data-action="scroll-bottom" title="Scroll to bottom">⏬</button>
+  <button data-bytes="2c">,</button>
+  <button data-bytes="2e">.</button>
+  <button data-bytes="5f">_</button>
+  <button data-bytes="2d">-</button>
+  <button data-bytes="2f">/</button>
+  <button data-bytes="3a">:</button>
+  <button data-bytes="3b">;</button>
+  <button data-bytes="3f">?</button>
+  <button data-bytes="21">!</button>
+  <button data-bytes="27">'</button>
+  <button data-bytes="22">"</button>
+  <button data-bytes="28">(</button>
+  <button data-bytes="29">)</button>
+  <button data-bytes="5b">[</button>
+  <button data-bytes="5d">]</button>
+  <button data-bytes="7b">{</button>
+  <button data-bytes="7d">}</button>
+  <button data-bytes="5c">\</button>
+  <button data-bytes="7c">|</button>
+  <button data-bytes="3d">=</button>
+  <button data-bytes="2b">+</button>
+  <button data-bytes="2a">*</button>
+  <button data-bytes="26">&amp;</button>
+  <button data-bytes="3c">&lt;</button>
+  <button data-bytes="3e">&gt;</button>
+  <button data-bytes="23">#</button>
+  <button data-bytes="40">@</button>
+  <button data-bytes="24">$</button>
   <button data-bytes="1b5b41">↑</button>
   <button data-bytes="1b5b42">↓</button>
   <button data-bytes="1b5b44">←</button>
@@ -177,6 +241,18 @@
   $('softkeys').addEventListener('click', e => {
     const btn = e.target.closest('button');
     if (!btn) return;
+    if (btn.dataset.action === 'paste') {
+      openPaste();
+      return;
+    }
+    if (btn.dataset.action && term) {
+      switch (btn.dataset.action) {
+        case 'scroll-top':       term.scrollToTop(); return;
+        case 'scroll-bottom':    term.scrollToBottom(); return;
+        case 'scroll-page-up':   term.scrollPages(-1); return;
+        case 'scroll-page-down': term.scrollPages(1); return;
+      }
+    }
     const hex = btn.dataset.bytes;
     if (!hex || !ws || ws.readyState !== WebSocket.OPEN) return;
     const bytes = new Uint8Array(hex.match(/.{2}/g).map(h => parseInt(h, 16)));
@@ -185,6 +261,29 @@
     // a soft-key tap (otherwise iOS Safari hides it).
     if (term) term.focus();
   });
+
+  // ---- paste modal ----
+  function openPaste() {
+    $('paste-text').value = '';
+    $('paste-modal').classList.remove('hidden');
+    // Defer focus so iOS actually gives keyboard/long-press affordances.
+    setTimeout(() => $('paste-text').focus(), 50);
+  }
+  function closePaste() {
+    $('paste-modal').classList.add('hidden');
+    if (term) term.focus();
+  }
+  $('paste-modal').addEventListener('click', e => {
+    if (e.target.id === 'paste-modal') closePaste();
+  });
+  $('paste-send').addEventListener('click', () => {
+    const text = $('paste-text').value;
+    if (text && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(encodeFrame(TAG_PTY_DATA, enc.encode(text)));
+    }
+    closePaste();
+  });
+  $('paste-cancel').addEventListener('click', closePaste);
 
   // ---- login + session list ----
   async function fetchSessions() {

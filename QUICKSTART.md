@@ -330,10 +330,18 @@ with no internet access.
   on WebSockets), validated by the broker's middleware.
 - **Auto-reconnect** with exponential backoff (1 s → 30 s cap) when
   the broker restarts. Scrollback survives the gap.
-- **Touch devices** get a soft-key bar at the bottom (Esc / Tab /
-  arrows / `^C` `^D` `^L` `^Z`) for keys most virtual keyboards omit.
-  Tapping `^C` on the bar bypasses the Ctrl+C escalation tracker on
-  purpose, so triple-tapping doesn't accidentally shut the broker down.
+- **Touch devices** get a soft-key bar at the bottom with control keys
+  (Esc / Tab / arrows / `^C` `^D` `^L` `^Z`), 28 ASCII punctuation
+  buttons (`, . _ - / : ; ? ! ' " ( ) [ ] { } \ | = + * & < > # @ $` —
+  iOS soft keyboards bury most of these, and several never reach xterm
+  through the standard input pipeline), a **📋 paste modal** (a visible
+  textarea you long-press-paste into then Send — works around iOS's
+  refusal to long-press-paste into xterm's hidden helper textarea), and
+  **⏫ ⇞ ⇟ ⏬ scroll controls** (xterm's touch-scroll on iOS is
+  sluggish, so jump-to-top / page-up / page-down / jump-to-bottom
+  buttons make scrollback navigation tractable). Tapping `^C` on the
+  bar bypasses the Ctrl+C escalation tracker on purpose, so
+  triple-tapping doesn't accidentally shut the broker down.
 
 The browser viewer is a peer of `claude-attach` over the named pipe
 or LAN WebSocket — same fan-out, same input merging, same resize

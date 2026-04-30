@@ -185,8 +185,10 @@ start http://127.0.0.1:8765/
   所以一进来就是"接着上次"的状态,不是空屏
 - **同一个 session 可以多个浏览器 / 设备同时打开**,输入合并,resize 取
   所有 viewer 中最小的列宽行高
-- 移动端浏览器底部有软键栏(Esc / Tab / 方向键 / `^C` `^D` `^L` `^Z`),
-  补虚拟键盘没有的键
+- 移动端浏览器底部有软键栏:控制键(Esc / Tab / 方向键 / `^C` `^D` `^L` `^Z`)、
+  28 个 ASCII 标点按钮(iOS 软键盘埋得深或传不进 xterm)、📋 粘贴弹窗
+  (长按粘贴到可见 textarea 再 Send,绕开 iOS 不肯长按粘贴到 xterm 隐藏
+  textarea 的限制)、⏫ ⇞ ⇟ ⏬ 滚动控件(xterm 在 iOS 触屏滚动迟钝)
 - 网络抖动后 WebSocket 会自动重连退避,不丢 scrollback
 - **关闭浏览器只是 detach**,A 上的 claude 继续跑,session 不受影响
 
