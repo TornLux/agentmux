@@ -108,20 +108,71 @@ http://127.0.0.1:8765/ on this host now reaches the broker on the other side.
   Attach:  .\claude-attach.exe --broker http://127.0.0.1:8765 --session default
 ```
 
-### 3.3 在 B 端访问 broker
+### 3.3 验证隧道是否连通
 
-隧道起来之后,B 端的 `127.0.0.1:8765` 就**等价于** A 端的 broker。下面三种
+ssh / plink 进程"在跑"不等于隧道"通了"。下面分 A、B 两端各自检查,出问题
+可以一眼定位是哪一段断的。
+
+#### 3.3.1 A 端(broker 主机)
+
+```powershell
+# 1. 隧道进程还活着
+Get-Content $env:LOCALAPPDATA\agentmux\ssh-tunnel-broker.pid |
+    ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }
+# 期望:有一行 ssh 或 plink 的输出
+```
+
+```powershell
+# 2. 反向端口在 C 上真的绑住了 —— 从 A 临时 SSH 进 C 跑一下
+ssh bob@relay.example.com "ss -tlnp | grep 18765"
+# 期望:
+#   LISTEN 0 128 127.0.0.1:18765 0.0.0.0:* users:(("sshd",pid=...))
+#
+# 老系统(没有 ss)用 netstat:
+ssh bob@relay.example.com "netstat -an | grep 18765"
+# 期望看到 127.0.0.1:18765 处于 LISTEN
+```
+
+**第 2 步是最关键的一步**——它直接证明 A → C 这一段的反向转发真的生效
+了,而不是 ssh 进程"看上去活着但其实转发请求被 sshd 拒了"(比如 sshd 配
+了 `AllowTcpForwarding no`,A 上的 ssh 不会立刻退出,但 C 上根本没绑端
+口,这种状态从 A 本地看不出来)。
+
+#### 3.3.2 B 端(viewer 主机)
+
+```powershell
+# 1. 隧道进程还活着
+Get-Content $env:LOCALAPPDATA\agentmux\ssh-tunnel-viewer.pid |
+    ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }
+
+# 2. 本地 8765 在监听
+Test-NetConnection 127.0.0.1 -Port 8765
+# 期望:TcpTestSucceeded : True
+
+# 3. 端到端打通 —— 请求穿过 B → C → A → broker 再原路返回
+curl http://127.0.0.1:8765/sessions
+# 期望:返回 JSON,即使没 session 也是 [] 而不是连接错误
+```
+
+第 3 步通过了,就说明全链路能用,直接进 §3.4。
+
+#### 3.3.3 哪一步失败说明什么
+
+| 失败点 | 真正断在哪 | 怎么修 |
+|---|---|---|
+| B 端第 2 步失败(`TcpTestSucceeded : False`) | B 的 ssh / plink 已退出,本地 8765 没人绑 | 看 ssh-tunnel-start.ps1 输出有没有报错,再跑一遍 |
+| B 端第 2 步过、第 3 步 connection refused / timeout | B → C 通,但 C 上 18765 没人接 → A 端隧道没起好或已断 | 回 A 端做 §3.3.1 第 2 步,看不到 LISTEN 就重启 A 端隧道 |
+| B 端第 3 步连上但返回非 JSON 错误 | 隧道通了,但 broker 没在跑 | A 端跑 `.\agentmux status` 看 broker 健康状态 |
+| A 端 §3.3.1 第 2 步看到 `0.0.0.0:18765` 而非 `127.0.0.1:18765` | C 上 sshd 开了 `GatewayPorts yes`,18765 暴露到公网 | 见 §6 安全须知,broker **必须** 配 attach_token |
+| A 端 §3.3.1 第 2 步看不到任何 18765 行,但 ssh 进程还活着 | sshd 拒了端口转发(`AllowTcpForwarding no`),或 18765 已被别的进程占了 | 让 C 的管理员开 `AllowTcpForwarding`,或换一个 `-BridgePort` |
+
+### 3.4 在 B 端访问 broker
+
+隧道验证通过后,B 端的 `127.0.0.1:8765` 就**等价于** A 端的 broker。下面三种
 访问方式和你坐在 A 主机本机用时**一字不差**——broker 看到的请求源 IP 全
 是 127.0.0.1,触发 loopback 豁免,所以 **不需要任何 token / 环境变量**。
 
-先快速确认隧道是通的:
-
-```powershell
-Test-NetConnection 127.0.0.1 -Port 8765       # TcpTestSucceeded : True
-curl http://127.0.0.1:8765/sessions           # 返回 session JSON 列表
-```
-
-#### 3.3.1 浏览器(web viewer)
+#### 3.4.1 浏览器(web viewer)
 
 ```powershell
 start http://127.0.0.1:8765/
@@ -143,7 +194,7 @@ start http://127.0.0.1:8765/
 > 浏览器进页面也不会弹 token 输入框。如果将来你切到 LAN 直连模式,再按
 > README "Remote viewer over LAN" 配 `attach_token`。
 
-#### 3.3.2 终端 viewer(claude-attach.exe)
+#### 3.4.2 终端 viewer(claude-attach.exe)
 
 最常用三种姿势:
 
@@ -171,7 +222,7 @@ start http://127.0.0.1:8765/
 多个 `claude-attach` 同时连同一个 session 也 OK:输入按到达顺序合并,
 画面共享。
 
-#### 3.3.3 HTTP API(可选,自动化用)
+#### 3.4.3 HTTP API(可选,自动化用)
 
 所有 README 里列的接口都能直接 `curl` 调用,因为隧道把 B 的 loopback 接到
 broker 上:
@@ -191,7 +242,7 @@ curl -X POST http://127.0.0.1:8765/sessions/default/interrupt
 
 写脚本批量驱动 broker 时这种姿势最省事——不用拉起 viewer 也能控会话。
 
-### 3.4 停止
+### 3.5 停止
 
 ```powershell
 # A 主机
