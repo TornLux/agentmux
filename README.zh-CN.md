@@ -221,7 +221,7 @@ bash scripts/build-release.sh
 # → dist/agentmux-vX.Y.Z-macos-x86_64.tar.gz   (Intel Mac)
 ```
 
-`build-release.sh` 通过 `uname` 自动识别宿主 OS + 架构,一份脚本搞定三种 Unix 目标。推 `v*` tag 触发 `.github/workflows/release.yml`,四个 packaging job 并行跑 —— Windows zip 在 `windows-latest`、Linux tarball 在 `ubuntu-latest`、Apple Silicon tarball 在 `macos-latest`、Intel Mac tarball 在 `macos-13` —— 把四个 archive 以及它们的 `.sha256` 校验和一起 attach 到同一个 GitHub Release。(也支持 `workflow_dispatch` 手动触发。)
+`build-release.sh` 默认通过 `uname` 推断 platform stem;cross-compile 模式下(`TARGET=<rustc-triple>`)改为从 triple 推 stem,binary 从 `target/$TARGET/release/` 读。推 `v*` tag 触发 `.github/workflows/release.yml`,三个 packaging job 并行跑 —— Windows zip 在 `windows-latest`、Linux tarball 在 `ubuntu-latest`、两个 macOS tarball 都在 `macos-latest`(Apple Silicon 原生 build aarch64,cross-compile 出 x86_64)—— 把四个 archive 以及它们的 `.sha256` 校验和一起 attach 到同一个 GitHub Release。(也支持 `workflow_dispatch` 手动触发。)
 
 ### 8. Windows Terminal 配置（可选）
 

@@ -91,83 +91,53 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  build-macos-aarch64:
-    # macos-latest is currently Apple Silicon (aarch64-apple-darwin).
-    # Pin explicitly via macos-14 if/when GitHub flips the alias.
+  build-macos:
+    # One Apple Silicon runner produces both aarch64 (native) and
+    # x86_64 (cross-compiled) tarballs. macos-13 (the old dedicated
+    # Intel runner) is avoided because GitHub's Intel runner pool is
+    # tiny and routinely queues 30+ minutes; cross-compiling from
+    # arm64 is well-supported by Apple's universal SDK and the
+    # standard Rust toolchain.
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain (both Apple targets)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-macos-aarch64
+          shared-key: release-macos
+          # Both target dirs (target/aarch64-apple-darwin/ +
+          # target/x86_64-apple-darwin/) live under target/ and are
+          # cached together by rust-cache's defaults.
 
-      - name: Build release tarball
+      - name: Build aarch64 tarball
+        run: TARGET=aarch64-apple-darwin bash scripts/build-release.sh
+
+      - name: Build x86_64 tarball (cross-compiled)
+        run: TARGET=x86_64-apple-darwin bash scripts/build-release.sh
+
+      - name: List dist
+        run: ls -la dist/
+
+      - name: Compute SHA256 for both archives
         run: |
-          bash scripts/build-release.sh
-          ls -la dist/
+          for archive in dist/*.tar.gz; do
+            hash=$(shasum -a 256 "$archive" | awk '{ print $1 }')
+            base=$(basename "$archive" .tar.gz)
+            printf "%s  %s\n" "$hash" "$(basename "$archive")" > "dist/${base}.sha256"
+            echo "sha256: $hash  $(basename "$archive")"
+          done
 
-      - name: Compute SHA256
-        run: |
-          archive=$(ls dist/*.tar.gz | head -n1)
-          hash=$(shasum -a 256 "$archive" | awk '{ print $1 }')
-          base=$(basename "$archive" .tar.gz)
-          printf "%s  %s\n" "$hash" "$(basename "$archive")" > "dist/${base}.sha256"
-          echo "sha256: $hash"
-
-      - name: Upload macOS aarch64 artifact
+      - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-macos-aarch64
-          path: |
-            dist/*.tar.gz
-            dist/*.sha256
-          if-no-files-found: error
-          retention-days: 7
-
-  build-macos-x86_64:
-    # macos-13 is GitHub's last Intel runner — Apple Silicon images
-    # (macos-14 / macos-latest) cannot host a native x86_64 build,
-    # and we'd rather avoid cross-compiling unless forced to.
-    runs-on: macos-13
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin
-
-      - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-macos-x86_64
-
-      - name: Build release tarball
-        run: |
-          bash scripts/build-release.sh
-          ls -la dist/
-
-      - name: Compute SHA256
-        run: |
-          archive=$(ls dist/*.tar.gz | head -n1)
-          hash=$(shasum -a 256 "$archive" | awk '{ print $1 }')
-          base=$(basename "$archive" .tar.gz)
-          printf "%s  %s\n" "$hash" "$(basename "$archive")" > "dist/${base}.sha256"
-          echo "sha256: $hash"
-
-      - name: Upload macOS x86_64 artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-macos-x86_64
+          name: release-macos
           path: |
             dist/*.tar.gz
             dist/*.sha256
@@ -175,7 +145,7 @@ jobs:
           retention-days: 7
 
   release:
-    needs: [build-windows, build-linux, build-macos-aarch64, build-macos-x86_64]
+    needs: [build-windows, build-linux, build-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

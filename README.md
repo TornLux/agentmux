@@ -255,15 +255,16 @@ bash scripts/build-release.sh
 # → dist/agentmux-vX.Y.Z-macos-x86_64.tar.gz   (on Intel Mac)
 ```
 
-`build-release.sh` detects the host OS + architecture via `uname` and
-names the tarball accordingly; one script handles all three Unix
-targets. Pushing a `v*` tag triggers `.github/workflows/release.yml`,
-which runs four packaging jobs in parallel — Windows zip on
-`windows-latest`, Linux tarball on `ubuntu-latest`, Apple Silicon
-tarball on `macos-latest`, Intel Mac tarball on `macos-13` — and
-attaches all four archives plus their `.sha256` checksums to a single
-GitHub Release. (`workflow_dispatch` is also wired so you can fire
-it manually.)
+`build-release.sh` infers the platform stem from `uname` by default; in
+cross-compile mode (`TARGET=<rustc-triple>`) it instead derives the
+stem from the triple and reads binaries from `target/$TARGET/release/`.
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which
+runs three packaging jobs in parallel — Windows zip on
+`windows-latest`, Linux tarball on `ubuntu-latest`, both macOS
+tarballs on `macos-latest` (Apple Silicon native for aarch64,
+cross-compiled for x86_64) — and attaches all four archives plus
+their `.sha256` checksums to a single GitHub Release.
+(`workflow_dispatch` is also wired so you can fire it manually.)
 
 ### 8. Add the Windows Terminal profile (optional)
 
