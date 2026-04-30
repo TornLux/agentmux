@@ -22,7 +22,8 @@
 #     README.md
 #     QUICKSTART.md
 #     PLAN.md
-#     LICENSE  (if present)
+#     LICENSE-MIT
+#     LICENSE-APACHE
 #
 # Notes:
 #   - agentmux-tray is omitted on every Unix variant (Win32-only crate).
@@ -138,7 +139,7 @@ for b in "${BINARIES[@]}"; do
     echo "  + bin/$b"
 done
 
-for f in README.md QUICKSTART.md PLAN.md LICENSE; do
+for f in README.md QUICKSTART.md PLAN.md LICENSE-MIT LICENSE-APACHE; do
     if [[ -f "$ROOT/$f" ]]; then
         cp "$ROOT/$f" "$STAGE_ROOT/"
         echo "  + $f"

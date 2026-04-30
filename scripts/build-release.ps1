@@ -104,7 +104,7 @@ try {
     }
 
     # top-level files
-    foreach ($f in @("agentmux.ps1", "README.md", "QUICKSTART.md", "PLAN.md", "LICENSE")) {
+    foreach ($f in @("agentmux.ps1", "README.md", "QUICKSTART.md", "PLAN.md", "LICENSE-MIT", "LICENSE-APACHE")) {
         $src = Join-Path $root $f
         if (Test-Path $src) {
             Copy-Item $src $stageRoot

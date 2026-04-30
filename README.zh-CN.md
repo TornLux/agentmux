@@ -370,4 +370,14 @@ agentmux/
 
 ## 许可证
 
-待定。
+双许可,任选其一:
+
+- Apache License, Version 2.0([LICENSE-APACHE](LICENSE-APACHE) 或
+  http://www.apache.org/licenses/LICENSE-2.0)
+- MIT License([LICENSE-MIT](LICENSE-MIT) 或
+  http://opensource.org/licenses/MIT)
+
+### 贡献
+
+除非你明确声明其它方式,根据 Apache-2.0 license 的定义,你有意向本项目提交
+的任何贡献,都将以上述双许可方式授权,无需附加任何条款或条件。

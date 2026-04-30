@@ -17,6 +17,8 @@ members = [
 version = "0.3.2"
 edition = "2021"
 rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/TornLux/agentmux"
 
 [profile.release]
 opt-level = "z"
