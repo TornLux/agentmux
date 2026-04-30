@@ -11,6 +11,12 @@
   </p>
 </p>
 
+<p align="center">
+  <img src="docs/storyboard.svg" alt="agentmux: detach your terminal, approve tool calls from your phone, reattach later" width="900">
+</p>
+
+<p align="center"><em>That's the headline. Below, everything else.</em></p>
+
 ---
 
 agentmux turns Claude Code into an always-on, multi-session background service. A long-running broker daemon owns one ConPTY per session and the `claude` child inside it; viewers (`claude-attach.exe`) come and go without disturbing the running model. Closing the terminal does not kill the session — reopen it later, pick a session from the menu, and the last ~512 KB of TUI output replays so you walk back into a live screen, not a blank prompt.

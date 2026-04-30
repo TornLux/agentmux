@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900">
+  <defs>
+    <style>
+      .tagline { font: 600 32px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; fill: #1f2328; }
+      .num     { font: 700 22px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; fill: #ffffff; }
+      .title   { font: 600 20px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; fill: #0969da; }
+      .caption { font: 400 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; fill: #656d76; }
+      .card    { fill: #ffffff; stroke: #d1d9e0; stroke-width: 2; }
+      .badge   { fill: #0969da; }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#0969da"/>
+    </marker>
+  </defs>
+
+  <!-- tagline -->
+  <text x="800" y="60" text-anchor="middle" class="tagline">Sessions outlive your terminal. And your desk.</text>
+
+  <!-- Cell 1: At your desk -->
+  <g transform="translate(40, 100)">
+    <rect class="card" width="350" height="780" rx="8"/>
+    <circle class="badge" cx="32" cy="40" r="18"/>
+    <text x="32" y="48" text-anchor="middle" class="num">1</text>
+    <text x="60" y="48" class="title">At your desk</text>
+    <image href="REPLACE_ME_1" x="20" y="80" width="310" height="580" preserveAspectRatio="xMidYMid meet"/>
+    <text x="175" y="710" text-anchor="middle" class="caption">Started a refactor with claude</text>
+    <text x="175" y="732" text-anchor="middle" class="caption">— tests are running</text>
+  </g>
+
+  <!-- Arrow 1 -> 2 -->
+  <line stroke="#0969da" stroke-width="3" x1="395" y1="490" x2="430" y2="490" marker-end="url(#arrow)"/>
+
+  <!-- Cell 2: Walk away -->
+  <g transform="translate(440, 100)">
+    <rect class="card" width="350" height="780" rx="8"/>
+    <circle class="badge" cx="32" cy="40" r="18"/>
+    <text x="32" y="48" text-anchor="middle" class="num">2</text>
+    <text x="60" y="48" class="title">Walk away</text>
+    <image href="REPLACE_ME_2" x="20" y="80" width="310" height="580" preserveAspectRatio="xMidYMid meet"/>
+    <text x="175" y="710" text-anchor="middle" class="caption">Closed the terminal —</text>
+    <text x="175" y="732" text-anchor="middle" class="caption">broker keeps claude alive</text>
+  </g>
+
+  <!-- Arrow 2 -> 3 -->
+  <line stroke="#0969da" stroke-width="3" x1="795" y1="490" x2="830" y2="490" marker-end="url(#arrow)"/>
+
+  <!-- Cell 3: Approve from phone -->
+  <g transform="translate(840, 100)">
+    <rect class="card" width="350" height="780" rx="8"/>
+    <circle class="badge" cx="32" cy="40" r="18"/>
+    <text x="32" y="48" text-anchor="middle" class="num">3</text>
+    <text x="60" y="48" class="title">Approve from phone</text>
+    <image href="REPLACE_ME_3" x="20" y="80" width="310" height="580" preserveAspectRatio="xMidYMid meet"/>
+    <text x="175" y="710" text-anchor="middle" class="caption">Tool prompt routes to Discord</text>
+    <text x="175" y="732" text-anchor="middle" class="caption">— tap ✓ Allow</text>
+  </g>
+
+  <!-- Arrow 3 -> 4 -->
+  <line stroke="#0969da" stroke-width="3" x1="1195" y1="490" x2="1230" y2="490" marker-end="url(#arrow)"/>
+
+  <!-- Cell 4: Back at desk -->
+  <g transform="translate(1240, 100)">
+    <rect class="card" width="350" height="780" rx="8"/>
+    <circle class="badge" cx="32" cy="40" r="18"/>
+    <text x="32" y="48" text-anchor="middle" class="num">4</text>
+    <text x="60" y="48" class="title">Back at desk</text>
+    <image href="REPLACE_ME_4" x="20" y="80" width="310" height="580" preserveAspectRatio="xMidYMid meet"/>
+    <text x="175" y="710" text-anchor="middle" class="caption">agentmux attach —</text>
+    <text x="175" y="732" text-anchor="middle" class="caption">full context replays</text>
+  </g>
+</svg>

@@ -11,6 +11,12 @@
   </p>
 </p>
 
+<p align="center">
+  <img src="docs/storyboard.svg" alt="agentmux:断开终端、在手机上审批工具调用、稍后重新接入" width="900">
+</p>
+
+<p align="center"><em>这是主线故事。其它功能与工程细节见下。</em></p>
+
 ---
 
 agentmux 把 Claude Code 改造成一个常驻的多会话后台服务。一个长期运行的 broker 守护进程为每个 session 持有一个 ConPTY 和它内部的 `claude` 子进程；查看器（`claude-attach.exe`）随用随开、随手关闭，不会打扰正在跑的模型。关掉终端窗口不会杀掉 session —— 下次重新打开、从菜单里选回那个 session，最近 ~512 KB 的 TUI 输出会被回放，看到的就是当前画面，而不是一个空白提示符。

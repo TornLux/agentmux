@@ -1,0 +1,316 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 720" role="img" aria-labelledby="title desc">
+  <title id="title">agentmux: detach your terminal, approve tool calls from your phone, reattach later</title>
+  <desc id="desc">A four-panel storyboard. Panel 1: a terminal showing claude waiting for a tool approval. Panel 2: a closed laptop in 3/4 view with a pulsing green broker-alive badge, plus a moon and zzz suggesting the user has stepped away. Panel 3: a phone displaying a Discord tool-request card with Allow and Deny buttons, a cursor pointing at Allow. Panel 4: the same terminal showing the curl command completed and claude explaining the response.</desc>
+
+  <defs>
+    <style>
+      .tagline      { font: 600 30px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; fill: #1f2328; }
+      .subtagline   { font: 400 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #656d76; }
+      .num          { font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #ffffff; }
+      .title        { font: 600 18px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #0969da; }
+      .caption      { font: 400 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #656d76; }
+      .term-mono    { font: 12px ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, "Liberation Mono", Menlo, monospace; }
+      .term-text    { fill: #c9d1d9; }
+      .term-dim     { fill: #6e7681; }
+      .term-prompt  { fill: #58a6ff; }
+      .term-warn    { fill: #d29922; }
+      .term-ok      { fill: #56d364; }
+      .term-orange  { fill: #d97757; }
+      .term-string  { fill: #a5d6ff; }
+      .card         { fill: #ffffff; stroke: #d1d9e0; stroke-width: 2; }
+      .badge        { fill: #0969da; }
+      .term-bg      { fill: #0d1117; }
+      .term-tb      { fill: #21262d; }
+      .phone-body   { fill: #1f2328; }
+      .discord-bg   { fill: #f6f8fa; }
+      .discord-card { fill: #ffffff; stroke: #d1d9e0; stroke-width: 1.5; }
+      .btn-allow    { fill: #1f883d; }
+      .btn-deny     { fill: #cf222e; }
+      .btn-text     { font: 600 11px -apple-system, BlinkMacSystemFont, sans-serif; fill: #ffffff; }
+      .discord-name { font: 600 11px -apple-system, BlinkMacSystemFont, sans-serif; fill: #1f2328; }
+      .discord-meta { font: 400 9px -apple-system, BlinkMacSystemFont, sans-serif; fill: #656d76; }
+      .discord-text { font: 11px -apple-system, BlinkMacSystemFont, sans-serif; fill: #1f2328; }
+      .discord-mono { font: 10px ui-monospace, SFMono-Regular, Consolas, monospace; fill: #1f2328; }
+      .laptop-top   { fill: #c1c8d1; stroke: #8c959f; stroke-width: 1.5; stroke-linejoin: round; }
+      .laptop-side  { fill: #8c959f; stroke: #6e7681; stroke-width: 1.5; stroke-linejoin: round; }
+      .laptop-base  { fill: #d0d7de; stroke: #8c959f; stroke-width: 1.5; stroke-linejoin: round; }
+      .laptop-logo  { fill: #ffffff; opacity: 0.7; }
+      .moon         { fill: #f7e08e; stroke: #d4a72c; stroke-width: 1.5; }
+      .moon-cut     { fill: #ffffff; }
+      .star         { fill: #f7e08e; }
+      .zz           { font: 700 26px -apple-system, BlinkMacSystemFont, sans-serif; fill: #8c959f; opacity: 0.7; }
+      .alive-pill   { fill: #2da44e; }
+      .alive-pill-text { font: 700 12px -apple-system, BlinkMacSystemFont, sans-serif; fill: #ffffff; letter-spacing: 0.3px; }
+      .pulse-halo   { fill: #2da44e; opacity: 0.3; }
+      .live-dot     { fill: #cf222e; }
+      .live-halo    { fill: #cf222e; opacity: 0.35; }
+      .live-text    { font: 600 9px -apple-system, BlinkMacSystemFont, sans-serif; fill: #ff7b72; letter-spacing: 0.5px; }
+      .ok-dot       { fill: #56d364; }
+      .ok-text      { font: 600 9px -apple-system, BlinkMacSystemFont, sans-serif; fill: #56d364; letter-spacing: 0.5px; }
+      .cursor       { fill: #ffffff; stroke: #1f2328; stroke-width: 2; stroke-linejoin: round; }
+      .tap-ring     { fill: none; stroke: #0969da; stroke-width: 2; opacity: 0.6; }
+    </style>
+    <marker id="arrow" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto">
+      <path d="M 0 0 L 14 7 L 0 14 z" fill="#0969da"/>
+    </marker>
+  </defs>
+
+  <!-- ===== Tagline + subtagline ===== -->
+  <text x="750" y="48" text-anchor="middle" class="tagline">Sessions outlive your terminal. And your desk.</text>
+  <text x="750" y="76" text-anchor="middle" class="subtagline">Run claude. Walk away. Stay in the loop.</text>
+
+  <!-- ===== Cell 1: At your desk ===== -->
+  <g transform="translate(30, 110)">
+    <rect class="card" width="330" height="580" rx="8"/>
+    <circle class="badge" cx="30" cy="36" r="16"/>
+    <text x="30" y="42" text-anchor="middle" class="num">1</text>
+    <text x="56" y="42" class="title">At your desk</text>
+
+    <!-- Terminal mockup -->
+    <g transform="translate(20, 70)">
+      <rect class="term-bg" width="290" height="430" rx="6"/>
+      <path class="term-tb" d="M 0,6 a 6,6 0 0 1 6,-6 L 284,0 a 6,6 0 0 1 6,6 L 290,26 L 0,26 Z"/>
+      <circle cx="12" cy="13" r="4.5" fill="#ff5f56"/>
+      <circle cx="26" cy="13" r="4.5" fill="#ffbd2e"/>
+      <circle cx="40" cy="13" r="4.5" fill="#27c93f"/>
+      <text x="145" y="17" text-anchor="middle" font-size="10" fill="#8b949e" font-family="-apple-system, sans-serif">claude-attach — demo</text>
+
+      <!-- "live" indicator in title bar -->
+      <circle cx="263" cy="13" r="4" class="live-halo"/>
+      <circle cx="263" cy="13" r="2.5" class="live-dot"/>
+      <text x="270" y="16" class="live-text">LIVE</text>
+
+      <!-- prompt -->
+      <text x="12" y="50" class="term-mono term-prompt">&gt; curl -s https://httpbin.org/get</text>
+      <text x="12" y="66" class="term-mono term-prompt">  | head -20, then explain.</text>
+
+      <!-- claude reasoning -->
+      <text x="12" y="92" class="term-mono term-orange">⏺</text>
+      <text x="28" y="92" class="term-mono term-text">I'll fetch that JSON and walk</text>
+      <text x="28" y="108" class="term-mono term-text">through the response fields.</text>
+
+      <!-- prior tool 1: Read (auto-allowed) -->
+      <text x="12" y="134" class="term-mono term-orange">⏺</text>
+      <text x="28" y="134" class="term-mono term-text">Read(httpbin docs/get.md)</text>
+      <text x="28" y="150" class="term-mono term-dim">└─ file not found</text>
+
+      <!-- prior tool 2: Glob (auto-allowed) -->
+      <text x="12" y="176" class="term-mono term-orange">⏺</text>
+      <text x="28" y="176" class="term-mono term-text">Glob(**/*httpbin*.json)</text>
+      <text x="28" y="192" class="term-mono term-dim">└─ 0 matches</text>
+
+      <!-- current tool: Bash (awaiting) -->
+      <text x="12" y="218" class="term-mono term-orange">⏺</text>
+      <text x="28" y="218" class="term-mono term-text">Bash(curl -s https://httpbin.org</text>
+      <text x="28" y="234" class="term-mono term-text">     /get | head -20)</text>
+      <text x="28" y="254" class="term-mono term-dim">└─ </text>
+      <text x="50" y="254" class="term-mono term-warn">awaiting permission…</text>
+
+      <!-- breathing cursor -->
+      <rect x="12" y="274" width="8" height="13" fill="#c9d1d9"/>
+
+      <!-- divider above hook status -->
+      <line x1="12" y1="368" x2="278" y2="368" stroke="#30363d" stroke-width="1"/>
+
+      <!-- pre-tool hook waiting indicator (more detailed) -->
+      <text x="12" y="386" class="term-mono term-dim" font-size="11">⠋ pre-tool hook · session demo · 0m 23s</text>
+      <text x="12" y="402" class="term-mono term-dim" font-size="11">  POST /tool-decision/4f3a-… pending</text>
+    </g>
+
+    <text x="165" y="528" text-anchor="middle" class="caption">Started a turn —</text>
+    <text x="165" y="548" text-anchor="middle" class="caption">claude is awaiting tool approval</text>
+  </g>
+
+  <!-- Arrow 1 → 2 -->
+  <line stroke="#0969da" stroke-width="3.5" x1="365" y1="380" x2="395" y2="380" marker-end="url(#arrow)"/>
+
+  <!-- ===== Cell 2: Walk away ===== -->
+  <g transform="translate(400, 110)">
+    <rect class="card" width="330" height="580" rx="8"/>
+    <circle class="badge" cx="30" cy="36" r="16"/>
+    <text x="30" y="42" text-anchor="middle" class="num">2</text>
+    <text x="56" y="42" class="title">Walk away</text>
+
+    <!-- night sky: moon + stars -->
+    <g transform="translate(245, 130)">
+      <circle r="34" class="moon"/>
+      <circle cx="-12" cy="-10" r="34" class="moon-cut"/>
+      <circle cx="-72" cy="-44" r="2.5" class="star"/>
+      <circle cx="-110" cy="-12" r="1.8" class="star"/>
+      <circle cx="-92" cy="44" r="2" class="star"/>
+      <circle cx="46" cy="-30" r="1.5" class="star"/>
+      <circle cx="38" cy="62" r="2.2" class="star"/>
+    </g>
+
+    <!-- floating zzz -->
+    <text x="50" y="240" class="zz" transform="rotate(-12 50 240)">z</text>
+    <text x="80" y="200" class="zz" font-size="22" transform="rotate(-12 80 200)">z</text>
+    <text x="105" y="170" class="zz" font-size="17" transform="rotate(-12 105 170)">z</text>
+
+    <!-- closed laptop, 3/4 perspective view -->
+    <g transform="translate(60, 290)">
+      <!-- shadow -->
+      <ellipse cx="115" cy="148" rx="115" ry="8" fill="#000" opacity="0.12"/>
+      <!-- laptop base (top face, slight perspective) -->
+      <path class="laptop-base" d="M 22,128 L 208,128 L 226,140 L 4,140 Z"/>
+      <!-- laptop side (visible 3/4) -->
+      <path class="laptop-side" d="M 4,140 L 226,140 L 226,144 L 4,144 Z"/>
+      <!-- laptop lid (closed top, 3/4 from above) -->
+      <path class="laptop-top" d="M 30,30 L 200,30 L 215,128 L 15,128 Z"/>
+      <!-- subtle Apple-style logo on lid (but generic apple shape) -->
+      <circle cx="115" cy="78" r="14" class="laptop-logo"/>
+      <rect x="113" y="62" width="4" height="6" rx="2" class="laptop-logo"/>
+      <!-- hinge line -->
+      <line x1="22" y1="128" x2="208" y2="128" stroke="#6e7681" stroke-width="1"/>
+    </g>
+
+    <!-- broker · alive pill badge -->
+    <g transform="translate(95, 470)">
+      <rect class="alive-pill" width="140" height="32" rx="16"/>
+      <circle cx="20" cy="16" r="9" class="pulse-halo"/>
+      <circle cx="20" cy="16" r="5" fill="#ffffff"/>
+      <text x="78" y="21" text-anchor="middle" class="alive-pill-text">broker · alive</text>
+    </g>
+
+    <text x="165" y="528" text-anchor="middle" class="caption">Closed the terminal —</text>
+    <text x="165" y="548" text-anchor="middle" class="caption">broker keeps claude alive</text>
+  </g>
+
+  <!-- Arrow 2 → 3 -->
+  <line stroke="#0969da" stroke-width="3.5" x1="735" y1="380" x2="765" y2="380" marker-end="url(#arrow)"/>
+
+  <!-- ===== Cell 3: Approve from phone ===== -->
+  <g transform="translate(770, 110)">
+    <rect class="card" width="330" height="580" rx="8"/>
+    <circle class="badge" cx="30" cy="36" r="16"/>
+    <text x="30" y="42" text-anchor="middle" class="num">3</text>
+    <text x="56" y="42" class="title">Approve from phone</text>
+
+    <!-- Phone -->
+    <g transform="translate(60, 75)">
+      <!-- phone outer body -->
+      <rect class="phone-body" width="210" height="430" rx="28"/>
+      <!-- screen background -->
+      <rect class="discord-bg" x="6" y="22" width="198" height="386" rx="6"/>
+      <!-- dynamic island -->
+      <rect class="phone-body" x="83" y="6" width="44" height="14" rx="7"/>
+
+      <!-- Discord channel header -->
+      <rect fill="#5865f2" x="6" y="22" width="198" height="32"/>
+      <text x="105" y="42" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff" font-family="-apple-system, sans-serif">#agentmux</text>
+
+      <!-- bot row -->
+      <g transform="translate(14, 70)">
+        <!-- avatar -->
+        <circle cx="14" cy="14" r="13" fill="#5865f2"/>
+        <text x="14" y="18" text-anchor="middle" font-size="13" font-weight="700" fill="#ffffff" font-family="-apple-system, sans-serif">a</text>
+        <text x="34" y="13" class="discord-name">agentmux</text>
+        <rect x="92" y="3" width="22" height="11" rx="2" fill="#5865f2"/>
+        <text x="103" y="11" text-anchor="middle" font-size="7" font-weight="700" fill="#ffffff" font-family="-apple-system, sans-serif">BOT</text>
+        <text x="120" y="13" class="discord-meta">just now</text>
+
+        <!-- card body -->
+        <rect class="discord-card" x="34" y="22" width="148" height="220" rx="6"/>
+        <!-- accent stripe down the left edge of the card (Discord embed style) -->
+        <rect fill="#0969da" x="34" y="22" width="3" height="220" rx="1"/>
+
+        <text x="46" y="42" class="discord-text" font-weight="600">🔧 Tool request</text>
+        <text x="46" y="58" class="discord-meta">session: demo</text>
+
+        <text x="46" y="80" class="discord-mono" font-weight="600">Bash:</text>
+        <rect x="46" y="86" width="124" height="56" rx="3" fill="#f6f8fa" stroke="#eaeef2"/>
+        <text x="52" y="100" class="discord-mono">curl -s https://</text>
+        <text x="52" y="114" class="discord-mono">  httpbin.org/get</text>
+        <text x="52" y="128" class="discord-mono">  | head -20</text>
+
+        <text x="46" y="160" class="discord-meta" font-weight="600">cwd: ~/projects/demo</text>
+        <text x="46" y="174" class="discord-meta">user: you (whitelisted)</text>
+
+        <!-- buttons -->
+        <rect class="btn-allow" x="46" y="188" width="64" height="28" rx="5"/>
+        <text x="78" y="206" text-anchor="middle" class="btn-text">✓ Allow</text>
+        <rect class="btn-deny" x="116" y="188" width="58" height="28" rx="5"/>
+        <text x="145" y="206" text-anchor="middle" class="btn-text">✕ Deny</text>
+      </g>
+
+      <!-- iOS-style home indicator at bottom of phone screen -->
+      <rect x="80" y="416" width="50" height="3" rx="1.5" fill="#c1c8d1"/>
+
+      <!-- cursor pointer + tap rings, on the Allow button -->
+      <g transform="translate(96, 282)">
+        <!-- expanding tap rings -->
+        <circle cx="0" cy="0" r="14" class="tap-ring"/>
+        <circle cx="0" cy="0" r="22" class="tap-ring" opacity="0.35"/>
+        <!-- cursor (white pointer with black outline) -->
+        <path class="cursor" d="M 0 0 L 0 18 L 5 14 L 9 22 L 12 21 L 8 13 L 14 13 Z"/>
+      </g>
+    </g>
+
+    <text x="165" y="528" text-anchor="middle" class="caption">Tool prompt routes to Discord —</text>
+    <text x="165" y="548" text-anchor="middle" class="caption">tap ✓ Allow from anywhere</text>
+  </g>
+
+  <!-- Arrow 3 → 4 -->
+  <line stroke="#0969da" stroke-width="3.5" x1="1105" y1="380" x2="1135" y2="380" marker-end="url(#arrow)"/>
+
+  <!-- ===== Cell 4: Back at desk ===== -->
+  <g transform="translate(1140, 110)">
+    <rect class="card" width="330" height="580" rx="8"/>
+    <circle class="badge" cx="30" cy="36" r="16"/>
+    <text x="30" y="42" text-anchor="middle" class="num">4</text>
+    <text x="56" y="42" class="title">Back at desk</text>
+
+    <!-- Terminal mockup (after) -->
+    <g transform="translate(20, 70)">
+      <rect class="term-bg" width="290" height="430" rx="6"/>
+      <path class="term-tb" d="M 0,6 a 6,6 0 0 1 6,-6 L 284,0 a 6,6 0 0 1 6,6 L 290,26 L 0,26 Z"/>
+      <circle cx="12" cy="13" r="4.5" fill="#ff5f56"/>
+      <circle cx="26" cy="13" r="4.5" fill="#ffbd2e"/>
+      <circle cx="40" cy="13" r="4.5" fill="#27c93f"/>
+      <text x="145" y="17" text-anchor="middle" font-size="10" fill="#8b949e" font-family="-apple-system, sans-serif">claude-attach — demo</text>
+
+      <!-- "ok" indicator in title bar -->
+      <circle cx="263" cy="13" r="3" class="ok-dot"/>
+      <text x="270" y="16" class="ok-text">DONE</text>
+
+      <text x="12" y="50" class="term-mono term-orange">⏺</text>
+      <text x="28" y="50" class="term-mono term-text">Bash(curl -s https://httpbin.org/get</text>
+      <text x="28" y="66" class="term-mono term-text">     | head -20)</text>
+      <text x="28" y="86" class="term-mono term-dim">└─ </text>
+      <text x="50" y="86" class="term-mono term-ok">HTTP/1.1 200 OK</text>
+      <text x="50" y="102" class="term-mono term-text">{</text>
+      <text x="50" y="118" class="term-mono term-text">  </text>
+      <text x="68" y="118" class="term-mono term-string">"args"</text>
+      <text x="108" y="118" class="term-mono term-text">: {},</text>
+      <text x="50" y="134" class="term-mono term-text">  </text>
+      <text x="68" y="134" class="term-mono term-string">"headers"</text>
+      <text x="124" y="134" class="term-mono term-text">: {</text>
+      <text x="50" y="150" class="term-mono term-text">    </text>
+      <text x="86" y="150" class="term-mono term-string">"Host"</text>
+      <text x="122" y="150" class="term-mono term-text">: </text>
+      <text x="138" y="150" class="term-mono term-string">"httpbin.org"</text>
+      <text x="50" y="166" class="term-mono term-text">  },</text>
+      <text x="50" y="182" class="term-mono term-text">  </text>
+      <text x="68" y="182" class="term-mono term-string">"url"</text>
+      <text x="100" y="182" class="term-mono term-text">: </text>
+      <text x="116" y="182" class="term-mono term-string">"https://…"</text>
+      <text x="50" y="198" class="term-mono term-text">}</text>
+
+      <text x="12" y="230" class="term-mono term-orange">⏺</text>
+      <text x="28" y="230" class="term-mono term-text">The endpoint echoed back our</text>
+      <text x="28" y="246" class="term-mono term-text">request — args is empty, headers</text>
+      <text x="28" y="262" class="term-mono term-text">includes Host &amp; User-Agent, and</text>
+      <text x="28" y="278" class="term-mono term-text">url has the absolute path we hit.</text>
+
+      <!-- prompt waiting for next turn -->
+      <text x="12" y="312" class="term-mono term-prompt">&gt; </text>
+      <rect x="22" y="302" width="8" height="13" fill="#c9d1d9"/>
+
+      <text x="12" y="408" class="term-mono term-dim" font-size="11">512 KB ring · 1 viewer · session live</text>
+    </g>
+
+    <text x="165" y="528" text-anchor="middle" class="caption">agentmux attach —</text>
+    <text x="165" y="548" text-anchor="middle" class="caption">full context replays, claude continues</text>
+  </g>
+</svg>
