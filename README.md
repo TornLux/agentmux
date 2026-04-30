@@ -258,12 +258,12 @@ bash scripts/build-release.sh
 `build-release.sh` detects the host OS + architecture via `uname` and
 names the tarball accordingly; one script handles all three Unix
 targets. Pushing a `v*` tag triggers `.github/workflows/release.yml`,
-which runs the three packaging scripts in parallel — Windows zip on a
-`windows-latest` runner, Linux tarball on `ubuntu-latest`, macOS
-tarball on `macos-latest` (Apple Silicon by default) — and attaches
-all archives plus their `.sha256` checksums to a single GitHub
-Release. (`workflow_dispatch` is also wired so you can fire it
-manually.)
+which runs four packaging jobs in parallel — Windows zip on
+`windows-latest`, Linux tarball on `ubuntu-latest`, Apple Silicon
+tarball on `macos-latest`, Intel Mac tarball on `macos-13` — and
+attaches all four archives plus their `.sha256` checksums to a single
+GitHub Release. (`workflow_dispatch` is also wired so you can fire
+it manually.)
 
 ### 8. Add the Windows Terminal profile (optional)
 
