@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 shared = { path = "../shared" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "net", "io-std", "sync", "time"] }
+interprocess = { version = "2", features = ["tokio"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde = { version = "1", features = ["derive"] }

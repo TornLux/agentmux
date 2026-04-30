@@ -19,7 +19,11 @@ pub struct Config {
     /// `host:port` the broker's HTTP control plane binds to. Both
     /// broker (listen) and viewer (resolve via http_url()) read this.
     pub http_addr: String,
-    /// Win32 named pipe path. Must match between broker and viewer.
+    /// Local-socket name shared by broker and viewer. Bare name (no
+    /// `\\.\pipe\` prefix) — interprocess maps it to
+    /// `\\.\pipe\Local\<name>` on Windows and `/tmp/<name>.sock` on
+    /// Unix. Legacy `\\.\pipe\<name>` values from older configs are
+    /// auto-stripped on load with a warning.
     pub pipe_name: String,
     /// argv used when broker starts a fresh session. Overridden by
     /// `broker.exe ... <override>` on the broker CLI.
@@ -65,7 +69,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             http_addr: "127.0.0.1:8765".to_string(),
-            pipe_name: r"\\.\pipe\claude-broker".to_string(),
+            pipe_name: "claude-broker".to_string(),
             default_command: vec![
                 "claude".to_string(),
                 "--dangerously-skip-permissions".to_string(),
@@ -103,7 +107,10 @@ impl Config {
     fn load_path(path: &std::path::Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(content) => match toml::from_str::<Self>(&content) {
-                Ok(cfg) => cfg,
+                Ok(mut cfg) => {
+                    cfg.normalize_pipe_name();
+                    cfg
+                }
                 Err(e) => {
                     eprintln!("config parse error in {}: {e}", path.display());
                     eprintln!("  → falling back to defaults");
@@ -114,6 +121,24 @@ impl Config {
                 eprintln!("config read error in {}: {e}", path.display());
                 Self::default()
             }
+        }
+    }
+
+    /// Strip a legacy `\\.\pipe\` prefix from `pipe_name` if present.
+    /// Pre-interprocess builds wrote the full Win32 pipe path into
+    /// config; the new transport takes a bare namespace name and
+    /// expands it to `\\.\pipe\Local\<name>` on Windows or
+    /// `/tmp/<name>.sock` on Unix. Stripping is silent-but-warned so
+    /// existing configs keep working without manual edits.
+    fn normalize_pipe_name(&mut self) {
+        const LEGACY_PREFIX: &str = r"\\.\pipe\";
+        if let Some(stripped) = self.pipe_name.strip_prefix(LEGACY_PREFIX) {
+            eprintln!(
+                "config: pipe_name '{}' uses legacy \\\\.\\pipe\\ prefix — \
+                 stripping to '{}'. Update your config.toml to silence this.",
+                self.pipe_name, stripped
+            );
+            self.pipe_name = stripped.to_string();
         }
     }
 
@@ -218,7 +243,7 @@ mod tests {
     fn defaults_match_legacy_constants() {
         let c = Config::default();
         assert_eq!(c.http_addr, "127.0.0.1:8765");
-        assert_eq!(c.pipe_name, r"\\.\pipe\claude-broker");
+        assert_eq!(c.pipe_name, "claude-broker");
         assert_eq!(c.default_command[0], "claude");
         assert_eq!(c.ring_cap_bytes, 512 * 1024);
         assert_eq!(c.http_url(), "http://127.0.0.1:8765");
@@ -245,7 +270,7 @@ mod tests {
         let toml_src = r#"http_addr = "127.0.0.1:9999""#;
         let c: Config = toml::from_str(toml_src).unwrap();
         assert_eq!(c.http_addr, "127.0.0.1:9999");
-        assert_eq!(c.pipe_name, r"\\.\pipe\claude-broker"); // default
+        assert_eq!(c.pipe_name, "claude-broker"); // default
         assert_eq!(c.default_command[0], "claude"); // default
     }
 
@@ -253,7 +278,7 @@ mod tests {
     fn full_toml_overrides_everything() {
         let toml_src = r#"
 http_addr = "0.0.0.0:1234"
-pipe_name = '\\.\pipe\test-pipe'
+pipe_name = "test-pipe"
 default_command = ["pwsh.exe", "-NoLogo"]
 ring_cap_bytes = 65536
 hibernate_idle_secs = 0
@@ -266,7 +291,7 @@ default_cwd = "C:\\projects\\me"
 "#;
         let c: Config = toml::from_str(toml_src).unwrap();
         assert_eq!(c.http_addr, "0.0.0.0:1234");
-        assert_eq!(c.pipe_name, r"\\.\pipe\test-pipe");
+        assert_eq!(c.pipe_name, "test-pipe");
         assert_eq!(c.default_command, vec!["pwsh.exe", "-NoLogo"]);
         assert_eq!(c.ring_cap_bytes, 65536);
         assert_eq!(c.hibernate_idle_secs, 0);
@@ -306,6 +331,24 @@ default_cwd = "C:\\projects\\me"
         let (resolved, src) = c.resolve_default_cwd(fallback.clone());
         assert_eq!(resolved, fallback);
         assert_eq!(src, DefaultCwdSource::ConfiguredButMissing);
+    }
+
+    #[test]
+    fn normalize_strips_legacy_pipe_prefix() {
+        let mut c = Config::default();
+        c.pipe_name = r"\\.\pipe\old-style-name".to_string();
+        c.normalize_pipe_name();
+        assert_eq!(c.pipe_name, "old-style-name");
+
+        // Idempotent — re-running on a bare name leaves it alone.
+        c.normalize_pipe_name();
+        assert_eq!(c.pipe_name, "old-style-name");
+
+        // Bare names are unchanged.
+        let mut bare = Config::default();
+        bare.pipe_name = "already-bare".to_string();
+        bare.normalize_pipe_name();
+        assert_eq!(bare.pipe_name, "already-bare");
     }
 
     #[test]

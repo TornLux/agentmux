@@ -28,8 +28,10 @@ use shared::frame::{
     encode_control, encode_hello, encode_resize, read_frame, write_frame, HelloPayload,
     CTRL_RESTART, CTRL_SHUTDOWN, TAG_CONTROL, TAG_HELLO, TAG_PTY_DATA, TAG_RESIZE,
 };
+use interprocess::local_socket::tokio::Stream as LocalStream;
+use interprocess::local_socket::traits::tokio::Stream as TokioStreamTrait;
+use interprocess::local_socket::{GenericNamespaced, ToNsName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tokio::sync::mpsc;
 
 mod console;
@@ -526,10 +528,13 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-async fn connect_with_retry(pipe_name: &str) -> Result<NamedPipeClient> {
+async fn connect_with_retry(pipe_name: &str) -> Result<LocalStream> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match ClientOptions::new().open(pipe_name) {
+        let ns_name = pipe_name
+            .to_ns_name::<GenericNamespaced>()
+            .with_context(|| format!("encode local-socket name {pipe_name}"))?;
+        match LocalStream::connect(ns_name).await {
             Ok(c) => return Ok(c),
             Err(e) if Instant::now() < deadline => {
                 eprintln!("waiting for broker… ({e})");
@@ -542,7 +547,7 @@ async fn connect_with_retry(pipe_name: &str) -> Result<NamedPipeClient> {
 
 async fn writer_task(
     mut frame_rx: mpsc::Receiver<(u8, Vec<u8>)>,
-    mut w: tokio::io::WriteHalf<NamedPipeClient>,
+    mut w: tokio::io::WriteHalf<LocalStream>,
 ) {
     while let Some((tag, payload)) = frame_rx.recv().await {
         if write_frame(&mut w, tag, &payload).await.is_err() {
@@ -699,7 +704,7 @@ async fn size_poller(stdout_h: SendHandle, frame_tx: mpsc::Sender<(u8, Vec<u8>)>
     }
 }
 
-async fn frames_to_stdout(mut r: tokio::io::ReadHalf<NamedPipeClient>) {
+async fn frames_to_stdout(mut r: tokio::io::ReadHalf<LocalStream>) {
     let mut stdout = tokio::io::stdout();
     loop {
         match read_frame(&mut r).await {

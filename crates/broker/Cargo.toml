@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 shared = { path = "../shared" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
+interprocess = { version = "2", features = ["tokio"] }
 portable-pty = "0.8"
 axum = { version = "0.7", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }

@@ -4,7 +4,7 @@ pub mod config;
 pub mod frame;
 pub mod http;
 
-pub const PIPE_NAME: &str = r"\\.\pipe\claude-broker";
+pub const PIPE_NAME: &str = "claude-broker";
 
 /// Default broker HTTP control plane address. Hooks read
 /// `AGENT_BROKER_URL` first; this is the fallback.

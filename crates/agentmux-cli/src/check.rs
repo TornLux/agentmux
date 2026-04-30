@@ -83,8 +83,12 @@ fn check_broker(path: &Path, had_failure: &mut bool) -> Result<()> {
         }
     }
     if let Some(pipe) = doc.get("pipe_name").and_then(|v| v.as_str()) {
-        if !pipe.starts_with(r"\\.\pipe\") {
-            println!(r"⚠ broker.pipe_name={pipe:?} should start with \\.\pipe\");
+        if let Some(stripped) = pipe.strip_prefix(r"\\.\pipe\") {
+            println!(
+                "⚠ broker.pipe_name={pipe:?} uses legacy \\\\.\\pipe\\ prefix — \
+                 broker auto-strips it to {stripped:?} on load. Update config.toml \
+                 to silence this warning."
+            );
         } else {
             println!("✓ pipe_name = {pipe}");
         }

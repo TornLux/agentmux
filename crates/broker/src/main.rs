@@ -30,7 +30,9 @@ use shared::frame::{
     write_frame, HelloPayload, CTRL_INTERRUPT, CTRL_RESTART, CTRL_SHUTDOWN, TAG_CONTROL,
     TAG_HELLO, TAG_PTY_DATA, TAG_REPLAY_END, TAG_RESIZE,
 };
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use interprocess::local_socket::tokio::Stream as LocalStream;
+use interprocess::local_socket::traits::tokio::Listener as TokioListenerTrait;
+use interprocess::local_socket::{GenericNamespaced, ListenerOptions, ToNsName};
 use tokio::sync::{broadcast, watch};
 use tracing::{error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -648,20 +650,19 @@ fn ct_eq_str(a: &str, b: &str) -> bool {
 
 async fn run_pipe_server(manager: Arc<Manager>, app_state: AppState) -> Result<()> {
     let pipe_name = app_state.config.pipe_name.clone();
-    info!("listening on {}", pipe_name);
-    let mut server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(&pipe_name)
-        .with_context(|| format!("create pipe {pipe_name}"))?;
+    info!("listening on local socket {}", pipe_name);
+    let ns_name = pipe_name
+        .clone()
+        .to_ns_name::<GenericNamespaced>()
+        .with_context(|| format!("encode local-socket name {pipe_name}"))?;
+    let listener = ListenerOptions::new()
+        .name(ns_name)
+        .create_tokio()
+        .with_context(|| format!("bind local socket {pipe_name}"))?;
     let next_id = Arc::new(AtomicU64::new(1));
 
     loop {
-        server.connect().await.context("pipe connect")?;
-        let connected = server;
-        server = ServerOptions::new()
-            .create(&pipe_name)
-            .context("re-create pipe")?;
-
+        let connected = listener.accept().await.context("local socket accept")?;
         let viewer_id = next_id.fetch_add(1, Ordering::Relaxed);
         let manager = manager.clone();
         let app_state = app_state.clone();
@@ -671,7 +672,7 @@ async fn run_pipe_server(manager: Arc<Manager>, app_state: AppState) -> Result<(
 
 async fn handle_client(
     viewer_id: u64,
-    pipe: NamedPipeServer,
+    pipe: LocalStream,
     manager: Arc<Manager>,
     app_state: AppState,
 ) {
@@ -791,7 +792,7 @@ async fn handle_client(
 }
 
 async fn wait_for_hello(
-    reader: &mut tokio::io::ReadHalf<NamedPipeServer>,
+    reader: &mut tokio::io::ReadHalf<LocalStream>,
     manager: &Arc<Manager>,
     viewer_id: u64,
 ) -> Option<(Arc<Session>, HelloPayload)> {

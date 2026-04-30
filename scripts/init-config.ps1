@@ -44,8 +44,9 @@ $content = @'
 # their broker URL from http://<this>.
 # http_addr = "127.0.0.1:8765"
 
-# Win32 named pipe path. Must match between broker and viewer.
-# pipe_name = '\\.\pipe\claude-broker'
+# Local-socket name shared by broker and viewer. Bare name; broker
+# expands to \\.\pipe\Local\<name> on Windows, /tmp/<name>.sock on Unix.
+# pipe_name = "claude-broker"
 
 # argv used when broker starts a fresh session. The command after
 # broker.exe on the CLI overrides this value at runtime.

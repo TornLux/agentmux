@@ -221,6 +221,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
+ "interprocess",
  "portable-pty",
  "serde",
  "serde_json",
@@ -332,6 +333,7 @@ version = "0.3.2"
 dependencies = [
  "anyhow",
  "futures-util",
+ "interprocess",
  "serde",
  "serde_json",
  "shared",
