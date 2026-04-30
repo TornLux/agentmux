@@ -346,6 +346,20 @@ async fn relay_tool_request(
             return;
         }
     };
+    // When a local viewer (claude-attach or web) is watching the session,
+    // suppress the Discord prompt — broker still broadcasts the event so
+    // tray/web surfaces handle the approval; Discord would just be noise.
+    if event
+        .get("local_viewer_attached")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        info!(
+            "tool_request id={} skipped: local viewer attached to session {}",
+            request_id, session_name
+        );
+        return;
+    }
     let tool_name = event
         .get("tool_name")
         .and_then(|v| v.as_str())

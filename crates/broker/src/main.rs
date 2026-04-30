@@ -1199,16 +1199,26 @@ async fn http_tool_request(
         .unwrap()
         .insert(request_id.clone(), tx);
 
-    // Lookup human-friendly session name for nicer downstream UX.
-    let session_name = s
+    // Lookup human-friendly session name + check whether a local viewer
+    // is currently watching. The latter rides on the broadcast event so
+    // remote-IM subscribers (Discord) can self-suppress when the user is
+    // already at a viewer; tray/web subscribers ignore the field and keep
+    // showing approval UI as usual.
+    let (session_name, local_viewer_attached) = s
         .manager
         .get_by_id_or_name(&body.session_id)
-        .map(|sess| sess.name.clone())
-        .unwrap_or_else(|| body.session_id.clone());
+        .map(|sess| {
+            let attached = sess.attached_clients();
+            let local = attached
+                .iter()
+                .any(|c| c.client_kind == "terminal" || c.client_kind == "web");
+            (sess.name.clone(), local)
+        })
+        .unwrap_or_else(|| (body.session_id.clone(), false));
 
     info!(
-        "/tool-request id={} session={} tool={}",
-        request_id, session_name, body.tool_name
+        "/tool-request id={} session={} tool={} local_viewer={}",
+        request_id, session_name, body.tool_name, local_viewer_attached
     );
 
     // Broadcast so subscribers (Discord bot etc.) can prompt the user.
@@ -1219,6 +1229,7 @@ async fn http_tool_request(
         "session_name": session_name,
         "tool_name": body.tool_name,
         "tool_input": body.tool_input,
+        "local_viewer_attached": local_viewer_attached,
     });
     let _ = s.event_bus.send(event.clone());
     s.events.append(event);
