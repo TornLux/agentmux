@@ -12,24 +12,11 @@ on:
         default: ""
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
     timeout-minutes: 30
-
-    permissions:
-      contents: write   # needed to create the GitHub release
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Resolve tag
-        id: tag
-        shell: pwsh
-        run: |
-          $tag = "${{ github.event.inputs.tag }}"
-          if (-not $tag) { $tag = "${{ github.ref_name }}" }
-          if (-not $tag) { throw "no tag provided" }
-          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -39,7 +26,7 @@ jobs:
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release
+          shared-key: release-windows
 
       - name: Build release zip
         shell: pwsh
@@ -55,6 +42,85 @@ jobs:
           "$hash  $($zip.Name)" | Out-File -FilePath "dist\$($zip.BaseName).sha256" -Encoding ascii
           Write-Host "sha256: $hash"
 
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  build-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux
+
+      - name: Build release tarball
+        run: |
+          bash scripts/build-release.sh
+          ls -la dist/
+
+      - name: Compute SHA256
+        run: |
+          archive=$(ls dist/*.tar.gz | head -n1)
+          hash=$(sha256sum "$archive" | awk '{ print $1 }')
+          base=$(basename "$archive" .tar.gz)
+          printf "%s  %s\n" "$hash" "$(basename "$archive")" > "dist/${base}.sha256"
+          echo "sha256: $hash"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # needed to create the GitHub release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          tag="${{ github.event.inputs.tag }}"
+          if [ -z "$tag" ]; then tag="${{ github.ref_name }}"; fi
+          if [ -z "$tag" ]; then echo "no tag provided" >&2; exit 1; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage release files
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.sha256' \) \
+              -exec cp -v {} release-assets/ \;
+          ls -la release-assets/
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -63,5 +129,6 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            dist/*.zip
-            dist/*.sha256
+            release-assets/*.zip
+            release-assets/*.tar.gz
+            release-assets/*.sha256
