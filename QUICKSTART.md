@@ -555,7 +555,11 @@ To bring it back:
 
 ## Going further
 
-The full architecture and design rationale live in [PLAN.md](PLAN.md). The
-[README](README.md) covers the HTTP control plane, configuration tables for
-broker and Discord configs, the wire protocol between viewer and broker, and
-how to add new IM platforms.
+The [README](README.md) covers the HTTP control plane, configuration tables
+for broker and Discord configs, the wire protocol between viewer and broker,
+and how to add new IM platforms.
+
+For contributors / future maintainers: the architecture's *why*, the protocol
+wire formats, and an unimplemented P2P-attach proposal live in
+[docs/PLAN.md](docs/PLAN.md). It's a Chinese-language design log — new users
+don't need to read it.

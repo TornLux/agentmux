@@ -21,7 +21,6 @@
 #          hook-posttool,platform-discord,agentmux-cli}
 #     README.md
 #     QUICKSTART.md
-#     PLAN.md
 #     LICENSE-MIT
 #     LICENSE-APACHE
 #
@@ -139,7 +138,7 @@ for b in "${BINARIES[@]}"; do
     echo "  + bin/$b"
 done
 
-for f in README.md QUICKSTART.md PLAN.md LICENSE-MIT LICENSE-APACHE; do
+for f in README.md QUICKSTART.md LICENSE-MIT LICENSE-APACHE; do
     if [[ -f "$ROOT/$f" ]]; then
         cp "$ROOT/$f" "$STAGE_ROOT/"
         echo "  + $f"

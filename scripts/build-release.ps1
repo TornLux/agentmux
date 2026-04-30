@@ -8,7 +8,6 @@
 #     agentmux.ps1
 #     README.md
 #     QUICKSTART.md
-#     PLAN.md
 #
 # Then zips it to ./dist/agentmux-vX.Y.Z-windows-x86_64.zip.
 #
@@ -104,7 +103,7 @@ try {
     }
 
     # top-level files
-    foreach ($f in @("agentmux.ps1", "README.md", "QUICKSTART.md", "PLAN.md", "LICENSE-MIT", "LICENSE-APACHE")) {
+    foreach ($f in @("agentmux.ps1", "README.md", "QUICKSTART.md", "LICENSE-MIT", "LICENSE-APACHE")) {
         $src = Join-Path $root $f
         if (Test-Path $src) {
             Copy-Item $src $stageRoot

@@ -1,5 +1,19 @@
 # agentmux 实施方案
 
+> **Reader navigation.** This is an internal Chinese-language design log
+> capturing the *why* behind agentmux's architecture, the protocol
+> wire formats, and the phase-by-phase implementation history. It also
+> hosts the unimplemented P2P-attach proposal (Appendix D).
+>
+> - **Are you a new user?** Skip this file. Read [README.md](../README.md)
+>   or [QUICKSTART.md](../QUICKSTART.md) instead — both are bilingual.
+> - **Are you a contributor or future maintainer?** Read on; this is
+>   the canonical record of design decisions and tradeoffs.
+> - **Phase status (§6) may be slightly stale** — several items
+>   originally marked `⏸ 跳过` have since been completed (Discord
+>   bridge, IM command system, demote/adopt, etc.). Trust git log
+>   over phase ticks.
+
 ## 0. 项目目标
 
 把本地的 Claude Code 改造成一个"始终在线的多会话 agent 服务":

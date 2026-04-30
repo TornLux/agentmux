@@ -405,7 +405,10 @@ agentmux/
 │   └── terminal-profile.json
 ├── .github/workflows/
 │   └── release.yml         # Tag-triggered Windows + Linux build → GitHub release
-└── PLAN.md                 # Design doc + phase-by-phase implementation log
+└── docs/
+    ├── storyboard.svg      # README hero illustration
+    ├── storyboard/         # screenshot pipeline (advanced)
+    └── PLAN.md             # Design doc + phase log (Chinese; contributor-only)
 ```
 
 ## Requirements

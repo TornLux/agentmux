@@ -355,7 +355,10 @@ agentmux/
 │   └── terminal-profile.json
 ├── .github/workflows/
 │   └── release.yml         # tag 触发 Windows + Linux 自动构建 + GitHub release
-└── PLAN.md                 # 设计文档 + 阶段实施日志
+└── docs/
+    ├── storyboard.svg      # README 顶部 hero 插画
+    ├── storyboard/         # 截图驱动 storyboard 的可选 pipeline
+    └── PLAN.md             # 设计文档 + 阶段日志(中文,contributor 阅读)
 ```
 
 ## 系统要求
