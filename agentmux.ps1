@@ -211,6 +211,7 @@ Daily ops
                         Start broker + tray + Discord bot (if configured)
   start --foreground    Start broker in the current shell (Ctrl+C to stop)
   stop                  Stop broker, tray, and Discord bot
+  restart               Stop + start (reloads config.toml / discord.toml)
   status                Show what's running and active sessions
   attach [name]         Open a local terminal viewer (named pipe)
                         --broker http://host:port --token <t>: connect over LAN
@@ -300,6 +301,21 @@ Usage: .\agentmux stop
   Stops platform-discord, agentmux-tray, and broker (via the PID
   file under %LOCALAPPDATA%\agentmux\). Safe to run when nothing is
   running — exits cleanly.
+"@
+        }
+        "restart" {
+            @"
+Usage: .\agentmux restart [--no-tray] [--no-discord]
+
+  Stops the whole stack (broker + tray + Discord) and starts it again.
+  Use after editing config.toml or discord.toml so all three processes
+  reload their settings — config changes do not take effect mid-run.
+
+  Same flags as `start` are accepted and forwarded.
+
+  Discord users with /reload and tray users with "Restart agentmux"
+  trigger this same flow remotely (broker spawns a detached respawner
+  before exiting, then the script re-runs).
 "@
         }
         "status" {
@@ -732,6 +748,18 @@ function Cmd-Stop([string[]]$Argv) {
         Write-Host "stopped agentmux-tray (pid $($_.Id))"
     }
     & (Join-Path $scriptsDir "stop-broker.ps1")
+}
+
+function Cmd-Restart([string[]]$Argv) {
+    if (Wants-Help $Argv) { Show-VerbHelp "restart"; return }
+    # Stop everything (broker + discord + tray) then start fresh so all
+    # three reload their config from disk. Used after editing config.toml
+    # / discord.toml — same effect as `.\agentmux stop; .\agentmux start`.
+    Cmd-Stop @()
+    # Brief pause so OS handle release (PID file, named pipe, port)
+    # finishes before start tries to claim them again.
+    Start-Sleep -Milliseconds 500
+    Cmd-Start $Argv
 }
 
 function Cmd-Status([string[]]$Argv) {
@@ -1421,6 +1449,7 @@ switch ($Command) {
     "init"    { Cmd-Init    $Rest }
     "start"   { Cmd-Start   $Rest }
     "stop"    { Cmd-Stop    $Rest }
+    "restart" { Cmd-Restart $Rest }
     "status"  { Cmd-Status  $Rest }
     "attach"  { Cmd-Attach  $Rest }
     "logs"    { Cmd-Logs    $Rest }

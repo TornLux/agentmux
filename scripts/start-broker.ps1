@@ -107,6 +107,15 @@ if (Test-Path -LiteralPath $pidFile) {
 
 if (-not $env:RUST_LOG) { $env:RUST_LOG = "info" }
 
+# Plumb the launcher path so broker's POST /restart-agentmux endpoint
+# (called by Discord /reload and tray "Restart agentmux") knows which
+# script to re-invoke after it shuts itself down. Without this env, the
+# endpoint returns 503 and the user must restart from the CLI.
+$launcher = Join-Path $root "agentmux.ps1"
+if (Test-Path -LiteralPath $launcher) {
+    $env:AGENTMUX_LAUNCHER = (Resolve-Path -LiteralPath $launcher).Path
+}
+
 if ($Foreground) {
     Write-Host "broker:   foreground (Ctrl+C to stop, cwd $WorkingDirectory)"
     Push-Location $WorkingDirectory

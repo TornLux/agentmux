@@ -101,6 +101,16 @@ impl BrokerClient {
         Ok(())
     }
 
+    /// Trigger a whole-stack restart. Returns OK once broker has
+    /// detached the respawner — broker may already be exiting by the
+    /// time the response arrives, so the WS subscriber will reconnect
+    /// to the new broker on its own.
+    pub async fn restart_agentmux(&self) -> Result<()> {
+        let url = format!("{}/restart-agentmux", self.cfg.http_url());
+        self.http.post(&url).send().await?.error_for_status()?;
+        Ok(())
+    }
+
     /// Re-adopt a `LocallyOwned` session: broker spawns claude with
     /// `--resume <stored-id>`. User is responsible for having exited
     /// any local `claude --resume` first; broker can't detect a

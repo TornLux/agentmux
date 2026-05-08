@@ -31,6 +31,11 @@ use crate::UserEvent;
 const STATIC_ID_OPEN_WEB: &str = "static:open_web";
 const STATIC_ID_QUIT_BROKER: &str = "static:quit_broker";
 const STATIC_ID_QUIT_TRAY: &str = "static:quit_tray";
+/// Whole-stack restart via broker's POST /restart-agentmux. Broker
+/// spawns a detached respawner then exits; the respawner re-runs
+/// `agentmux restart` so all three processes (broker + tray + discord)
+/// reload their config from disk. Only useful while broker is reachable.
+const STATIC_ID_RESTART_ALL: &str = "static:restart_all";
 /// Stop everything in one click: discord bot first (so it doesn't
 /// churn reconnects when broker drops out), then broker via HTTP
 /// `/shutdown`, then exit the tray itself. Useful when you suspect
@@ -116,6 +121,19 @@ impl TrayState {
                 self.runtime.spawn(async move {
                     if let Err(e) = broker.shutdown().await {
                         warn!("shutdown broker: {e}");
+                    }
+                });
+            }
+            STATIC_ID_RESTART_ALL => {
+                info!("restart-agentmux requested via menu");
+                let broker = self.broker.clone();
+                self.runtime.spawn(async move {
+                    if let Err(e) = broker.restart_agentmux().await {
+                        // Most common failure: AGENTMUX_LAUNCHER unset
+                        // (broker started outside the wrapper). Surface
+                        // the broker's 503 message so the user knows
+                        // they need to restart from the CLI instead.
+                        warn!("restart-agentmux: {e}");
                     }
                 });
             }
@@ -370,6 +388,12 @@ fn build_session_menu(sessions: &[SessionInfo]) -> Result<Menu> {
         None,
     ))?;
     m.append(&PredefinedMenuItem::separator())?;
+    m.append(&MenuItem::with_id(
+        STATIC_ID_RESTART_ALL,
+        "Restart agentmux (reload config)",
+        true,
+        None,
+    ))?;
     m.append(&MenuItem::with_id(
         STATIC_ID_QUIT_BROKER,
         "Stop broker",

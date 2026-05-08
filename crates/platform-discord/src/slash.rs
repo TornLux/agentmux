@@ -39,9 +39,11 @@ pub fn definitions() -> Vec<CreateCommand> {
                 CreateCommandOption::new(
                     CommandOptionType::String,
                     "name",
-                    "Session name",
+                    "Existing session to bind",
                 )
                 .required(true)
+                .min_length(1)
+                .max_length(32)
                 .set_autocomplete(true),
             ),
         CreateCommand::new("logs")
@@ -61,15 +63,19 @@ pub fn definitions() -> Vec<CreateCommand> {
                 CreateCommandOption::new(
                     CommandOptionType::String,
                     "name",
-                    "Session name (auto-generated if omitted)",
-                ),
+                    "Session name, no whitespace (auto-generated if omitted)",
+                )
+                .min_length(1)
+                .max_length(32),
             )
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::String,
                     "cwd",
                     "Working directory (broker default if omitted)",
-                ),
+                )
+                .min_length(1)
+                .max_length(260),
             )
             .add_option(
                 CreateCommandOption::new(
@@ -82,11 +88,13 @@ pub fn definitions() -> Vec<CreateCommand> {
             .description("Toggle whether this channel's session survives broker restart")
             .add_option(
                 CreateCommandOption::new(
-                    CommandOptionType::Boolean,
+                    CommandOptionType::String,
                     "on",
-                    "true = persist (auto-resume), false = ephemeral",
+                    "on = restored on broker restart, off = forgotten",
                 )
-                .required(true),
+                .required(true)
+                .add_string_choice("on", "on")
+                .add_string_choice("off", "off"),
             ),
         CreateCommand::new("kill")
             .description("Destroy a session (channels lose binding)")
@@ -97,6 +105,8 @@ pub fn definitions() -> Vec<CreateCommand> {
                     "Session to kill",
                 )
                 .required(true)
+                .min_length(1)
+                .max_length(32)
                 .set_autocomplete(true),
             ),
         CreateCommand::new("interrupt").description("Ctrl+C this channel's session"),
@@ -104,25 +114,30 @@ pub fn definitions() -> Vec<CreateCommand> {
             .description("Restart claude in this channel's session (history preserved)"),
         CreateCommand::new("hibernate")
             .description("Hibernate this channel's session (next message wakes it)"),
+        CreateCommand::new("reload")
+            .description("Restart the whole agentmux stack (reloads config.toml / discord.toml)"),
         CreateCommand::new("help").description("Show command help"),
     ]
 }
 
 pub async fn handle_command(handler: &Handler, ctx: &Context, cmd: &CommandInteraction) {
     let cid = cmd.channel_id.get();
-    let body = match cmd.data.name.as_str() {
-        "ls" => slash_ls(handler, cid).await,
-        "status" => slash_status(handler, cid).await,
-        "cwd" => slash_cwd(handler, cid).await,
-        "attach" => {
-            let name = string_arg(cmd, "name").unwrap_or_default();
-            slash_attach(handler, cid, &name).await
-        }
+    // (reply body, ephemeral) — read-only / status-class verbs reply
+    // ephemerally so the channel doesn't fill up with one-user diagnostics;
+    // mutating verbs stay public so other channel members see what changed.
+    let (body, ephemeral) = match cmd.data.name.as_str() {
+        "ls" => (slash_ls(handler, cid).await, true),
+        "status" => (slash_status(handler, cid).await, true),
+        "cwd" => (slash_cwd(handler, cid).await, true),
         "logs" => {
             let n = int_arg(cmd, "n").unwrap_or(30) as usize;
-            slash_logs(handler, cid, n).await
+            (slash_logs(handler, cid, n).await, true)
         }
-        "new" => {
+        "attach" => {
+            let name = string_arg(cmd, "name").unwrap_or_default();
+            (slash_attach(handler, cid, &name).await, false)
+        }
+        "new" => (
             slash_new(
                 handler,
                 cid,
@@ -130,24 +145,32 @@ pub async fn handle_command(handler: &Handler, ctx: &Context, cmd: &CommandInter
                 string_arg(cmd, "cwd"),
                 bool_arg(cmd, "persist"),
             )
-            .await
-        }
+            .await,
+            false,
+        ),
         "persist" => {
-            let on = bool_arg(cmd, "on").unwrap_or(false);
-            slash_persist(handler, cid, on).await
+            // Choices guarantee the value is exactly "on" or "off"; we
+            // fall through to off on any unexpected/missing value rather
+            // than panic so an out-of-sync client can't crash the bot.
+            let on = matches!(string_arg(cmd, "on").as_deref(), Some("on"));
+            (slash_persist(handler, cid, on).await, false)
         }
         "kill" => {
             let name = string_arg(cmd, "name").unwrap_or_default();
-            slash_kill(handler, &name).await
+            (slash_kill(handler, &name).await, false)
         }
-        "interrupt" => slash_interrupt(handler, cid).await,
-        "restart" => slash_restart(handler, cid).await,
-        "hibernate" => slash_hibernate(handler, cid).await,
-        "help" => slash_help(),
-        other => format!("unknown command `/{other}`"),
+        "interrupt" => (slash_interrupt(handler, cid).await, false),
+        "restart" => (slash_restart(handler, cid).await, false),
+        "hibernate" => (slash_hibernate(handler, cid).await, false),
+        "reload" => (slash_reload(handler).await, true),
+        "help" => (slash_help(), true),
+        other => (format!("unknown command `/{other}`"), true),
     };
 
-    let resp = CreateInteractionResponseMessage::new().content(body);
+    let mut resp = CreateInteractionResponseMessage::new().content(body);
+    if ephemeral {
+        resp = resp.ephemeral(true);
+    }
     if let Err(e) = cmd
         .create_response(&ctx.http, CreateInteractionResponse::Message(resp))
         .await
@@ -412,6 +435,18 @@ async fn slash_restart(handler: &Handler, cid: u64) -> String {
     }
 }
 
+async fn slash_reload(handler: &Handler) -> String {
+    match handler.broker.restart_agentmux().await {
+        Ok(_) => "♻️ restarting agentmux — bot will lose WS for a few seconds, then reconnect".into(),
+        Err(e) => {
+            // Most common failure: broker started outside the wrapper
+            // script so AGENTMUX_LAUNCHER isn't set — broker returns 503
+            // with explicit guidance, surface it verbatim.
+            format!("❌ reload: {e}")
+        }
+    }
+}
+
 async fn slash_hibernate(handler: &Handler, cid: u64) -> String {
     let bound = handler
         .state
@@ -434,6 +469,7 @@ fn slash_help() -> String {
      `/persist on:bool` — toggle restart-survival\n\
      `/kill name` — destroy a session (autocomplete)\n\
      `/interrupt` `/restart` `/hibernate` — lifecycle\n\
+     `/reload` — restart the whole stack (reloads config files)\n\
      plain text (or `!verb`) still works in whitelisted channels"
         .to_string()
 }

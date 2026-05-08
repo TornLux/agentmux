@@ -241,6 +241,21 @@ impl BrokerClient {
         self.post_action(name, "hibernate").await
     }
 
+    /// Trigger a whole-stack restart on the broker. Broker spawns a
+    /// detached respawner then exits, so this call may return success
+    /// while broker is mid-shutdown — the bot's WS subscriber will
+    /// auto-reconnect once the new broker is up.
+    pub async fn restart_agentmux(&self) -> Result<()> {
+        let url = format!("{}/restart-agentmux", self.base_http);
+        let resp = self
+            .http
+            .post(&url)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        check_ok(resp, "/restart-agentmux").await
+    }
+
     async fn post_action(&self, name: &str, action: &str) -> Result<()> {
         let url = format!("{}/sessions/{}/{}", self.base_http, name, action);
         let resp = self

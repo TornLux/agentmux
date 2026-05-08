@@ -528,6 +528,7 @@ async fn run_http_server(app_state: AppState) {
         .route("/sessions/:key/persist", post(http_set_persist))
         .route("/sessions/:key/ring", get(http_ring_snapshot))
         .route("/shutdown", post(http_shutdown))
+        .route("/restart-agentmux", post(http_restart_agentmux))
         .route("/event", post(http_event))
         .route("/tool-request", post(http_tool_request))
         .route("/tool-decision/:request_id", post(http_tool_decision))
@@ -1288,6 +1289,95 @@ async fn http_tool_decision(
 async fn http_shutdown(State(s): State<AppState>) -> &'static str {
     let _ = s.shutdown_tx.send(true);
     "ok"
+}
+
+/// Whole-stack restart. Triggered from `agentmux restart` (CLI),
+/// Discord `/reload`, or tray "Restart agentmux".
+///
+/// Mechanism: spawn a *detached* PowerShell respawner that sleeps a
+/// few seconds (waiting for our PID file release + listener teardown)
+/// then re-invokes the launcher script in `restart` mode, then signal
+/// our own shutdown. Because the respawner is detached, it survives our
+/// exit. Because broker is also stopped *and* started by the launcher,
+/// every process reloads its config from disk — fixing the recurring
+/// "I edited config.toml but nothing changed" papercut.
+///
+/// Returns 503 if `AGENTMUX_LAUNCHER` isn't set (broker started outside
+/// the wrapper, e.g. on Linux where the wrapper doesn't exist yet).
+async fn http_restart_agentmux(
+    State(s): State<AppState>,
+) -> Result<&'static str, (StatusCode, String)> {
+    let launcher = match std::env::var("AGENTMUX_LAUNCHER") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AGENTMUX_LAUNCHER not set — broker was started outside the wrapper script. \
+                 Restart manually with: .\\agentmux restart"
+                    .into(),
+            ));
+        }
+    };
+
+    if let Err(e) = spawn_respawner(&launcher) {
+        warn!("/restart-agentmux: respawner spawn failed: {e}");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("respawner spawn failed: {e}"),
+        ));
+    }
+
+    info!(
+        "/restart-agentmux: respawner detached (launcher={}); shutting down",
+        launcher
+    );
+    let _ = s.shutdown_tx.send(true);
+    Ok("ok")
+}
+
+/// Spawn a detached helper that waits for broker to exit, then runs
+/// `<launcher> restart`. Returns immediately so the HTTP handler can
+/// reply 200 before broker tears down.
+#[cfg(windows)]
+fn spawn_respawner(launcher: &str) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS so the helper isn't
+    // killed when broker exits. CREATE_NO_WINDOW keeps it invisible.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = format!(
+        "Start-Sleep -Seconds 2; & '{}' restart",
+        launcher.replace('\'', "''")
+    );
+    std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW)
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn spawn_respawner(launcher: &str) -> std::io::Result<()> {
+    // POSIX: nohup + setsid + bash via the launcher path. The launcher
+    // is currently Windows-only so this branch is rarely hit; we still
+    // accept it so a future agentmux.sh just works.
+    use std::process::{Command, Stdio};
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("(sleep 2 && \"{launcher}\" restart) &"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
 }
 
 async fn http_event(
