@@ -21,12 +21,39 @@
 
 use serenity::all::{
     AutocompleteChoice, CommandDataOptionValue, CommandInteraction, CommandOptionType,
-    Context, CreateAutocompleteResponse, CreateCommand, CreateCommandOption,
-    CreateInteractionResponse, CreateInteractionResponseMessage,
+    Context, CreateAutocompleteResponse, CreateCommand, CreateCommandOption, CreateEmbed,
+    CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseMessage,
 };
 
 use crate::ansi;
 use crate::handler::Handler;
+
+// Discord-style color palette so embed side bars are visually consistent
+// with the platform itself. Picked from Discord's brand guide.
+const COLOR_OK: u32 = 0x57F287; // green
+const COLOR_ERR: u32 = 0xED4245; // red
+const COLOR_INFO: u32 = 0x5865F2; // blurple
+
+fn ok_embed(title: impl Into<String>, body: impl Into<String>) -> CreateEmbed {
+    CreateEmbed::new()
+        .title(title)
+        .description(body)
+        .color(COLOR_OK)
+}
+
+fn err_embed(title: impl Into<String>, body: impl Into<String>) -> CreateEmbed {
+    CreateEmbed::new()
+        .title(title)
+        .description(body)
+        .color(COLOR_ERR)
+}
+
+fn info_embed(title: impl Into<String>, body: impl Into<String>) -> CreateEmbed {
+    CreateEmbed::new()
+        .title(title)
+        .description(body)
+        .color(COLOR_INFO)
+}
 
 pub fn definitions() -> Vec<CreateCommand> {
     vec![
@@ -122,10 +149,10 @@ pub fn definitions() -> Vec<CreateCommand> {
 
 pub async fn handle_command(handler: &Handler, ctx: &Context, cmd: &CommandInteraction) {
     let cid = cmd.channel_id.get();
-    // (reply body, ephemeral) — read-only / status-class verbs reply
+    // (embed, ephemeral) — read-only / status-class verbs reply
     // ephemerally so the channel doesn't fill up with one-user diagnostics;
     // mutating verbs stay public so other channel members see what changed.
-    let (body, ephemeral) = match cmd.data.name.as_str() {
+    let (embed, ephemeral) = match cmd.data.name.as_str() {
         "ls" => (slash_ls(handler, cid).await, true),
         "status" => (slash_status(handler, cid).await, true),
         "cwd" => (slash_cwd(handler, cid).await, true),
@@ -164,10 +191,13 @@ pub async fn handle_command(handler: &Handler, ctx: &Context, cmd: &CommandInter
         "hibernate" => (slash_hibernate(handler, cid).await, false),
         "reload" => (slash_reload(handler).await, true),
         "help" => (slash_help(), true),
-        other => (format!("unknown command `/{other}`"), true),
+        other => (
+            err_embed("Unknown command", format!("`/{other}` is not a known command")),
+            true,
+        ),
     };
 
-    let mut resp = CreateInteractionResponseMessage::new().content(body);
+    let mut resp = CreateInteractionResponseMessage::new().add_embed(embed);
     if ephemeral {
         resp = resp.ephemeral(true);
     }
@@ -246,21 +276,21 @@ fn bool_arg(cmd: &CommandInteraction, name: &str) -> Option<bool> {
     })
 }
 
-// -------- per-verb implementations (return reply body) --------
+// -------- per-verb implementations (return embed) --------
 
-async fn slash_ls(handler: &Handler, cid: u64) -> String {
+async fn slash_ls(handler: &Handler, cid: u64) -> CreateEmbed {
     let bound = handler
         .state
         .resolve_or_bind(cid, &handler.config.default_session)
         .await;
     let list = match handler.broker.list_sessions().await {
         Ok(l) => l,
-        Err(e) => return format!("❌ broker: {e}"),
+        Err(e) => return err_embed("Broker error", format!("`{e}`")),
     };
-    let mut out = String::from("```\n");
-    if list.is_empty() {
-        out.push_str("(no sessions)\n");
+    let table = if list.is_empty() {
+        "(no sessions)".to_string()
     } else {
+        let mut out = String::new();
         for s in &list {
             let marker = if s.name == bound { "▶ " } else { "  " };
             out.push_str(&format!(
@@ -271,57 +301,73 @@ async fn slash_ls(handler: &Handler, cid: u64) -> String {
                 truncate(&s.cwd, 40),
             ));
         }
-    }
-    out.push_str("```\n▶ = bound to this channel");
+        out
+    };
+    let mut embed = info_embed("Sessions", format!("```\n{table}```"))
+        .footer(CreateEmbedFooter::new("▶ = bound to this channel"));
+
     let snap = handler.state.bindings_snapshot().await;
     let other: Vec<_> = snap.into_iter().filter(|(c, _)| *c != cid).collect();
     if !other.is_empty() {
-        out.push_str("\nother bindings:");
-        for (c, s) in other {
-            out.push_str(&format!("\n  <#{c}> → `{s}`"));
-        }
+        let other_text = other
+            .into_iter()
+            .map(|(c, s)| format!("<#{c}> → `{s}`"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        embed = embed.field("Other channel bindings", other_text, false);
     }
-    out
+    embed
 }
 
-async fn slash_status(handler: &Handler, cid: u64) -> String {
+async fn slash_status(handler: &Handler, cid: u64) -> CreateEmbed {
     let bound = handler
         .state
         .resolve_or_bind(cid, &handler.config.default_session)
         .await;
-    format!("this channel is bound to session `{bound}`")
+    info_embed(
+        "Channel binding",
+        format!("This channel is bound to session `{bound}`"),
+    )
 }
 
-async fn slash_cwd(handler: &Handler, cid: u64) -> String {
+async fn slash_cwd(handler: &Handler, cid: u64) -> CreateEmbed {
     let bound = handler
         .state
         .resolve_or_bind(cid, &handler.config.default_session)
         .await;
     match handler.broker.list_sessions().await {
         Ok(list) => match list.iter().find(|s| s.name == bound) {
-            Some(s) => format!("`{}` cwd: `{}`", s.name, s.cwd),
-            None => format!("❌ session `{bound}` not found (no longer alive?)"),
+            Some(s) => info_embed("Working directory", format!("`{}`", s.cwd))
+                .field("Session", format!("`{}`", s.name), true)
+                .field("State", format!("`{}`", s.state), true),
+            None => err_embed(
+                "Session not found",
+                format!("`{bound}` is no longer alive (broker dropped it?)"),
+            ),
         },
-        Err(e) => format!("❌ broker: {e}"),
+        Err(e) => err_embed("Broker error", format!("`{e}`")),
     }
 }
 
-async fn slash_attach(handler: &Handler, cid: u64, name: &str) -> String {
+async fn slash_attach(handler: &Handler, cid: u64, name: &str) -> CreateEmbed {
     if name.is_empty() {
-        return "usage: `/attach name:<session>`".into();
+        return err_embed("Missing argument", "Usage: `/attach name:<session>`");
     }
     let exists = match handler.broker.list_sessions().await {
         Ok(l) => l.iter().any(|s| s.name == name),
-        Err(e) => return format!("❌ broker: {e}"),
+        Err(e) => return err_embed("Broker error", format!("`{e}`")),
     };
     if !exists {
-        return format!("❌ no session named `{name}`");
+        return err_embed("No such session", format!("No session named `{name}`"));
     }
     handler.state.bind(cid, name.to_string()).await;
-    format!("✅ this channel is now bound to session `{name}`")
+    ok_embed(
+        "Channel rebound",
+        format!("This channel is now bound to session `{name}`"),
+    )
 }
 
-async fn slash_logs(handler: &Handler, cid: u64, n: usize) -> String {
+async fn slash_logs(handler: &Handler, cid: u64, n: usize) -> CreateEmbed {
     let n = n.clamp(1, 100);
     let bound = handler
         .state
@@ -329,14 +375,17 @@ async fn slash_logs(handler: &Handler, cid: u64, n: usize) -> String {
         .await;
     let bytes = match handler.broker.get_ring(&bound).await {
         Ok(b) => b,
-        Err(e) => return format!("❌ fetch ring `{bound}`: {e}"),
+        Err(e) => return err_embed(format!("logs `{bound}`"), format!("`{e}`")),
     };
     let stripped = ansi::strip(&bytes);
     let mut tail = ansi::last_lines(&stripped, n);
     if tail.is_empty() {
         tail.push_str("(buffer is empty)");
     }
-    let budget = handler.config.max_message_chars.saturating_sub(32);
+    // Embed description max is 4096; cap below that with headroom for
+    // the code-fence wrapper. max_message_chars from config still
+    // honoured for users who tightened it.
+    let budget = handler.config.max_message_chars.saturating_sub(32).min(4000);
     if tail.chars().count() > budget {
         let skip = tail.chars().count() - budget;
         tail = tail.chars().skip(skip).collect();
@@ -344,7 +393,10 @@ async fn slash_logs(handler: &Handler, cid: u64, n: usize) -> String {
             tail = tail[idx + 1..].to_string();
         }
     }
-    format!("**[{bound}] last {n} lines**\n```\n{tail}\n```")
+    info_embed(
+        format!("[{bound}] last {n} lines"),
+        format!("```\n{tail}\n```"),
+    )
 }
 
 async fn slash_new(
@@ -353,33 +405,42 @@ async fn slash_new(
     name: Option<String>,
     cwd: Option<String>,
     persist: Option<bool>,
-) -> String {
+) -> CreateEmbed {
     let name = match name {
         Some(n) => n,
         None => match handler.broker.list_sessions().await {
             Ok(list) => auto_name(&list),
-            Err(e) => return format!("❌ broker: {e}"),
+            Err(e) => return err_embed("Broker error", format!("`{e}`")),
         },
     };
     match handler.broker.create_session(&name, cwd.as_deref(), persist).await {
         Ok(_) => {
             handler.state.bind(cid, name.clone()).await;
-            let cwd_extra = cwd
-                .as_ref()
-                .map(|c| format!(" (cwd: `{c}`)"))
-                .unwrap_or_default();
-            let persist_extra = match persist {
-                Some(true) => " [persist=on]",
-                Some(false) => " [ephemeral]",
-                None => "",
-            };
-            format!("✅ created `{name}` and bound this channel to it{cwd_extra}{persist_extra}")
+            let mut embed = ok_embed(
+                "Session created",
+                format!("`{name}` is now bound to this channel"),
+            );
+            if let Some(c) = &cwd {
+                embed = embed.field("cwd", format!("`{c}`"), false);
+            }
+            if let Some(p) = persist {
+                embed = embed.field(
+                    "persist",
+                    if p {
+                        "on (restored on broker restart)"
+                    } else {
+                        "ephemeral (forgotten on broker restart)"
+                    },
+                    false,
+                );
+            }
+            embed
         }
-        Err(e) => format!("❌ create `{name}`: {e}"),
+        Err(e) => err_embed(format!("create `{name}`"), format!("`{e}`")),
     }
 }
 
-async fn slash_persist(handler: &Handler, cid: u64, on: bool) -> String {
+async fn slash_persist(handler: &Handler, cid: u64, on: bool) -> CreateEmbed {
     let bound = handler
         .state
         .resolve_or_bind(cid, &handler.config.default_session)
@@ -387,91 +448,122 @@ async fn slash_persist(handler: &Handler, cid: u64, on: bool) -> String {
     match handler.broker.set_persist(&bound, on).await {
         Ok(_) => {
             let label = if on {
-                "persist=on (restored on broker restart)"
+                "persist = on (restored on broker restart)"
             } else {
                 "ephemeral (forgotten on broker restart)"
             };
-            format!("✅ `{bound}` → {label}")
+            ok_embed(format!("Persist updated for `{bound}`"), label)
         }
-        Err(e) => format!("❌ persist `{bound}`: {e}"),
+        Err(e) => err_embed(format!("persist `{bound}`"), format!("`{e}`")),
     }
 }
 
-async fn slash_kill(handler: &Handler, name: &str) -> String {
+async fn slash_kill(handler: &Handler, name: &str) -> CreateEmbed {
     if name.is_empty() {
-        return "usage: `/kill name:<session>`".into();
+        return err_embed("Missing argument", "Usage: `/kill name:<session>`");
     }
     match handler.broker.delete_session(name).await {
         Ok(_) => {
             handler.state.unbind_all(name).await;
-            format!(
-                "✅ killed `{name}` (channels previously bound now fall back to `{}`)",
-                handler.config.default_session
+            ok_embed(
+                format!("Killed `{name}`"),
+                format!(
+                    "Channels previously bound now fall back to `{}`",
+                    handler.config.default_session
+                ),
             )
         }
-        Err(e) => format!("❌ kill `{name}`: {e}"),
+        Err(e) => err_embed(format!("kill `{name}`"), format!("`{e}`")),
     }
 }
 
-async fn slash_interrupt(handler: &Handler, cid: u64) -> String {
+async fn slash_interrupt(handler: &Handler, cid: u64) -> CreateEmbed {
     let bound = handler
         .state
         .resolve_or_bind(cid, &handler.config.default_session)
         .await;
     match handler.broker.interrupt_session(&bound).await {
-        Ok(_) => format!("🛑 interrupted `{bound}`"),
-        Err(e) => format!("❌ interrupt `{bound}`: {e}"),
+        Ok(_) => ok_embed(
+            format!("🛑 interrupted `{bound}`"),
+            "Sent Ctrl+C to claude",
+        ),
+        Err(e) => err_embed(format!("interrupt `{bound}`"), format!("`{e}`")),
     }
 }
 
-async fn slash_restart(handler: &Handler, cid: u64) -> String {
+async fn slash_restart(handler: &Handler, cid: u64) -> CreateEmbed {
     let bound = handler
         .state
         .resolve_or_bind(cid, &handler.config.default_session)
         .await;
     match handler.broker.restart_session(&bound).await {
-        Ok(_) => format!("🔄 restarted claude in `{bound}` (history preserved)"),
-        Err(e) => format!("❌ restart `{bound}`: {e}"),
+        Ok(_) => ok_embed(
+            format!("🔄 Restarted claude in `{bound}`"),
+            "Conversation history preserved (resumed via stored session id)",
+        ),
+        Err(e) => err_embed(format!("restart `{bound}`"), format!("`{e}`")),
     }
 }
 
-async fn slash_reload(handler: &Handler) -> String {
+async fn slash_reload(handler: &Handler) -> CreateEmbed {
     match handler.broker.restart_agentmux().await {
-        Ok(_) => "♻️ restarting agentmux — bot will lose WS for a few seconds, then reconnect".into(),
+        Ok(_) => ok_embed(
+            "♻️ Restarting agentmux",
+            "Bot will lose its WS connection for a few seconds, then reconnect to the fresh broker. \
+             config.toml / discord.toml are re-read.",
+        ),
         Err(e) => {
             // Most common failure: broker started outside the wrapper
             // script so AGENTMUX_LAUNCHER isn't set — broker returns 503
             // with explicit guidance, surface it verbatim.
-            format!("❌ reload: {e}")
+            err_embed("Reload failed", format!("`{e}`"))
         }
     }
 }
 
-async fn slash_hibernate(handler: &Handler, cid: u64) -> String {
+async fn slash_hibernate(handler: &Handler, cid: u64) -> CreateEmbed {
     let bound = handler
         .state
         .resolve_or_bind(cid, &handler.config.default_session)
         .await;
     match handler.broker.hibernate_session(&bound).await {
-        Ok(_) => format!("💤 hibernated `{bound}` — next message wakes it"),
-        Err(e) => format!("❌ hibernate `{bound}`: {e}"),
+        Ok(_) => ok_embed(
+            format!("💤 Hibernated `{bound}`"),
+            "Next message in this channel will wake it",
+        ),
+        Err(e) => err_embed(format!("hibernate `{bound}`"), format!("`{e}`")),
     }
 }
 
-fn slash_help() -> String {
-    "**agentmux slash commands**\n\
-     `/ls` — list sessions and bindings\n\
-     `/status` — show this channel's binding\n\
-     `/cwd` — show bound session's cwd\n\
-     `/attach name` — rebind this channel (autocomplete)\n\
-     `/logs [n]` — last n lines of session output\n\
-     `/new [name] [cwd] [persist]` — create + bind\n\
-     `/persist on:bool` — toggle restart-survival\n\
-     `/kill name` — destroy a session (autocomplete)\n\
-     `/interrupt` `/restart` `/hibernate` — lifecycle\n\
-     `/reload` — restart the whole stack (reloads config files)\n\
-     plain text (or `!verb`) still works in whitelisted channels"
-        .to_string()
+fn slash_help() -> CreateEmbed {
+    info_embed(
+        "agentmux slash commands",
+        "Plain text (or `!verb`) still works in whitelisted channels.",
+    )
+    .field(
+        "Status",
+        "`/ls` list sessions + bindings\n\
+         `/status` channel binding\n\
+         `/cwd` show bound session's cwd\n\
+         `/logs [n]` last n lines of output",
+        false,
+    )
+    .field(
+        "Lifecycle",
+        "`/interrupt` Ctrl+C this channel's session\n\
+         `/restart` restart claude (history preserved)\n\
+         `/hibernate` next message wakes it\n\
+         `/reload` restart the whole stack (reloads config files)",
+        false,
+    )
+    .field(
+        "Sessions",
+        "`/new [name] [cwd] [persist]` create + bind\n\
+         `/attach name` rebind this channel\n\
+         `/persist on:on|off` toggle restart-survival\n\
+         `/kill name` destroy a session",
+        false,
+    )
 }
 
 fn auto_name(existing: &[crate::broker::SessionLite]) -> String {

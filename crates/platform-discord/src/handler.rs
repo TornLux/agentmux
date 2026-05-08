@@ -257,6 +257,20 @@ impl EventHandler for Handler {
             }
         };
 
+        // Spawn typing immediately — *before* send_input — so the
+        // "agentmux is typing…" indicator covers the full broker-await
+        // window. For hibernated sessions, send_input blocks 5–10 s
+        // waiting for `claude --resume` to settle; without this early
+        // spawn the user sees the placeholder but no typing presence
+        // during that gap. Cancel flag is flipped if forwarding errors
+        // out, so a failed forward doesn't leave a ghost indicator.
+        let typing_cancel = Arc::new(AtomicBool::new(false));
+        spawn_typing_task(
+            ctx.http.clone(),
+            placeholder.channel_id,
+            typing_cancel.clone(),
+        );
+
         info!(
             "forwarding to session={} from user={} channel={} chars={} attachments={} reply_route={}",
             session,
@@ -269,19 +283,13 @@ impl EventHandler for Handler {
 
         match self.broker.send_input(&session, &prompt).await {
             Ok(_) => {
-                let typing_cancel = Arc::new(AtomicBool::new(false));
                 let pending = PendingReply::new(
                     placeholder.channel_id.get(),
                     placeholder.id.get(),
                     now_unix_ms().saturating_add(PENDING_TTL.as_millis() as u64),
-                    typing_cancel.clone(),
-                );
-                self.state.push_pending(&session, pending).await;
-                spawn_typing_task(
-                    ctx.http.clone(),
-                    placeholder.channel_id,
                     typing_cancel,
                 );
+                self.state.push_pending(&session, pending).await;
             }
             Err(SendInputError::LocallyOwned { session, message }) => {
                 // The session was demoted: broker has no claude to
@@ -293,6 +301,7 @@ impl EventHandler for Handler {
                 // channel — repeated attempts get just the reaction
                 // so the channel doesn't fill with the same notice.
                 info!("forward to {session}: locally-owned, refused");
+                typing_cancel.store(true, Ordering::Release);
                 let _ = placeholder.delete(&ctx.http).await;
                 let _ = msg
                     .react(&ctx.http, ReactionType::Unicode("💤".into()))
@@ -315,6 +324,7 @@ impl EventHandler for Handler {
                 // placeholder, react ❌ on user's msg, post a brief
                 // error reply with the diagnostic so the user can
                 // see why it failed.
+                typing_cancel.store(true, Ordering::Release);
                 let _ = placeholder.delete(&ctx.http).await;
                 let _ = msg
                     .react(&ctx.http, ReactionType::Unicode("❌".into()))
