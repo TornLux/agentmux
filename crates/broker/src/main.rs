@@ -38,6 +38,7 @@ use tracing::{error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
 mod manager;
+mod orchestrator;
 mod ringbuf;
 mod session;
 
@@ -271,6 +272,21 @@ struct AppState {
     /// `/tool-decision/:id` we fire the matching oneshot and unblock
     /// the hook. `request_id` is a UUID picked at /tool-request time.
     pending_decisions: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ToolDecision>>>>,
+    /// Cross-session task dispatch queue. Any session can register a
+    /// callback against another session via `/sessions/:caller/dispatch`;
+    /// when the target's next `assistant_message` lands, broker injects
+    /// a synthetic `[SYSTEM: task-complete]` block back into the caller.
+    /// Persisted to `dispatches.toml` on every push/pop.
+    orchestrator: Arc<orchestrator::OrchestratorState>,
+    /// One-line, human-readable description of what each session is
+    /// currently doing — derived from `tool_progress` /
+    /// `assistant_message` / `notification` events as they pass
+    /// through `http_event`. Surfaced via `GET /sessions` and the
+    /// `session_status_changed` WS event so the dashboard panel can
+    /// render at-a-glance state without parsing transcripts.
+    /// Keyed by broker session id. In-memory only — derived from the
+    /// event stream, so a restart simply waits for the next event.
+    session_statuses: Arc<Mutex<HashMap<String, String>>>,
 }
 
 const EVENT_BUS_CAP: usize = 256;
@@ -447,6 +463,8 @@ async fn main() -> Result<()> {
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let (event_bus, _) = broadcast::channel::<serde_json::Value>(EVENT_BUS_CAP);
+    let dispatches_file = shared::config::local_appdata_dir().join("dispatches.toml");
+    let orchestrator_state = Arc::new(orchestrator::OrchestratorState::new(dispatches_file));
     let app_state = AppState {
         manager: manager.clone(),
         shutdown_tx: shutdown_tx.clone(),
@@ -455,6 +473,8 @@ async fn main() -> Result<()> {
         config: config.clone(),
         event_bus,
         pending_decisions: Arc::new(Mutex::new(HashMap::new())),
+        orchestrator: orchestrator_state,
+        session_statuses: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // Idle hibernate scanner. Disabled at 0; otherwise wakes every
@@ -486,6 +506,98 @@ async fn main() -> Result<()> {
                     );
                     let to_hib = s.clone();
                     tokio::task::spawn_blocking(move || to_hib.hibernate());
+                }
+            }
+        });
+    }
+
+    // Orchestrator bootstrap: if config.main_session names an existing
+    // session that has NEVER been bootstrapped before (no recorded
+    // claude_session_id → fresh / never-resumed), inject the
+    // orchestrator system prompt so it knows about /dispatch and the
+    // [SYSTEM: ...] callback grammar. Skipped for resumed sessions
+    // because the prompt is already in their conversation history.
+    if !config.main_session.is_empty() {
+        match manager.get_by_id_or_name(&config.main_session) {
+            Some(main) if main.claude_session_id().is_none() => {
+                let main_clone = main.clone();
+                let main_name = main.name.clone();
+                tokio::spawn(async move {
+                    let why = wait_until_claude_ready(&main_clone).await;
+                    info!(
+                        "orchestrator bootstrap → {}: claude ready ({why})",
+                        main_clone.name
+                    );
+                    let prompt = format_orchestrator_bootstrap();
+                    if let Err(e) = deliver_to_session(&main_clone, &prompt).await {
+                        warn!("orchestrator bootstrap inject to {main_name}: {e}");
+                    } else {
+                        info!("orchestrator prompt injected into {main_name}");
+                    }
+                });
+            }
+            Some(main) => {
+                info!(
+                    "main_session={} already has claude_session_id={:?} — skipping bootstrap (resumed history holds prior orchestrator prompt)",
+                    main.name,
+                    main.claude_session_id()
+                );
+            }
+            None => {
+                warn!(
+                    "config.main_session={} but no such session exists — orchestrator bootstrap skipped. \
+                     Either create the session or change main_session in config.toml.",
+                    config.main_session
+                );
+            }
+        }
+    }
+
+    // Dispatch timeout scanner. Wakes every 60s, drains any callbacks
+    // whose deadline has passed, and injects a `[SYSTEM: task-timeout]`
+    // block into each caller. Without this, a worker that crashes or
+    // gets stuck would leave its caller waiting forever.
+    if config.dispatch_timeout_secs > 0 {
+        let app = app_state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.tick().await; // skip immediate fire
+            loop {
+                tick.tick().await;
+                let now = orchestrator::now_unix_ms();
+                let expired = app.orchestrator.drain_expired(now);
+                if expired.is_empty() {
+                    continue;
+                }
+                info!("dispatch timeout: {} callback(s) expired", expired.len());
+                for cb in expired {
+                    let target_name = app
+                        .manager
+                        .get_by_id_or_name(&cb.target_session_id)
+                        .map(|t| t.name.clone())
+                        .unwrap_or_else(|| cb.target_session_id.clone());
+                    let synthesized = orchestrator::format_task_timeout(&cb, &target_name);
+                    let caller_id = cb.caller_session_id.clone();
+                    let task_id_log = cb.task_id.clone();
+                    let app_inner = app.clone();
+                    tokio::spawn(async move {
+                        let caller = match app_inner.manager.get_by_id_or_name(&caller_id) {
+                            Some(c) => c,
+                            None => {
+                                warn!(
+                                    "timeout task_id={task_id_log}: caller {caller_id} \
+                                     no longer exists, dropping"
+                                );
+                                return;
+                            }
+                        };
+                        if let Err(e) = deliver_to_session(&caller, &synthesized).await {
+                            warn!(
+                                "timeout inject task_id={task_id_log} → caller={}: {e}",
+                                caller.name
+                            );
+                        }
+                    });
                 }
             }
         });
@@ -525,6 +637,11 @@ async fn run_http_server(app_state: AppState) {
         .route("/sessions/:key/demote", post(http_demote))
         .route("/sessions/:key/adopt", post(http_adopt))
         .route("/sessions/:key/input", post(http_input))
+        .route("/sessions/:caller/dispatch", post(http_dispatch))
+        .route(
+            "/sessions/:caller/spawn-and-dispatch",
+            post(http_spawn_and_dispatch),
+        )
         .route("/sessions/:key/persist", post(http_set_persist))
         .route("/sessions/:key/ring", get(http_ring_snapshot))
         .route("/shutdown", post(http_shutdown))
@@ -872,8 +989,31 @@ async fn handle_control_cmd(
 
 // --- HTTP handlers -------------------------------------------------------
 
-async fn http_list(State(s): State<AppState>) -> Json<Vec<SessionInfo>> {
-    Json(s.manager.list())
+#[derive(Serialize)]
+struct SessionWithStatus {
+    #[serde(flatten)]
+    info: SessionInfo,
+    /// One-line "what is this session doing right now" string. Empty
+    /// for sessions that haven't emitted any event yet (broker just
+    /// restarted, no activity since).
+    current_status: String,
+}
+
+async fn http_list(State(s): State<AppState>) -> Json<Vec<SessionWithStatus>> {
+    let statuses = s.session_statuses.lock().unwrap().clone();
+    Json(
+        s.manager
+            .list()
+            .into_iter()
+            .map(|info| {
+                let current_status = statuses.get(&info.id).cloned().unwrap_or_default();
+                SessionWithStatus {
+                    info,
+                    current_status,
+                }
+            })
+            .collect(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1434,6 +1574,89 @@ async fn http_event(
         }
     }
 
+    // Update per-session current_status from this event, broadcasting
+    // a `session_status_changed` event when it actually changes.
+    // Dashboard subscribers (Discord embed, tray submenu) listen for
+    // the change event so they only re-render on transitions.
+    if let Some(sid) = event.get("session_id").and_then(|v| v.as_str()) {
+        if let Some(status) = derive_status(&kind, &event) {
+            let changed = {
+                let mut g = s.session_statuses.lock().unwrap();
+                if g.get(sid) == Some(&status) {
+                    false
+                } else {
+                    g.insert(sid.to_string(), status.clone());
+                    true
+                }
+            };
+            if changed {
+                let session_name = s
+                    .manager
+                    .get_by_id_or_name(sid)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| sid.to_string());
+                let evt = serde_json::json!({
+                    "type": "session_status_changed",
+                    "session_id": sid,
+                    "session_name": session_name,
+                    "current_status": status,
+                });
+                let _ = s.event_bus.send(evt);
+            }
+        }
+    }
+
+    // Cross-session callback delivery. If this assistant_message
+    // resolves an outstanding /dispatch (target had a registered
+    // callback), pop the front-of-queue entry and inject a
+    // `[SYSTEM: task-complete]` block into the original caller. Done
+    // before the broadcast so subscribers see both events in order.
+    // The actual delivery is fire-and-forget so a slow caller (e.g.
+    // hibernated, needs auto-resume) doesn't stall the /event handler.
+    if kind == "assistant_message" {
+        if let Some(target_id) = event.get("session_id").and_then(|v| v.as_str()) {
+            if let Some(cb) = s.orchestrator.pop_for_target(target_id) {
+                let target_name = s
+                    .manager
+                    .get_by_id_or_name(target_id)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| target_id.to_string());
+                let body_text = event
+                    .get("body")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let synthesized =
+                    orchestrator::format_task_complete(&cb, &target_name, &body_text);
+                let task_id_log = cb.task_id.clone();
+                let caller_id = cb.caller_session_id.clone();
+                let app_clone = s.clone();
+                tokio::spawn(async move {
+                    let caller = match app_clone.manager.get_by_id_or_name(&caller_id) {
+                        Some(c) => c,
+                        None => {
+                            warn!(
+                                "callback task_id={task_id_log}: caller {caller_id} \
+                                 no longer exists, dropping"
+                            );
+                            return;
+                        }
+                    };
+                    if let Err(e) = deliver_to_session(&caller, &synthesized).await {
+                        warn!(
+                            "callback task_id={task_id_log} → caller={}: {e}",
+                            caller.name
+                        );
+                    }
+                });
+                info!(
+                    "callback queued task_id={} target={} → caller={}",
+                    cb.task_id, target_name, cb.caller_session_id
+                );
+            }
+        }
+    }
+
     // Tee to WS subscribers before persisting — broadcast::send returns
     // Err only when there are zero receivers, which is fine.
     let _ = s.event_bus.send(event.clone());
@@ -1499,6 +1722,77 @@ async fn http_ring_snapshot(
         .ok_or((StatusCode::NOT_FOUND, format!("session not found: {key}")))?;
     let snap = session.pty_out.ring.lock().unwrap().snapshot();
     Ok(snap)
+}
+
+/// Map a hook event into a one-line "what is this session doing right
+/// now" string, for the dashboard panel. Returns None for events that
+/// don't change observable status (e.g. session_seen, tool_request —
+/// the user already sees those via other surfaces). Kept intentionally
+/// terse: status text shows up in tooltips and embeds where width is
+/// scarce.
+fn derive_status(kind: &str, event: &serde_json::Value) -> Option<String> {
+    let truncate = |s: &str, max: usize| -> String {
+        if s.chars().count() <= max {
+            s.to_string()
+        } else {
+            let mut out: String = s.chars().take(max - 1).collect();
+            out.push('…');
+            out
+        }
+    };
+    let short_path = |p: &str| -> String {
+        let normalized: String = p
+            .chars()
+            .map(|c| if c == '\\' { '/' } else { c })
+            .collect();
+        let parts: Vec<&str> = normalized.split('/').collect();
+        if parts.len() <= 3 {
+            return truncate(&normalized, 60);
+        }
+        let tail = parts[parts.len().saturating_sub(3)..].join("/");
+        truncate(&format!(".../{tail}"), 60)
+    };
+
+    let tool_input = event.get("tool_input").cloned().unwrap_or_default();
+    let s_field = |k: &str| -> String {
+        tool_input
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    match kind {
+        "tool_progress" => {
+            let tool = event.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+            Some(match tool {
+                "Read" => format!("reading {}", short_path(&s_field("file_path"))),
+                "Edit" | "MultiEdit" => format!("editing {}", short_path(&s_field("file_path"))),
+                "Write" => format!("writing {}", short_path(&s_field("file_path"))),
+                "Bash" => format!("$ {}", truncate(&s_field("command"), 50)),
+                "Glob" => format!("glob {}", truncate(&s_field("pattern"), 40)),
+                "Grep" => format!("grep {}", truncate(&s_field("pattern"), 40)),
+                "WebFetch" => format!("fetch {}", truncate(&s_field("url"), 50)),
+                "WebSearch" => format!("search {}", truncate(&s_field("query"), 40)),
+                "Task" => "delegating to subagent".to_string(),
+                "TodoWrite" => "updating todos".to_string(),
+                other if other.starts_with("mcp__") => {
+                    let mut parts = other.splitn(3, "__");
+                    let _ = parts.next();
+                    let server = parts.next().unwrap_or("?");
+                    let t = parts.next().unwrap_or("?");
+                    format!("mcp {server}.{t}")
+                }
+                other if !other.is_empty() => format!("running {other}"),
+                _ => "running tool".to_string(),
+            })
+        }
+        "assistant_message" => Some("idle".to_string()),
+        "notification" => Some("waiting on user".to_string()),
+        "tool_request" => Some("awaiting tool approval".to_string()),
+        "session_created" => Some("starting".to_string()),
+        _ => None,
+    }
 }
 
 /// Pulls the UUID-shaped basename out of a Claude Code transcript
@@ -1569,38 +1863,367 @@ async fn http_input(
         info!("/input post-resume readiness: {why}");
     }
 
-    // claude code TUI groups bytes arriving in the same read() call
-    // as a single paste burst — when that burst ends in `\r` and the
-    // input visually wraps (>~63 cols on the user's current terminal)
-    // or contains embedded `\n`, the trailing `\r` is NOT treated as
-    // an Enter keystroke and the input never submits. Empirically the
-    // fix is to write the text and the `\r` in two separate write()
-    // calls with even a tiny gap between them — claude then sees the
-    // `\r` as a discrete Enter keystroke and submits. 30 ms is two
-    // orders of magnitude above the threshold (5 ms still worked in
-    // diagnosis) yet imperceptible compared to network + claude
-    // turn latency.
-    //
-    // Skip the split when there is no text (no first write needed)
-    // or when append_enter is false (caller wants raw bytes — they
-    // can stage their own keystrokes).
     let text_bytes = body.text.into_bytes();
-    let has_text = !text_bytes.is_empty();
-    if has_text {
-        session.write_to_pty(&text_bytes);
-    }
-    if body.append_enter {
-        if has_text {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
-        session.write_to_pty(b"\r");
-    }
+    write_user_burst(&session, &text_bytes, body.append_enter).await;
     info!(
         "/input wrote text_bytes={} append_enter={}",
         text_bytes.len(),
         body.append_enter
     );
     Ok("ok")
+}
+
+/// Write a "user input burst" to a session's PTY. Shared between the
+/// HTTP `/input` path, the orchestrator's dispatch delivery, and the
+/// callback inject path so they all behave identically (including the
+/// 30ms split before `\r`).
+///
+/// claude code TUI groups bytes arriving in the same read() call as a
+/// single paste burst — when that burst ends in `\r` and the input
+/// visually wraps (>~63 cols on the user's current terminal) or
+/// contains embedded `\n`, the trailing `\r` is NOT treated as an Enter
+/// keystroke and the input never submits. Splitting the text and the
+/// `\r` into two write() calls with a 30 ms gap is the empirically
+/// reliable fix (5 ms still worked in diagnosis; 30 ms is comfortably
+/// above the threshold and imperceptible vs. claude turn latency).
+async fn write_user_burst(session: &Arc<Session>, text_bytes: &[u8], append_enter: bool) {
+    let has_text = !text_bytes.is_empty();
+    if has_text {
+        session.write_to_pty(text_bytes);
+    }
+    if append_enter {
+        if has_text {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        session.write_to_pty(b"\r");
+    }
+}
+
+#[derive(Deserialize)]
+struct DispatchBody {
+    /// Target session — runs the prompt as a new turn. Accepts session
+    /// id or name.
+    to: String,
+    /// What to ask the worker to do.
+    prompt: String,
+    /// Caller-chosen label, echoed verbatim in the callback so the
+    /// caller can correlate the result with the dispatch.
+    #[serde(default)]
+    tag: String,
+    /// Override the broker-default deadline. 0 / missing = use
+    /// `config.dispatch_timeout_secs`.
+    #[serde(default)]
+    timeout_secs: u64,
+}
+
+#[derive(Serialize)]
+struct DispatchResponse {
+    task_id: String,
+    /// Resolved id of the target (caller may have used name).
+    target_session_id: String,
+}
+
+/// Cross-session task dispatch. Caller registers a callback against
+/// `to`, broker sends `prompt` to `to`, returns `task_id` immediately.
+/// When `to`'s next assistant_message lands, broker injects a
+/// `[SYSTEM: task-complete]` block back into the caller's input.
+async fn http_dispatch(
+    Path(caller_key): Path<String>,
+    State(s): State<AppState>,
+    Json(body): Json<DispatchBody>,
+) -> Result<Json<DispatchResponse>, (StatusCode, String)> {
+    let caller = s.manager.get_by_id_or_name(&caller_key).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("caller session not found: {caller_key}"),
+    ))?;
+
+    let target = s.manager.get_by_id_or_name(&body.to).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("target session not found: {}", body.to),
+    ))?;
+
+    if caller.id == target.id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "caller and target must be different sessions".into(),
+        ));
+    }
+
+    if target.state() == SessionState::LocallyOwned {
+        return Err(locally_owned_409(&target.name));
+    }
+
+    let cap = s.config.max_active_dispatches_per_session;
+    if cap > 0 {
+        let active = s.orchestrator.count_for_caller(&caller.id);
+        if active as u32 >= cap {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "caller `{}` has {active} active dispatch(es); cap is {cap}. \
+                     wait for some to complete or kill stuck workers",
+                    caller.name
+                ),
+            ));
+        }
+    }
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let timeout_secs = if body.timeout_secs == 0 {
+        s.config.dispatch_timeout_secs
+    } else {
+        body.timeout_secs
+    };
+    let cb = orchestrator::PendingCallback {
+        task_id: task_id.clone(),
+        caller_session_id: caller.id.clone(),
+        target_session_id: target.id.clone(),
+        tag: body.tag.clone(),
+        original_prompt: body.prompt.clone(),
+        dispatched_at_unix_ms: orchestrator::now_unix_ms(),
+        timeout_secs,
+    };
+    s.orchestrator.push(cb);
+
+    info!(
+        "/dispatch task_id={} caller={} target={} tag={} prompt_chars={} timeout_secs={}",
+        task_id,
+        caller.name,
+        target.name,
+        body.tag,
+        body.prompt.chars().count(),
+        timeout_secs
+    );
+
+    // Deliver the prompt in the background — hibernate auto-resume can
+    // take 5-10s and the HTTP caller (the orchestrator's curl) shouldn't
+    // wait. The callback is already registered, so the target's reply
+    // will route back regardless of how late the prompt actually lands.
+    let target_clone = target.clone();
+    let prompt = body.prompt;
+    let target_name = target.name.clone();
+    let tid_for_log = task_id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = deliver_to_session(&target_clone, &prompt).await {
+            warn!("/dispatch task_id={tid_for_log} deliver to {target_name}: {e}");
+        }
+    });
+
+    Ok(Json(DispatchResponse {
+        task_id,
+        target_session_id: target.id.clone(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct SpawnDispatchBody {
+    /// Optional explicit name. Missing/empty → broker auto-picks
+    /// `w1`, `w2`, ... (lowest unused index).
+    #[serde(default)]
+    name: String,
+    /// cwd for the new session. Empty → broker default_cwd.
+    #[serde(default)]
+    cwd: String,
+    /// What to ask the new worker to do.
+    prompt: String,
+    /// Caller-chosen label, echoed in the callback.
+    #[serde(default)]
+    tag: String,
+    /// Per-task deadline override; 0 = use broker default.
+    #[serde(default)]
+    timeout_secs: u64,
+    /// Persist the new session across broker restarts? None → broker
+    /// default policy. Workers spawned for one-shot tasks usually want
+    /// `Some(false)` (ephemeral) so they don't accumulate.
+    #[serde(default)]
+    auto_resume: Option<bool>,
+    /// Optional Discord-side hint: when set, the bot will create a
+    /// thread under this channel id and bind it to the new session.
+    /// Stored on the session as metadata; broker itself doesn't act on
+    /// it. Phase 2 of the orchestrator rollout.
+    #[serde(default)]
+    desired_thread_parent: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct SpawnDispatchResponse {
+    task_id: String,
+    target_session_id: String,
+    target_session_name: String,
+}
+
+/// Atomic spawn-then-dispatch: convenience endpoint so the orchestrator
+/// doesn't have to do create + dispatch + worry about the gap. Useful
+/// when the orchestrator decides "no existing session matches this
+/// task; spin up a fresh worker just for it."
+async fn http_spawn_and_dispatch(
+    Path(caller_key): Path<String>,
+    State(s): State<AppState>,
+    Json(body): Json<SpawnDispatchBody>,
+) -> Result<Json<SpawnDispatchResponse>, (StatusCode, String)> {
+    let caller = s.manager.get_by_id_or_name(&caller_key).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("caller session not found: {caller_key}"),
+    ))?;
+
+    let cap = s.config.max_active_dispatches_per_session;
+    if cap > 0 {
+        let active = s.orchestrator.count_for_caller(&caller.id);
+        if active as u32 >= cap {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "caller `{}` has {active} active dispatch(es); cap is {cap}",
+                    caller.name
+                ),
+            ));
+        }
+    }
+
+    let cwd = if body.cwd.is_empty() {
+        s.default_cwd.clone()
+    } else {
+        PathBuf::from(&body.cwd)
+    };
+    if !cwd.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("cwd does not exist: {cwd:?}"),
+        ));
+    }
+
+    let auto_resume = body.auto_resume.unwrap_or(s.config.auto_resume_default);
+
+    let name = if body.name.is_empty() {
+        auto_worker_name(&s.manager.list())
+    } else {
+        body.name
+    };
+
+    let target = s
+        .manager
+        .create(name.clone(), cwd, auto_resume, None)
+        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+
+    if caller.id == target.id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "spawn-and-dispatch can't target the caller (same session)".into(),
+        ));
+    }
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let timeout_secs = if body.timeout_secs == 0 {
+        s.config.dispatch_timeout_secs
+    } else {
+        body.timeout_secs
+    };
+    let cb = orchestrator::PendingCallback {
+        task_id: task_id.clone(),
+        caller_session_id: caller.id.clone(),
+        target_session_id: target.id.clone(),
+        tag: body.tag.clone(),
+        original_prompt: body.prompt.clone(),
+        dispatched_at_unix_ms: orchestrator::now_unix_ms(),
+        timeout_secs,
+    };
+    s.orchestrator.push(cb);
+
+    info!(
+        "/spawn-and-dispatch task_id={} caller={} new_target={} tag={} thread_parent={:?}",
+        task_id, caller.name, target.name, body.tag, body.desired_thread_parent
+    );
+
+    // Emit a session_created event so the Discord bot (or any other
+    // listener) can act on `desired_thread_parent` and create a thread
+    // for the new worker. Broker itself doesn't talk to Discord.
+    let event = serde_json::json!({
+        "type": "session_created",
+        "session_id": target.id,
+        "session_name": target.name,
+        "caller_session_id": caller.id,
+        "desired_thread_parent": body.desired_thread_parent,
+    });
+    let _ = s.event_bus.send(event.clone());
+    s.events.append(event);
+
+    let target_clone = target.clone();
+    let prompt = body.prompt;
+    let target_name = target.name.clone();
+    let tid_for_log = task_id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = deliver_to_session(&target_clone, &prompt).await {
+            warn!("/spawn-and-dispatch task_id={tid_for_log} deliver to {target_name}: {e}");
+        }
+    });
+
+    Ok(Json(SpawnDispatchResponse {
+        task_id,
+        target_session_id: target.id.clone(),
+        target_session_name: target.name.clone(),
+    }))
+}
+
+/// Embedded at compile time so a release zip doesn't need the docs
+/// folder at runtime.
+const ORCHESTRATOR_PROMPT: &str = include_str!("../../../docs/orchestrator-prompt.md");
+
+/// Wrap the orchestrator-prompt.md content in a `[SYSTEM: ...]` envelope
+/// matching the grammar workers see for callbacks. This way the main
+/// session's first incoming "message" is unambiguously a broker-injected
+/// system instruction, not a user turn.
+fn format_orchestrator_bootstrap() -> String {
+    format!(
+        "[SYSTEM: orchestrator-bootstrap]\n\
+         The following are your role and instructions for this session. They take \
+         precedence over default claude behaviour. User messages from now on arrive \
+         via the agentmux Discord bridge — they will look like ordinary user input.\n\
+         \n\
+         ---\n\
+         \n\
+         {ORCHESTRATOR_PROMPT}\n\
+         \n\
+         ---\n\
+         [/SYSTEM]"
+    )
+}
+
+/// Pick the lowest unused `wN` name that isn't already a session.
+fn auto_worker_name(existing: &[SessionInfo]) -> String {
+    let used: std::collections::HashSet<&str> = existing.iter().map(|s| s.name.as_str()).collect();
+    for i in 1..u32::MAX {
+        let candidate = format!("w{i}");
+        if !used.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    "w_overflow".to_string()
+}
+
+/// Resume the session if hibernated/crashed, then write `text` followed
+/// by Enter. The async equivalent of "as if the user typed `text` and
+/// hit Enter in claude's TUI." Used by `/dispatch` to deliver prompts to
+/// targets and by the orchestrator's callback path to inject
+/// `[SYSTEM: ...]` blocks back to the caller. Refuses LocallyOwned
+/// sessions since broker has no claude to write into.
+async fn deliver_to_session(session: &Arc<Session>, text: &str) -> Result<()> {
+    if session.state() == SessionState::LocallyOwned {
+        anyhow::bail!("session `{}` is locally-owned", session.name);
+    }
+    if matches!(
+        session.state(),
+        SessionState::Hibernated | SessionState::Crashed
+    ) {
+        let to_resume = session.clone();
+        tokio::task::spawn_blocking(move || to_resume.resume())
+            .await
+            .context("resume task join")?
+            .context("resume")?;
+        let why = wait_until_claude_ready(session).await;
+        info!("deliver post-resume readiness for {}: {why}", session.name);
+    }
+    write_user_burst(session, text.as_bytes(), true).await;
+    Ok(())
 }
 
 /// Upgrade the connection to a WebSocket and stream every annotated

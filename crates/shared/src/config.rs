@@ -106,6 +106,23 @@ pub struct Config {
     /// to off-by-default in 0.3.4 because Discord-driven workflows
     /// hit too many approvals to be usable.
     pub tool_approval: ToolApprovalMode,
+    /// Name of the session that acts as the user-facing **orchestrator**
+    /// (or "main agent"). When non-empty AND the session exists at
+    /// broker startup, broker injects an orchestrator system prompt so
+    /// the session knows it can dispatch work to other sessions via
+    /// `POST /sessions/:caller/dispatch`. Empty (default) = no
+    /// orchestration; sessions behave as plain claude instances.
+    pub main_session: String,
+    /// Cap on simultaneous in-flight dispatches per caller session.
+    /// Prevents a runaway main agent from spawning 100 workers and
+    /// burning the user's quota. 0 = unlimited (not recommended).
+    pub max_active_dispatches_per_session: u32,
+    /// Default deadline (seconds) for a dispatched task before broker
+    /// auto-injects a `[SYSTEM: task-timeout]` callback into the
+    /// caller. Prevents callers from waiting forever on a stuck or
+    /// crashed worker. Override per-dispatch via the `timeout_secs`
+    /// body field.
+    pub dispatch_timeout_secs: u64,
 }
 
 impl Default for Config {
@@ -126,6 +143,9 @@ impl Default for Config {
             attach_token: String::new(),
             default_cwd: String::new(),
             tool_approval: ToolApprovalMode::Off,
+            main_session: String::new(),
+            max_active_dispatches_per_session: 5,
+            dispatch_timeout_secs: 1800,
         }
     }
 }
@@ -342,6 +362,9 @@ auto_resume_default = true
 attach_token = "k7Rj9_secrettoken"
 default_cwd = "C:\\projects\\me"
 tool_approval = "ask"
+main_session = "boss"
+max_active_dispatches_per_session = 8
+dispatch_timeout_secs = 600
 "#;
         let c: Config = toml::from_str(toml_src).unwrap();
         assert_eq!(c.http_addr, "0.0.0.0:1234");
@@ -356,6 +379,17 @@ tool_approval = "ask"
         assert_eq!(c.attach_token, "k7Rj9_secrettoken");
         assert_eq!(c.default_cwd, "C:\\projects\\me");
         assert_eq!(c.tool_approval, ToolApprovalMode::Ask);
+        assert_eq!(c.main_session, "boss");
+        assert_eq!(c.max_active_dispatches_per_session, 8);
+        assert_eq!(c.dispatch_timeout_secs, 600);
+    }
+
+    #[test]
+    fn orchestrator_defaults_match_legacy_off() {
+        let c = Config::default();
+        assert!(c.main_session.is_empty(), "no orchestrator by default");
+        assert_eq!(c.max_active_dispatches_per_session, 5);
+        assert_eq!(c.dispatch_timeout_secs, 1800);
     }
 
     #[test]
