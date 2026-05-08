@@ -73,6 +73,16 @@ pub struct PersistedSession {
     /// "broker-owned, restore as Hibernated" behaviour.
     #[serde(default)]
     pub locally_owned: bool,
+    /// Has the orchestrator system prompt been injected into this
+    /// session at least once? Tracked separately from
+    /// `claude_session_id` because a session can have a transcript
+    /// (claude_session_id is Some) yet *predate* the user configuring
+    /// `main_session` — in which case we still need to inject. Old
+    /// sessions.toml files default to `false`, which means a session
+    /// pre-existing the orchestrator feature gets bootstrapped on the
+    /// next broker start (and only then).
+    #[serde(default)]
+    pub orchestrator_bootstrapped: bool,
 }
 
 fn default_auto_resume() -> bool {
@@ -184,6 +194,15 @@ pub struct Session {
     state: Mutex<SessionState>,
     claude_session_id: Mutex<Option<String>>,
     auto_resume: Mutex<bool>,
+    /// Has broker injected the orchestrator system prompt into this
+    /// session before? Persisted via `PersistedSession` so a broker
+    /// restart on a session that was already bootstrapped doesn't
+    /// re-inject (the prompt is already in claude's resumed history).
+    /// Conversely, a session that has a `claude_session_id` but was
+    /// never bootstrapped (the user added `main_session` to config
+    /// after the session already had a transcript) gets correctly
+    /// flagged for injection.
+    orchestrator_bootstrapped: Mutex<bool>,
     last_activity: Mutex<Instant>,
     inner: Mutex<SessionInner>,
     /// `Arc::new_cyclic` plumbing: lets `&self` methods that need to
@@ -232,6 +251,10 @@ impl Session {
             auto_resume,
             resume_claude_session_id,
             now_ms(),
+            // Fresh session: never bootstrapped. broker startup will
+            // inject the orchestrator prompt (if main_session matches)
+            // and flip the flag.
+            false,
         );
         session.start_pty(use_resume)?;
         *session.state.lock().unwrap() = SessionState::Idle;
@@ -251,6 +274,7 @@ impl Session {
             persisted.argv.clone()
         };
         let was_locally_owned = persisted.locally_owned;
+        let was_bootstrapped = persisted.orchestrator_bootstrapped;
         let session = Self::build_hibernated(
             persisted.id,
             persisted.name,
@@ -260,6 +284,7 @@ impl Session {
             persisted.auto_resume,
             persisted.claude_session_id,
             persisted.created_at_ms,
+            was_bootstrapped,
         );
         if was_locally_owned {
             *session.state.lock().unwrap() = SessionState::LocallyOwned;
@@ -276,6 +301,7 @@ impl Session {
         auto_resume: bool,
         claude_session_id: Option<String>,
         created_at_ms: u64,
+        orchestrator_bootstrapped: bool,
     ) -> Arc<Self> {
         let (in_tx, in_rx) = mpsc::channel::<Bytes>(IN_QUEUE_CAP);
         let (out_tx, _) = broadcast::channel::<Bytes>(OUT_BROADCAST_CAP);
@@ -304,6 +330,7 @@ impl Session {
             state: Mutex::new(SessionState::Hibernated),
             claude_session_id: Mutex::new(claude_session_id),
             auto_resume: Mutex::new(auto_resume),
+            orchestrator_bootstrapped: Mutex::new(orchestrator_bootstrapped),
             last_activity: Mutex::new(Instant::now()),
             inner: Mutex::new(SessionInner {
                 writer: None,
@@ -715,7 +742,20 @@ impl Session {
             auto_resume: self.auto_resume(),
             created_at_ms: self.created_at_ms,
             locally_owned: self.state() == SessionState::LocallyOwned,
+            orchestrator_bootstrapped: self.orchestrator_bootstrapped(),
         }
+    }
+
+    pub fn orchestrator_bootstrapped(&self) -> bool {
+        *self.orchestrator_bootstrapped.lock().unwrap()
+    }
+
+    /// Mark this session as having received its orchestrator system
+    /// prompt. Caller must `manager.save()` after to persist the flag
+    /// — this method only flips the in-memory bit so the call site
+    /// can decide whether the broader save is justified.
+    pub fn mark_orchestrator_bootstrapped(&self) {
+        *self.orchestrator_bootstrapped.lock().unwrap() = true;
     }
 
     pub fn register_viewer(&self, info: ClientInfo) {

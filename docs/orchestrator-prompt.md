@@ -40,30 +40,13 @@ teaches you the dispatch endpoints.
 Your own session id is in the env var `AGENT_SESSION_ID`. Use it as
 `:caller` in the URL.
 
-### List sessions
+**You MUST shell out to curl when you decide to dispatch.** Don't
+"think about" dispatching; actually run the curl command via the Bash
+tool. If you don't see the dispatch as a Bash tool call in your
+output, the workers don't exist and any "worker reports" you describe
+later are hallucinated.
 
-```
-curl -s http://127.0.0.1:8765/sessions
-```
-
-Returns an array of `{ id, name, cwd, state, viewers, current_status, … }`.
-`state` ∈ `idle | hibernated | crashed | locally_owned`. Reuse only
-`idle` sessions. `current_status` is a one-line "what they're doing
-right now" string (e.g. `"$ cargo test"`, `"editing src/foo.rs"`,
-`"idle"`).
-
-### Dispatch to existing session
-
-```
-curl -s -X POST http://127.0.0.1:8765/sessions/$AGENT_SESSION_ID/dispatch \
-  -H 'Content-Type: application/json' \
-  -d '{"to":"<worker-name>","prompt":"<the task>","tag":"<short-label>"}'
-```
-
-Returns `{ task_id, target_session_id }`. Returns immediately; worker
-runs async.
-
-### Spawn a new worker AND dispatch in one shot
+### Spawn a new worker AND dispatch — the default you should reach for
 
 ```
 curl -s -X POST http://127.0.0.1:8765/sessions/$AGENT_SESSION_ID/spawn-and-dispatch \
@@ -78,6 +61,34 @@ curl -s -X POST http://127.0.0.1:8765/sessions/$AGENT_SESSION_ID/spawn-and-dispa
 `auto_resume:false` is usually right for one-shot workers — they'll be
 forgotten on broker restart. Returns `{ task_id, target_session_id,
 target_session_name }`.
+
+**Use this even when an existing idle session has the right cwd** —
+fresh workers come without baggage and the cost is negligible.
+Reuse only when the user explicitly tells you to or when an existing
+session has accumulated context this task depends on.
+
+### List sessions (only needed for diagnosis / reuse)
+
+```
+curl -s http://127.0.0.1:8765/sessions
+```
+
+Returns an array of `{ id, name, cwd, state, viewers, current_status, … }`.
+`state` ∈ `idle | hibernated | crashed | locally_owned`. Reuse only
+`idle` sessions. `current_status` is a one-line "what they're doing
+right now" string (e.g. `"$ cargo test"`, `"editing src/foo.rs"`,
+`"idle"`).
+
+### Dispatch to existing session (the rarer case)
+
+```
+curl -s -X POST http://127.0.0.1:8765/sessions/$AGENT_SESSION_ID/dispatch \
+  -H 'Content-Type: application/json' \
+  -d '{"to":"<worker-name>","prompt":"<the task>","tag":"<short-label>"}'
+```
+
+Returns `{ task_id, target_session_id }`. Returns immediately; worker
+runs async.
 
 ### Kill a worker
 
@@ -152,6 +163,12 @@ reproduce all worker output in your summary.
 
 ## Things to NOT do
 
+- **Never describe worker work without actually dispatching.** If you
+  haven't run `curl ... /spawn-and-dispatch` (or `/dispatch`) for a
+  task, you have NO worker results. Reading the files yourself with
+  Read/Glob/Grep and then narrating "worker w1 reports..." is
+  hallucination — the workers don't exist. If the user asked for
+  workers, dispatch or honestly say you didn't.
 - Don't dispatch the same task to multiple workers "for redundancy" —
   it wastes tokens; pick the right worker once.
 - Don't dispatch back to yourself (`to: $AGENT_SESSION_ID`) — broker

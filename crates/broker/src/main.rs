@@ -511,17 +511,22 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Orchestrator bootstrap: if config.main_session names an existing
-    // session that has NEVER been bootstrapped before (no recorded
-    // claude_session_id → fresh / never-resumed), inject the
-    // orchestrator system prompt so it knows about /dispatch and the
-    // [SYSTEM: ...] callback grammar. Skipped for resumed sessions
-    // because the prompt is already in their conversation history.
+    // Orchestrator bootstrap: inject the orchestrator system prompt
+    // into `main_session` exactly once across that session's lifetime,
+    // tracked via the persistent `orchestrator_bootstrapped` flag in
+    // sessions.toml. Critically, this DOES NOT use claude_session_id
+    // as the heuristic — a session can have a transcript yet predate
+    // the user configuring main_session (the common case: user adds
+    // main_session to config.toml after the default session has
+    // already been chatting), in which case the prompt has never been
+    // seen. The flag pivots correctly for both fresh and pre-existing
+    // sessions: bootstrap iff the flag is unset.
     if !config.main_session.is_empty() {
         match manager.get_by_id_or_name(&config.main_session) {
-            Some(main) if main.claude_session_id().is_none() => {
+            Some(main) if !main.orchestrator_bootstrapped() => {
                 let main_clone = main.clone();
                 let main_name = main.name.clone();
+                let manager_for_save = manager.clone();
                 tokio::spawn(async move {
                     let why = wait_until_claude_ready(&main_clone).await;
                     info!(
@@ -529,18 +534,28 @@ async fn main() -> Result<()> {
                         main_clone.name
                     );
                     let prompt = format_orchestrator_bootstrap();
-                    if let Err(e) = deliver_to_session(&main_clone, &prompt).await {
-                        warn!("orchestrator bootstrap inject to {main_name}: {e}");
-                    } else {
-                        info!("orchestrator prompt injected into {main_name}");
+                    match deliver_to_session(&main_clone, &prompt).await {
+                        Ok(_) => {
+                            // Flip + persist so a future broker restart
+                            // sees the flag and skips re-injection.
+                            main_clone.mark_orchestrator_bootstrapped();
+                            if let Err(e) = manager_for_save.save() {
+                                warn!(
+                                    "save sessions.toml after orchestrator bootstrap of {main_name}: {e}"
+                                );
+                            }
+                            info!("orchestrator prompt injected into {main_name}");
+                        }
+                        Err(e) => {
+                            warn!("orchestrator bootstrap inject to {main_name}: {e}");
+                        }
                     }
                 });
             }
             Some(main) => {
                 info!(
-                    "main_session={} already has claude_session_id={:?} — skipping bootstrap (resumed history holds prior orchestrator prompt)",
-                    main.name,
-                    main.claude_session_id()
+                    "main_session={} already orchestrator_bootstrapped — skipping inject (prompt already in transcript)",
+                    main.name
                 );
             }
             None => {
@@ -1055,6 +1070,26 @@ async fn http_create(
         .manager
         .create(body.name, cwd, auto_resume, body.resume_session_id)
         .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+
+    // Emit a `session_created` event so the Discord bot (and any
+    // other listener) can build a thread / refresh dashboards / etc.
+    // Mirrors the event spawn-and-dispatch already broadcasts so
+    // both creation paths surface a worker the same way. The bot's
+    // handle_session_created falls back to discord.toml's
+    // worker_thread_parent when desired_thread_parent is missing
+    // here — i.e. the orchestrator's two-step path
+    // (POST /sessions → POST /dispatch) gets thread creation for free
+    // as long as the global config knob is set.
+    let event = serde_json::json!({
+        "type": "session_created",
+        "session_id": session.id,
+        "session_name": session.name,
+        "caller_session_id": serde_json::Value::Null,
+        "desired_thread_parent": serde_json::Value::Null,
+    });
+    let _ = s.event_bus.send(event.clone());
+    s.events.append(event);
+
     Ok(Json(session.info()))
 }
 
@@ -1478,28 +1513,51 @@ async fn http_restart_agentmux(
 /// Spawn a detached helper that waits for broker to exit, then runs
 /// `<launcher> restart`. Returns immediately so the HTTP handler can
 /// reply 200 before broker tears down.
+///
+/// Diagnostics: every invocation transcribes its output (Start-Sleep
+/// completion, agentmux restart's full stdout/stderr, any error) to
+/// `%LOCALAPPDATA%\agentmux\respawner.log`. Without this, a failed
+/// respawn was completely silent — broker died, the launcher's child
+/// PowerShell silently exited, and the user saw no diagnostics
+/// anywhere. The log is overwritten each restart (`-Force`) so it
+/// stays small.
+///
+/// Robustness:
+///   * `-ExecutionPolicy Bypass` — the script invocation
+///     `& '<launcher>' restart` runs a .ps1 file, which a Restricted
+///     or AllSigned policy would block. Bypass forces it through. We
+///     could not just use `-File` because we also need the leading
+///     `Start-Sleep` to give broker time to release its listener.
 #[cfg(windows)]
 fn spawn_respawner(launcher: &str) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
     // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS so the helper isn't
-    // killed when broker exits. CREATE_NO_WINDOW keeps it invisible.
+    // killed when broker exits.
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let log_path = shared::config::local_appdata_dir().join("respawner.log");
+    let log_path_str = log_path.to_string_lossy().replace('\'', "''");
+    let launcher_escaped = launcher.replace('\'', "''");
     let script = format!(
-        "Start-Sleep -Seconds 2; & '{}' restart",
-        launcher.replace('\'', "''")
+        "try {{ Start-Transcript -Path '{log_path_str}' -Force | Out-Null }} catch {{ }}; \
+         Write-Host (\"respawner: launcher=$([char]39){launcher_escaped}$([char]39) ts=$(Get-Date -Format o)\"); \
+         Start-Sleep -Seconds 2; \
+         try {{ & '{launcher_escaped}' restart }} catch {{ Write-Host \"respawner: ERROR $_\" }}; \
+         try {{ Stop-Transcript | Out-Null }} catch {{ }}"
     );
     std::process::Command::new("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
             "-WindowStyle",
             "Hidden",
             "-Command",
             &script,
         ])
-        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW)
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
         .spawn()?;
     Ok(())
 }
@@ -1875,17 +1933,23 @@ async fn http_input(
 
 /// Write a "user input burst" to a session's PTY. Shared between the
 /// HTTP `/input` path, the orchestrator's dispatch delivery, and the
-/// callback inject path so they all behave identically (including the
-/// 30ms split before `\r`).
+/// callback inject path so they all behave identically.
 ///
-/// claude code TUI groups bytes arriving in the same read() call as a
-/// single paste burst — when that burst ends in `\r` and the input
-/// visually wraps (>~63 cols on the user's current terminal) or
-/// contains embedded `\n`, the trailing `\r` is NOT treated as an Enter
-/// keystroke and the input never submits. Splitting the text and the
-/// `\r` into two write() calls with a 30 ms gap is the empirically
-/// reliable fix (5 ms still worked in diagnosis; 30 ms is comfortably
-/// above the threshold and imperceptible vs. claude turn latency).
+/// claude code TUI groups bytes arriving in the same read() call (or
+/// within a short timing window for raw-mode terminals) as a single
+/// paste burst — when that burst ends in `\r` and contains embedded
+/// `\n`, the trailing `\r` is NOT treated as an Enter keystroke and
+/// the input never submits. The fix is to ensure the trailing `\r`
+/// arrives as a temporally-separate input event from the bulk of the
+/// text.
+///
+/// The earlier implementation slept a fixed 30 ms — fine for short
+/// single-line Discord messages but **not enough for long multi-line
+/// orchestrator dispatches** (2-3 KB with embedded newlines): the
+/// trailing `\r` still landed inside claude's paste-burst window and
+/// the prompt sat unsubmitted in the input box. Replaced with an
+/// adaptive wait that polls the PTY output ring for a quiet period
+/// (claude's echo of the typed-in text settles → safe to send `\r`).
 async fn write_user_burst(session: &Arc<Session>, text_bytes: &[u8], append_enter: bool) {
     let has_text = !text_bytes.is_empty();
     if has_text {
@@ -1893,9 +1957,44 @@ async fn write_user_burst(session: &Arc<Session>, text_bytes: &[u8], append_ente
     }
     if append_enter {
         if has_text {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            wait_for_input_echo(session).await;
         }
         session.write_to_pty(b"\r");
+    }
+}
+
+/// Block until claude's TUI has finished echoing the just-written
+/// input (output ring has been quiet for `STABLE`). The empty/
+/// idle-but-cursor-blinking baseline emits no bytes, so a stretch of
+/// no-growth = TUI is done rendering the input. `MAX_WAIT` bounds the
+/// worst case so a stuck TUI can't strand a callback delivery
+/// indefinitely.
+async fn wait_for_input_echo(session: &Session) {
+    use std::time::Instant;
+    const POLL: Duration = Duration::from_millis(20);
+    const STABLE: Duration = Duration::from_millis(80);
+    const MAX_WAIT: Duration = Duration::from_millis(2000);
+
+    let start = Instant::now();
+    let mut last_size = session.pty_out.ring.lock().unwrap().len();
+    let mut last_change = start;
+
+    loop {
+        tokio::time::sleep(POLL).await;
+        let now = Instant::now();
+        let size = session.pty_out.ring.lock().unwrap().len();
+        if size != last_size {
+            last_size = size;
+            last_change = now;
+        }
+        let stable_for = now.duration_since(last_change);
+        let elapsed = now.duration_since(start);
+        if stable_for >= STABLE {
+            return;
+        }
+        if elapsed >= MAX_WAIT {
+            return;
+        }
     }
 }
 

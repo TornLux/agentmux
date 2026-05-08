@@ -123,4 +123,26 @@ pub fn draw(ui: &mut egui::Ui, broker: &mut BrokerForm, discord: &mut DiscordFor
             discord.main_session = broker.main_session.clone();
         }
     }
+
+    // The orchestrator's "@bot in any channel" entry point only fires
+    // when respond_to_mentions is true — otherwise non-whitelisted
+    // channels swallow the @-mention silently. Surface the dependency
+    // here (next to the field that creates it) instead of letting the
+    // user discover it by hitting the bug.
+    if !discord.main_session.is_empty() && !discord.respond_to_mentions {
+        ui.add_space(6.0);
+        ui.colored_label(
+            egui::Color32::from_rgb(0xfe, 0xe7, 0x5c),
+            "⚠ main_session is set but discord.respond_to_mentions = false. \
+             @-mentions in non-whitelisted channels will be ignored — the orchestrator \
+             entry point won't work.",
+        );
+        if ui
+            .button("Enable respond_to_mentions")
+            .on_hover_text("Flip discord.respond_to_mentions to true so @-mentions in any channel route to main")
+            .clicked()
+        {
+            discord.respond_to_mentions = true;
+        }
+    }
 }

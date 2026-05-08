@@ -1531,6 +1531,19 @@ function Cmd-OrchestratorSetup {
         & $agentmuxCli config set $discordCfg main_session $mainName | Out-Null
         Write-Host "    ✓ discord.toml main_session = $mainName" -ForegroundColor Green
 
+        # Orchestrator's "@bot in any channel routes to main" only works
+        # when `respond_to_mentions` is true — otherwise the bot ignores
+        # @-mentions in non-whitelisted channels and the entry point
+        # silently does nothing. Detect-and-fix automatically; without
+        # this auto-flip the user has to discover the dependency by
+        # hitting the bug.
+        $rawDiscord2 = Get-Content -LiteralPath $discordCfg -Raw -ErrorAction SilentlyContinue
+        $respondsAlready = $rawDiscord2 -match '(?m)^\s*respond_to_mentions\s*=\s*true'
+        if (-not $respondsAlready) {
+            & $agentmuxCli config set $discordCfg respond_to_mentions true | Out-Null
+            Write-Host "    ✓ discord.toml respond_to_mentions = true (required for @-mention routing)" -ForegroundColor Green
+        }
+
         Write-Host ""
         Write-Host "    worker_thread_parent: a Discord channel under which the bot" -ForegroundColor Cyan
         Write-Host "    creates a thread for every spawned worker. Right-click the" -ForegroundColor Cyan
