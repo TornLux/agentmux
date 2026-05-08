@@ -44,7 +44,7 @@ agentmux 把 Claude Code 改造成一个常驻的多会话后台服务。一个�
   - `hook-pretool` —— 工具调用**前**同步触发；放行安全工具（Read / Glob / Grep / `cargo` / `git status` / …），高危操作（`rm -rf`、`curl | sh`、session cwd 外的 Edit / Write 等）走 Discord / toast 审批
   - `hook-posttool` —— 工具调用**后**触发，POST `tool_progress` 事件驱动 Discord 的就地编辑式进度流
   四个 hook 都通过 `AGENT_SESSION_ID` 哨兵识别非 broker 启动的 claude 直接静默退出。本地有 viewer 已 attach 时跳过用户可见的事件(不重复打扰),但仍会发一个最小的 `session_seen` 内部事件让 broker 学到 claude 的 session id —— 这是 `agentmux demote` 之后能给出正确 `--resume` 命令的前提。
-- **工具审批,两面通吃。** `hook-pretool` 决定要问时，broker **同时**把 `tool_request` 推到 Discord(`✅ Allow` / `❌ Deny` 按钮卡)和本地 tray(Windows toast,带同样按钮,通过 `agentmux://` URL scheme 回路)。hook 在 `/tool-request` 上长轮询最长 5 分钟；任一端点先 POST `/tool-decision/:id` 即赢，broker 对落败者幂等返回 404。绝大多数 turn 触发零个审批；只有真正高危操作才打扰你。
+- **工具审批,两面通吃(opt-in,0.3.4 起默认关闭)。** 在 `config.toml` 把 `tool_approval` 设为 `"ask"` 才会启用。开启后,`hook-pretool` 决定要问时,broker **同时**把 `tool_request` 推到 Discord(`✅ Allow` / `❌ Deny` 按钮卡)和本地 tray(Windows toast,带同样按钮,通过 `agentmux://` URL scheme 回路)。hook 在 `/tool-request` 上长轮询最长 5 分钟;任一端点先 POST `/tool-decision/:id` 即赢,broker 对落败者幂等返回 404。默认关掉是因为 Discord 工作流下审批太频繁、根本用不下去;`default_command` 里本来就带了 `--dangerously-skip-permissions`,claude 自己不会问,需要二次人工把关时再开回 `"ask"`。
 - **Hibernate / resume + 持久化开关。** 空闲超过 `hibernate_idle_secs` 的 session 关掉 `claude` 子进程释放内存，元信息留在 `sessions.toml`，下次 `/input`（或 attach）通过 `claude --resume <session-id>` 拉回。auto-resume 等 TUI 画面稳定后再注入输入，避免休眠后第一条 IM 消息被启动期吞掉。新建 session 默认是*短暂*的（broker 重启后忘记）—— 用 `!persist on` / `/persist` / `-persist` 标志切换。
 - **本地 ↔ broker 互转(demote / adopt)。** 你在终端里跟 claude 聊得正起劲、突然要出门?跑 `.\agentmux adopt --resume <claude-session-id>`(先在本地 `/exit`),broker 用 `--resume` 在自己的 ConPTY 里把同一份对话接管过来,Discord/web/tray 全可用。反向回收:`.\agentmux demote <name>` 注入 `/exit\r` 等 2 秒(必要时 `TerminateProcess` fallback 1 秒),打印 `cd …; claude --resume <id>` 一行命令贴到本地终端继续。处于 locally-owned 状态期间,broker 拒绝 `/input`/`/interrupt`/`/restart`(返回结构化 409),Discord 给消息加 💤 反应(首次配完整提示,5 分钟窗口内只反应不刷屏),tray 图标变紫色并把 per-session 子菜单换成"Re-adopt to broker"。状态跨 broker 重启保留 —— 频道绑定、cwd、claude_session_id 全在。
 - **局域网远程接入（可选开启）。** 设置 `attach_token` 并把 `http_addr` 绑到 `0.0.0.0:8765`，第二台机器就能用 `claude-attach --broker http://host:8765 --token <…>` 通过 WebSocket 接入。回环调用方（同机现有工具）跳过鉴权；非回环调用方必须带 `Authorization: Bearer <token>`。
@@ -373,7 +373,7 @@ agentmux/
 - **Token 比较走 constant-time** 防止时序攻击。
 - **回环豁免**:auth 中间件对 127.0.0.1 / ::1 直接放行,所以同机现有工具(同主机的 Discord bot、hooks、本地 socket attach)不需要任何 token 配置仍正常工作。
 - **PreToolUse 失败放行。** broker 不可达时,`hook-pretool` 选择放行而不是阻塞 claude。设置 `AGENT_HOOK_DEBUG` 可在 stderr 看到失败原因(人看,claude 看不到)。
-- **默认启动命令** 是 `claude --dangerously-skip-permissions`。PreToolUse 审批流的设计目标是用更灵活的正则规则**替代** claude 自己的权限提示;如果你更想用 claude 内置的权限对话框,就在 `config.toml` 里改 `default_command` 并卸载 PreToolUse hook。
+- **默认启动命令** 是 `claude --dangerously-skip-permissions`。PreToolUse 审批流的设计目标是用更灵活的规则**替代** claude 自己的权限提示 —— 但 0.3.4 起默认关闭(`tool_approval = "off"`),要开就把 `tool_approval` 改成 `"ask"`。如果你更想用 claude 内置的权限对话框,就在 `default_command` 里去掉 `--dangerously-skip-permissions`,并保持 agentmux 这层关闭。
 - **PID 文件单实例锁**防止两个 broker 抢同一根本地 socket。
 - **Discord token 永不写盘。** bot token 存在 User-scope 环境变量里(默认 `DISCORD_BOT_TOKEN`),`discord.toml` 里只放变量*名*。
 

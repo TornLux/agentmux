@@ -160,6 +160,14 @@ fn run() -> Result<Outcome> {
         Err(_) => return Ok(Outcome::Allow),
     };
 
+    // Approval gate is opt-in (default off). Anything other than the
+    // literal "ask" — including the env var being absent on an older
+    // broker that predates this knob — fast-paths to Allow without
+    // touching stdin or the broker.
+    if !approval_enabled() {
+        return Ok(Outcome::Allow);
+    }
+
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).context("read stdin")?;
     let hook: Value = serde_json::from_str(&input).context("parse hook json")?;
@@ -208,6 +216,13 @@ fn run() -> Result<Outcome> {
 enum Classification {
     Allow,
     Ask,
+}
+
+fn approval_enabled() -> bool {
+    matches!(
+        std::env::var("AGENT_TOOL_APPROVAL").ok().as_deref(),
+        Some("ask")
+    )
 }
 
 fn classify(tool_name: &str, tool_input: &Value) -> Classification {
@@ -422,6 +437,33 @@ mod tests {
         // Forward-slash variant should normalise.
         let mixed = json!({"file_path": "G:/Claude/agentmux/Cargo.toml"});
         assert!(matches!(classify("Edit", &mixed), Classification::Allow));
+    }
+
+    #[test]
+    fn approval_gate_only_enables_on_literal_ask() {
+        struct EnvGuard(&'static str, Option<String>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let prev = std::env::var("AGENT_TOOL_APPROVAL").ok();
+        let _g = EnvGuard("AGENT_TOOL_APPROVAL", prev);
+
+        std::env::remove_var("AGENT_TOOL_APPROVAL");
+        assert!(!approval_enabled(), "missing var must be off");
+
+        std::env::set_var("AGENT_TOOL_APPROVAL", "off");
+        assert!(!approval_enabled());
+
+        std::env::set_var("AGENT_TOOL_APPROVAL", "ASK");
+        assert!(!approval_enabled(), "case-sensitive: only lowercase ask wins");
+
+        std::env::set_var("AGENT_TOOL_APPROVAL", "ask");
+        assert!(approval_enabled());
     }
 
     #[test]

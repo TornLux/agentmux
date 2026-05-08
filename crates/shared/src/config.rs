@@ -16,6 +16,40 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+/// Whether the agentmux hook layer asks a human (Discord / tray) before
+/// letting non-whitelisted tool calls run. Independent of claude's own
+/// `--dangerously-skip-permissions` flag — that one disables claude's
+/// native prompts; this one controls the agentmux-added approval gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolApprovalMode {
+    /// Hook fast-paths every tool call. No `/tool-request` round-trip,
+    /// no Discord card, no tray toast. Default — Discord users found
+    /// the constant approval prompts unworkable.
+    Off,
+    /// Legacy behaviour: hook classifies, asks via Discord/tray for
+    /// risky operations, fail-open on broker outage.
+    Ask,
+}
+
+impl Default for ToolApprovalMode {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+impl ToolApprovalMode {
+    /// Env-var spelling broker injects into spawned claude. Hook-pretool
+    /// looks for "ask" specifically; anything else (including missing)
+    /// means short-circuit to Allow.
+    pub fn as_env_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Ask => "ask",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -66,6 +100,12 @@ pub struct Config {
     /// to make new-session cwd insensitive to which directory you
     /// happened to be in when you ran `.\agentmux start`.
     pub default_cwd: String,
+    /// Tool-approval gate. `"off"` (default) lets every tool call
+    /// through without asking; `"ask"` re-enables the hook-pretool
+    /// classifier and the Discord/tray approval round-trip. Switched
+    /// to off-by-default in 0.3.4 because Discord-driven workflows
+    /// hit too many approvals to be usable.
+    pub tool_approval: ToolApprovalMode,
 }
 
 impl Default for Config {
@@ -85,6 +125,7 @@ impl Default for Config {
             auto_resume_default: false,
             attach_token: String::new(),
             default_cwd: String::new(),
+            tool_approval: ToolApprovalMode::Off,
         }
     }
 }
@@ -300,6 +341,7 @@ log_dir = "C:\\custom\\logs"
 auto_resume_default = true
 attach_token = "k7Rj9_secrettoken"
 default_cwd = "C:\\projects\\me"
+tool_approval = "ask"
 "#;
         let c: Config = toml::from_str(toml_src).unwrap();
         assert_eq!(c.http_addr, "0.0.0.0:1234");
@@ -313,6 +355,27 @@ default_cwd = "C:\\projects\\me"
         assert!(c.auto_resume_default);
         assert_eq!(c.attach_token, "k7Rj9_secrettoken");
         assert_eq!(c.default_cwd, "C:\\projects\\me");
+        assert_eq!(c.tool_approval, ToolApprovalMode::Ask);
+    }
+
+    #[test]
+    fn tool_approval_defaults_to_off() {
+        let c = Config::default();
+        assert_eq!(c.tool_approval, ToolApprovalMode::Off);
+        assert_eq!(c.tool_approval.as_env_str(), "off");
+
+        // Empty toml inherits the default.
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.tool_approval, ToolApprovalMode::Off);
+    }
+
+    #[test]
+    fn tool_approval_parses_lowercase_variants() {
+        let c: Config = toml::from_str(r#"tool_approval = "ask""#).unwrap();
+        assert_eq!(c.tool_approval, ToolApprovalMode::Ask);
+
+        let c: Config = toml::from_str(r#"tool_approval = "off""#).unwrap();
+        assert_eq!(c.tool_approval, ToolApprovalMode::Off);
     }
 
     #[test]

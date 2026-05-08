@@ -359,6 +359,10 @@ impl Session {
             "AGENT_TRUSTED_ROOTS",
             self.cwd.to_string_lossy().to_string(),
         );
+        // Tool-approval gate. "off" (default) lets hook-pretool
+        // short-circuit; "ask" re-enables the classifier + Discord/tray
+        // round-trip. Default-off as of 0.3.4.
+        cmd.env("AGENT_TOOL_APPROVAL", self.config.tool_approval.as_env_str());
 
         let child = pair
             .slave
