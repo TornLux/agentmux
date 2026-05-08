@@ -11,6 +11,7 @@ members = [
     "crates/platform-discord",
     "crates/agentmux-cli",
     "crates/agentmux-tray",
+    "crates/agentmux-config",
 ]
 
 [workspace.package]

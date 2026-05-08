@@ -21,7 +21,7 @@ use anyhow::{anyhow, Context, Result};
 use tao::event_loop::EventLoopProxy;
 use tokio::runtime::Handle;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tracing::{debug, info, warn};
 
 use crate::broker::{BrokerClient, SessionInfo};
@@ -31,6 +31,10 @@ use crate::UserEvent;
 const STATIC_ID_OPEN_WEB: &str = "static:open_web";
 const STATIC_ID_QUIT_BROKER: &str = "static:quit_broker";
 const STATIC_ID_QUIT_TRAY: &str = "static:quit_tray";
+/// Spawn the GUI config editor (`agentmux-config.exe`) as a detached
+/// child so its lifecycle is independent of the tray. Located via the
+/// same sibling-binary search used for everything else.
+const STATIC_ID_OPEN_SETTINGS: &str = "static:open_settings";
 /// Whole-stack restart via broker's POST /restart-agentmux. Broker
 /// spawns a detached respawner then exits; the respawner re-runs
 /// `agentmux restart` so all three processes (broker + tray + discord)
@@ -107,6 +111,21 @@ impl TrayState {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             self.dispatch_menu_id(ev.id().0.as_str());
         }
+        // Also drain tray-icon clicks. Double-click left button on the
+        // tray icon opens the GUI config editor — the same shortcut
+        // Windows users expect from notification-area utilities.
+        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } = ev
+            {
+                info!("open settings requested via tray double-click");
+                if let Err(e) = spawn_config_editor() {
+                    warn!("spawn agentmux-config: {e}");
+                }
+            }
+        }
     }
 
     fn dispatch_menu_id(&self, id: &str) {
@@ -123,6 +142,12 @@ impl TrayState {
                         warn!("shutdown broker: {e}");
                     }
                 });
+            }
+            STATIC_ID_OPEN_SETTINGS => {
+                info!("open settings requested via menu");
+                if let Err(e) = spawn_config_editor() {
+                    warn!("spawn agentmux-config: {e}");
+                }
             }
             STATIC_ID_RESTART_ALL => {
                 info!("restart-agentmux requested via menu");
@@ -389,6 +414,12 @@ fn build_session_menu(sessions: &[SessionInfo]) -> Result<Menu> {
     ))?;
     m.append(&PredefinedMenuItem::separator())?;
     m.append(&MenuItem::with_id(
+        STATIC_ID_OPEN_SETTINGS,
+        "Settings…",
+        true,
+        None,
+    ))?;
+    m.append(&MenuItem::with_id(
         STATIC_ID_RESTART_ALL,
         "Restart agentmux (reload config)",
         true,
@@ -466,6 +497,52 @@ fn needs_attention(s: &SessionInfo) -> bool {
 
 fn is_locally_owned(s: &SessionInfo) -> bool {
     s.state.as_str() == "locally_owned"
+}
+
+/// Spawn `agentmux-config.exe` as a detached child. Located via the
+/// same `bin/` sibling lookup the rest of the launcher uses, but
+/// agentmux-tray.exe is itself in the same dir on a release install
+/// (or target/release / target/debug for cargo builds).
+pub fn spawn_config_editor() -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let here = exe.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no parent dir for tray exe")
+    })?;
+    let candidate_names = [
+        if cfg!(windows) {
+            "agentmux-config.exe"
+        } else {
+            "agentmux-config"
+        },
+    ];
+    for name in candidate_names {
+        let p = here.join(name);
+        if p.exists() {
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const DETACHED_PROCESS: u32 = 0x0000_0008;
+                const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+                std::process::Command::new(&p)
+                    .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+                    .spawn()?;
+            }
+            #[cfg(not(windows))]
+            {
+                use std::process::Stdio;
+                std::process::Command::new(&p)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?;
+            }
+            return Ok(());
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("agentmux-config not found next to {exe:?}"),
+    ))
 }
 
 fn is_running(s: &SessionInfo) -> bool {

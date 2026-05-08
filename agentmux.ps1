@@ -241,6 +241,7 @@ Configuration
   config unset <broker|discord> <key>     Remove a field
   config token [--set]                    Generate a 32-byte attach token
                                           (with --set, writes to broker.toml)
+  config gui                              Open the GUI config editor (eframe)
 
 Orchestrator
   orchestrator                   (Re-)configure boss/worker workflow:
@@ -680,10 +681,38 @@ function Cmd-Init([string[]]$Argv) {
     }
     Write-Host ""
 
-    # 5 — orchestrator (optional)
-    Write-Host "[5/6] Orchestrator workflow (optional)" -ForegroundColor Cyan
-    Cmd-OrchestratorSetup
-    Write-Host ""
+    # Optional shortcut: switch to the GUI editor for the remaining
+    # config knobs. The GUI exposes everything Cmd-OrchestratorSetup
+    # asks (and more — Broker / Discord / Hooks / Advanced tabs too).
+    $guiExe = $null
+    foreach ($p in @(
+        (Join-Path $bin "agentmux-config.exe"),
+        (Join-Path $root "target\release\agentmux-config.exe"),
+        (Join-Path $root "target\debug\agentmux-config.exe")
+    )) {
+        if (Test-Path $p) { $guiExe = $p; break }
+    }
+    $useGui = $false
+    if ($guiExe) {
+        Write-Host "[4.5/6] GUI shortcut (optional)" -ForegroundColor Cyan
+        Write-Host "  agentmux-config.exe is built — you can fill in the rest of the"
+        Write-Host "  configuration (orchestrator + advanced fields) in a window instead"
+        Write-Host "  of CLI prompts."
+        $ans = Read-Host "  Open the GUI editor and finish there? [y/N]"
+        if ($ans -eq "y" -or $ans -eq "Y") {
+            Start-Process -FilePath $guiExe -WindowStyle Hidden | Out-Null
+            Write-Host "  opened agentmux config window. Skipping remaining wizard steps."
+            $useGui = $true
+        }
+        Write-Host ""
+    }
+
+    if (-not $useGui) {
+        # 5 — orchestrator (optional)
+        Write-Host "[5/6] Orchestrator workflow (optional)" -ForegroundColor Cyan
+        Cmd-OrchestratorSetup
+        Write-Host ""
+    }
 
     # 6 — start
     Write-Host "[6/6] Start services" -ForegroundColor Cyan
@@ -1210,12 +1239,33 @@ function Cmd-Config([string[]]$Argv) {
         "set"    { Cmd-ConfigSet   $rest }
         "unset"  { Cmd-ConfigUnset $rest }
         "token"  { Cmd-ConfigToken $rest }
+        "gui"    { Cmd-ConfigGui }
         default  {
             Write-Host "unknown config subcommand: $sub" -ForegroundColor Red
             Write-Host ""
             Show-VerbHelp "config"
         }
     }
+}
+
+function Cmd-ConfigGui {
+    # Spawn the eframe GUI editor as a detached child. The binary lives
+    # next to the other release artifacts (bin/ on a release zip,
+    # target/release / target/debug for cargo builds). Independent
+    # process so a GUI crash can't take down the calling shell.
+    $candidates = @(
+        (Join-Path $bin "agentmux-config.exe"),
+        (Join-Path $root "target\release\agentmux-config.exe"),
+        (Join-Path $root "target\debug\agentmux-config.exe")
+    )
+    $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $exe) {
+        Write-Host "✗ agentmux-config.exe not found." -ForegroundColor Red
+        Write-Host "  Build it with:  cargo build --release -p agentmux-config" -ForegroundColor Yellow
+        return
+    }
+    Start-Process -FilePath $exe -WindowStyle Hidden | Out-Null
+    Write-Host "opened agentmux config window."
 }
 
 function Cmd-ConfigToken([string[]]$Argv) {
