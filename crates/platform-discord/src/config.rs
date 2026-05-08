@@ -91,6 +91,24 @@ pub struct DiscordConfig {
     /// and only when the bot one day learns to attach as a viewer).
     /// Empty = ignore. Reserved for later phases.
     pub broker_config_path: String,
+    // --- Orchestrator (Phase 2/3) -----------------------------------
+    /// Session name to route @-mentions to in non-thread channels.
+    /// When empty (default), @-mentions go to the channel-bound session
+    /// like before. When set (and matches `config.toml::main_session`
+    /// on the broker side), the bot routes mentions to this session
+    /// regardless of which channel they came from — the orchestration
+    /// entry point. Mentions inside an already-bound thread still
+    /// route to that thread's session (so workers stay reachable in
+    /// their own threads).
+    pub main_session: String,
+    /// Discord channel id under which the bot creates a new thread for
+    /// every spawned worker session. 0 / unset = no auto-thread (worker
+    /// output flows to the main session's home channel as today).
+    pub worker_thread_parent: u64,
+    /// Discord channel id where the bot maintains a persistent
+    /// "current sessions" embed message — one row per session with
+    /// state + current_status. 0 / unset = no dashboard.
+    pub dashboard_channel_id: u64,
 }
 
 impl Default for DiscordConfig {
@@ -110,6 +128,9 @@ impl Default for DiscordConfig {
             reply_quote_in_prompt: true,
             react_with_actions: true,
             broker_config_path: String::new(),
+            main_session: String::new(),
+            worker_thread_parent: 0,
+            dashboard_channel_id: 0,
         }
     }
 }

@@ -110,6 +110,32 @@ reply_quote_in_prompt = true
 # restart). Only reactions from `allowed_user_ids` count. Set to false
 # if you'd rather use those emojis purely for human chat.
 react_with_actions = true
+
+# --- Orchestrator workflow (Phase 2/3 of boss/worker) -------------------
+# Set these via `.\agentmux orchestrator` so the matching value also
+# lands in broker config.toml. All optional — empty / 0 disables that
+# piece of the orchestration UX.
+
+# Session that handles @-mentions in non-thread channels. When set, an
+# @-mention of the bot in a regular channel routes the turn to this
+# session regardless of any prior channel binding (and remembers the
+# channel as the orchestrator's "home" for callback replies). Mentions
+# inside an already-spawned worker thread still route to that worker.
+# Must match config.toml::main_session on the broker side.
+main_session = ""
+
+# Discord channel id under which the bot creates a new public thread
+# for every spawned worker session. The thread inherits the broker's
+# `current_status` line into its progress edits and accepts user
+# messages as input back to that worker. 0 = no auto-thread (worker
+# output flows to the main session's home channel as in pre-0.3.4).
+worker_thread_parent = 0
+
+# Discord channel id where the bot maintains a single persistent embed
+# listing every session and its current status. Updated every ~5s; the
+# bot scans the channel at startup and reuses its prior message rather
+# than piling up duplicates. 0 = no dashboard.
+dashboard_channel_id = 0
 '@
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

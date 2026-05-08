@@ -242,6 +242,12 @@ Configuration
   config token [--set]                    Generate a 32-byte attach token
                                           (with --set, writes to broker.toml)
 
+Orchestrator
+  orchestrator                   (Re-)configure boss/worker workflow:
+                                  main_session, worker_thread_parent,
+                                  dashboard_channel_id. Same step that runs
+                                  in step 5 of agentmux init.
+
 Discord bridge
   discord setup                  Walk through token + channel + user setup
   discord token                  Re-prompt + verify the bot token
@@ -264,17 +270,20 @@ function Show-VerbHelp([string]$verb) {
             @"
 Usage: .\agentmux init
 
-  Interactive first-time wizard. Five steps:
+  Interactive first-time wizard. Six steps:
     1. prerequisite check (binaries, claude on PATH)
     2. install Claude Code hooks (Stop + Notification + PreToolUse + PostToolUse)
        — idempotent; entries are dedup'd by basename, so reinstalling from
          a different folder converges to a single canonical entry
-    3. write broker config template (skipped if exists)
+    3. write broker config template (skipped if exists) + default_cwd prompt
     4. optional Discord setup (token + channels + users)
        — re-detects an already-configured Discord and skips
-    5. start broker (and tray + Discord) in the background
+    5. optional orchestrator workflow (main_session + worker_thread_parent +
+       dashboard_channel_id) — wires the boss/worker pattern from
+       docs/orchestrator-prompt.md across config.toml + discord.toml
+    6. start broker (and tray + Discord) in the background
 
-  Re-runnable; already-done steps are skipped.
+  Re-runnable; already-done steps are skipped or reconfirmed.
 "@
         }
         "start" {
@@ -301,6 +310,27 @@ Usage: .\agentmux stop
   Stops platform-discord, agentmux-tray, and broker (via the PID
   file under %LOCALAPPDATA%\agentmux\). Safe to run when nothing is
   running — exits cleanly.
+"@
+        }
+        "orchestrator" {
+            @"
+Usage: .\agentmux orchestrator
+
+  Configures the boss/worker workflow. Sets:
+    config.toml::main_session          — which session is the orchestrator
+    discord.toml::main_session         — must match (read by the bot)
+    discord.toml::worker_thread_parent — channel for auto-spawned worker
+                                         threads (0 = post in main's home)
+    discord.toml::dashboard_channel_id — channel for the live status panel
+                                         (0 = no dashboard)
+
+  Re-runnable. Existing values are shown as defaults; press Enter to keep.
+
+  After running, restart agentmux so broker injects the orchestrator system
+  prompt into the named session:
+    .\agentmux restart
+
+  See docs/orchestrator-prompt.md for what the prompt teaches the model.
 "@
         }
         "restart" {
@@ -528,7 +558,7 @@ function Cmd-Init([string[]]$Argv) {
     Write-Host ""
 
     # 1 — prereqs
-    Write-Host "[1/5] Checking prerequisites..." -ForegroundColor Cyan
+    Write-Host "[1/6] Checking prerequisites..." -ForegroundColor Cyan
     $missing = $false
     foreach ($pair in @(
         @{ Path = $brokerExe;  Label = "broker.exe" },
@@ -564,7 +594,7 @@ function Cmd-Init([string[]]$Argv) {
     # canonical one pointing at this folder's build. We always offer to
     # run it; the script's own output ("already installed" vs "migrated"
     # vs "consolidated N duplicates") is the source of truth.
-    Write-Host "[2/5] Claude Code hooks" -ForegroundColor Cyan
+    Write-Host "[2/6] Claude Code hooks" -ForegroundColor Cyan
     if (Test-HooksInstalled) {
         Write-Host "  ✓ Existing agentmux hooks detected in $hooksCfg"
         Write-Host "    (re-running is safe — it dedups + repoints to this folder's build)"
@@ -583,7 +613,7 @@ function Cmd-Init([string[]]$Argv) {
     Write-Host ""
 
     # 3 — broker config
-    Write-Host "[3/5] Broker configuration" -ForegroundColor Cyan
+    Write-Host "[3/6] Broker configuration" -ForegroundColor Cyan
     if (Test-Path $brokerCfg) {
         Write-Host "  ✓ broker config already exists at $brokerCfg"
     } else {
@@ -628,7 +658,7 @@ function Cmd-Init([string[]]$Argv) {
     Write-Host ""
 
     # 4 — discord (optional)
-    Write-Host "[4/5] Discord IM bridge (optional)" -ForegroundColor Cyan
+    Write-Host "[4/6] Discord IM bridge (optional)" -ForegroundColor Cyan
     $hasDiscordCfg   = Test-Path $discordCfg
     $hasDiscordToken = [bool][Environment]::GetEnvironmentVariable("DISCORD_BOT_TOKEN", "User")
     if ($hasDiscordCfg -and $hasDiscordToken) {
@@ -650,8 +680,13 @@ function Cmd-Init([string[]]$Argv) {
     }
     Write-Host ""
 
-    # 5 — start
-    Write-Host "[5/5] Start services" -ForegroundColor Cyan
+    # 5 — orchestrator (optional)
+    Write-Host "[5/6] Orchestrator workflow (optional)" -ForegroundColor Cyan
+    Cmd-OrchestratorSetup
+    Write-Host ""
+
+    # 6 — start
+    Write-Host "[6/6] Start services" -ForegroundColor Cyan
     $ans = Read-Host "  Start broker now? [Y/n]"
     if ($ans -ne "n" -and $ans -ne "N") {
         Cmd-Start @()
@@ -1373,6 +1408,128 @@ function Cmd-DiscordSetup {
     Write-Host "Re-open this PowerShell window so the env var propagates, then run .\agentmux start."
 }
 
+function Cmd-OrchestratorSetup {
+    # Orchestrator workflow — one session ("main") receives @-mentions
+    # in Discord, decides whether to dispatch work to other sessions
+    # (workers), and reports back. Workers get their own Discord thread.
+    # A dashboard channel shows all sessions' live status.
+    #
+    # Three knobs all live in the existing config files:
+    #   config.toml::main_session                 — the orchestrator session
+    #   discord.toml::main_session                — same value (must match)
+    #   discord.toml::worker_thread_parent        — channel under which
+    #                                               worker threads spawn
+    #   discord.toml::dashboard_channel_id        — where the status panel
+    #                                               lives as a single message
+    #
+    # All optional and additive: skipping leaves the bot in plain
+    # "every channel binds 1:1 to a session" mode (the pre-0.3.4 UX).
+    Require-Binary $agentmuxCli "agentmux-cli.exe"
+
+    if (-not (Test-Path $brokerCfg)) {
+        Write-Host "  ⚠ no broker config.toml at $brokerCfg" -ForegroundColor Yellow
+        Write-Host "    skipping orchestrator setup; run [3/6] broker config first."
+        return
+    }
+    $hasDiscord = Test-Path $discordCfg
+
+    # Read current values so we can show them and skip prompts where set.
+    $rawBroker  = Get-Content -LiteralPath $brokerCfg  -Raw -ErrorAction SilentlyContinue
+    $rawDiscord = if ($hasDiscord) { Get-Content -LiteralPath $discordCfg -Raw -ErrorAction SilentlyContinue } else { "" }
+
+    $currentMain    = $null
+    $currentParent  = $null
+    $currentDash    = $null
+    if ($rawBroker  -match '(?m)^\s*main_session\s*=\s*"([^"]*)"')          { $currentMain   = $matches[1] }
+    if ($rawDiscord -match '(?m)^\s*worker_thread_parent\s*=\s*(\d+)')      { $currentParent = $matches[1] }
+    if ($rawDiscord -match '(?m)^\s*dashboard_channel_id\s*=\s*(\d+)')      { $currentDash   = $matches[1] }
+
+    Write-Host ""
+    Write-Host "  The orchestrator pattern lets one 'main' session decide which" -ForegroundColor Cyan
+    Write-Host "  other sessions handle which tasks. Workers get their own Discord" -ForegroundColor Cyan
+    Write-Host "  thread; a dashboard channel shows everyone's live status." -ForegroundColor Cyan
+    Write-Host "  See docs/orchestrator-prompt.md for the full role spec."         -ForegroundColor Cyan
+    Write-Host ""
+
+    if ($currentMain) {
+        Write-Host "  current main_session: $currentMain" -ForegroundColor Green
+        if ($currentParent) { Write-Host "  current worker_thread_parent: $currentParent" -ForegroundColor Green }
+        if ($currentDash)   { Write-Host "  current dashboard_channel_id: $currentDash"   -ForegroundColor Green }
+        $ans = Read-Host "  Reconfigure orchestrator? [y/N]"
+    } else {
+        $ans = Read-Host "  Enable orchestrator workflow? [y/N]"
+    }
+    if ($ans -ne "y" -and $ans -ne "Y") {
+        Write-Host "  skipped — re-run later with .\agentmux init or edit the config files directly"
+        return
+    }
+
+    # main_session — required. Defaults to "default" since that session
+    # always exists. Empty string disables on the broker side.
+    $defaultMain = if ($currentMain) { $currentMain } else { "default" }
+    $mainName = Read-Host "    main session name [$defaultMain]"
+    if (-not $mainName) { $mainName = $defaultMain }
+    if ($mainName -match '\s') {
+        Write-Host "  ⚠ session names cannot contain whitespace — aborting" -ForegroundColor Yellow
+        return
+    }
+
+    & $agentmuxCli config set $brokerCfg main_session $mainName | Out-Null
+    Write-Host "    ✓ config.toml main_session = $mainName" -ForegroundColor Green
+
+    if ($hasDiscord) {
+        & $agentmuxCli config set $discordCfg main_session $mainName | Out-Null
+        Write-Host "    ✓ discord.toml main_session = $mainName" -ForegroundColor Green
+
+        Write-Host ""
+        Write-Host "    worker_thread_parent: a Discord channel under which the bot" -ForegroundColor Cyan
+        Write-Host "    creates a thread for every spawned worker. Right-click the" -ForegroundColor Cyan
+        Write-Host "    channel → Copy ID. Empty = workers post in main's home channel." -ForegroundColor Cyan
+        $defaultParent = if ($currentParent) { $currentParent } else { "-" }
+        $parentInput = Read-Host "    worker_thread_parent channel id [$defaultParent for unset]"
+        if (-not $parentInput) { $parentInput = $defaultParent }
+        if ($parentInput -ne "-") {
+            if ($parentInput -match '^\d{17,20}$') {
+                & $agentmuxCli config set $discordCfg worker_thread_parent $parentInput | Out-Null
+                Write-Host "    ✓ discord.toml worker_thread_parent = $parentInput" -ForegroundColor Green
+            } else {
+                Write-Host "    ⚠ '$parentInput' doesn't look like a Discord channel id — skipping" -ForegroundColor Yellow
+            }
+        } else {
+            & $agentmuxCli config set $discordCfg worker_thread_parent 0 | Out-Null
+            Write-Host "    ✓ discord.toml worker_thread_parent = 0 (no auto-thread)"
+        }
+
+        Write-Host ""
+        Write-Host "    dashboard_channel_id: a Discord channel where the bot maintains" -ForegroundColor Cyan
+        Write-Host "    a single embed listing every session and its current status." -ForegroundColor Cyan
+        Write-Host "    Updated every ~5 s. Empty = no dashboard."                     -ForegroundColor Cyan
+        $defaultDash = if ($currentDash) { $currentDash } else { "-" }
+        $dashInput = Read-Host "    dashboard_channel_id [$defaultDash for unset]"
+        if (-not $dashInput) { $dashInput = $defaultDash }
+        if ($dashInput -ne "-") {
+            if ($dashInput -match '^\d{17,20}$') {
+                & $agentmuxCli config set $discordCfg dashboard_channel_id $dashInput | Out-Null
+                Write-Host "    ✓ discord.toml dashboard_channel_id = $dashInput" -ForegroundColor Green
+            } else {
+                Write-Host "    ⚠ '$dashInput' doesn't look like a Discord channel id — skipping" -ForegroundColor Yellow
+            }
+        } else {
+            & $agentmuxCli config set $discordCfg dashboard_channel_id 0 | Out-Null
+            Write-Host "    ✓ discord.toml dashboard_channel_id = 0 (no dashboard)"
+        }
+    } else {
+        Write-Host ""
+        Write-Host "    (Discord not configured — skipping discord-side knobs."        -ForegroundColor Yellow
+        Write-Host "     The bootstrap prompt still injects, so the main session"     -ForegroundColor Yellow
+        Write-Host "     will know how to dispatch via curl from a terminal viewer.)" -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    Write-Host "  ✓ orchestrator configured. Restart with .\agentmux restart for" -ForegroundColor Green
+    Write-Host "    broker to inject the orchestrator system prompt into '$mainName'." -ForegroundColor Green
+}
+
 function Cmd-DiscordToken {
     Write-Host ""
     $token = Read-Token
@@ -1457,6 +1614,10 @@ switch ($Command) {
     "config"  { Cmd-Config  $Rest }
     "discord" { Cmd-Discord $Rest }
     "hooks"   { Cmd-Hooks   $Rest }
+    "orchestrator" {
+        if (Wants-Help $Rest) { Show-VerbHelp "orchestrator"; return }
+        Cmd-OrchestratorSetup
+    }
 
     "new"     { Cmd-New     $Rest }
     "kill"    { Cmd-Kill    $Rest }

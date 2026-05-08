@@ -24,6 +24,10 @@ pub struct SessionLite {
     pub state: String,
     pub viewers: usize,
     pub cwd: String,
+    /// One-line "what is this session doing right now". Added in 0.3.4
+    /// alongside the orchestrator work; older brokers omit the field
+    /// (serde fills with empty string via the struct-level default).
+    pub current_status: String,
 }
 
 /// Outcome of a `send_input` call. Splits the LocallyOwned case out
@@ -56,6 +60,7 @@ impl Default for SessionLite {
             state: "idle".to_string(),
             viewers: 0,
             cwd: String::new(),
+            current_status: String::new(),
         }
     }
 }

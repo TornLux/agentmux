@@ -22,7 +22,7 @@
 //!    a `message_reference` pointing to a known assistant message,
 //!    the forward overrides the channel binding for that one turn.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -140,6 +140,19 @@ pub struct BotState {
     /// channel when the user keeps trying to talk to a demoted
     /// session, but the first rejection always carries the explanation.
     locally_owned_last_full: Mutex<HashMap<u64, Instant>>,
+    /// Channel ids the bot itself created as worker threads (via
+    /// `session_created` events from broker). Lets the @-mention
+    /// router distinguish "user is in #general / DM" (route to main
+    /// orchestrator) from "user is inside a worker's thread" (route
+    /// to that worker via channel binding). In-memory only — bot
+    /// restart needs to repopulate from channel_bindings + thread
+    /// detection if perfect coverage is required.
+    worker_thread_ids: Mutex<HashSet<u64>>,
+    /// Most recent channel where the user @-mentioned the orchestrator.
+    /// Used by the WS-event relay to route callback-driven main
+    /// turns (which have no in-flight placeholder) back to the place
+    /// the user actually asked from. None until first @-mention.
+    last_main_home: Mutex<Option<u64>>,
 }
 
 /// How long after a full "session is locally-owned" message the bot
@@ -201,7 +214,32 @@ impl BotState {
             state_file,
             pending_file,
             locally_owned_last_full: Mutex::new(HashMap::new()),
+            worker_thread_ids: Mutex::new(HashSet::new()),
+            last_main_home: Mutex::new(None),
         })
+    }
+
+    /// Mark a channel id as a bot-created worker thread.
+    pub async fn mark_worker_thread(&self, channel_id: u64) {
+        self.worker_thread_ids.lock().await.insert(channel_id);
+    }
+
+    /// Was `channel_id` previously marked as a worker thread? Used by
+    /// the @-mention router to decide whether to route to the main
+    /// orchestrator (false) or to the channel-bound session (true).
+    pub async fn is_worker_thread(&self, channel_id: u64) -> bool {
+        self.worker_thread_ids.lock().await.contains(&channel_id)
+    }
+
+    /// Remember where the user last @-mentioned the orchestrator so
+    /// callback-driven main turns post their reply back to the same
+    /// channel.
+    pub async fn set_main_home(&self, channel_id: u64) {
+        *self.last_main_home.lock().await = Some(channel_id);
+    }
+
+    pub async fn main_home(&self) -> Option<u64> {
+        *self.last_main_home.lock().await
     }
 
     /// Decide whether to post a full "session is locally-owned"

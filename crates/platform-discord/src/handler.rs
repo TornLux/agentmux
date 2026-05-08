@@ -81,6 +81,10 @@ pub struct Handler {
     /// `OnceLock` because we only ever set it once and reads should
     /// be lock-free.
     bot_user_id: OnceLock<u64>,
+    /// Optional dashboard panel — `Some` iff
+    /// `config.dashboard_channel_id` is non-zero. `ready()` calls
+    /// `bootstrap` on it, then spawns the refresher.
+    pub dashboard: Option<Arc<crate::dashboard::Dashboard>>,
 }
 
 impl Handler {
@@ -88,12 +92,14 @@ impl Handler {
         config: Arc<DiscordConfig>,
         broker: Arc<BrokerClient>,
         state: Arc<BotState>,
+        dashboard: Option<Arc<crate::dashboard::Dashboard>>,
     ) -> Self {
         Self {
             config,
             broker,
             state,
             bot_user_id: OnceLock::new(),
+            dashboard,
         }
     }
 
@@ -142,6 +148,19 @@ impl EventHandler for Handler {
                 }
             ),
             Err(e) => warn!("slash command registration failed: {e}"),
+        }
+
+        // Dashboard bootstrap. Bot user id is finally known here, which
+        // we need to find our own prior dashboard message so the bot
+        // doesn't pile up a fresh post on every restart.
+        if let Some(dash) = &self.dashboard {
+            match dash.bootstrap(&ctx.http, ready.user.id.get()).await {
+                Ok(_) => {
+                    dash.clone().spawn_refresher(ctx.http.clone(), self.broker.clone());
+                    info!("dashboard panel up");
+                }
+                Err(e) => warn!("dashboard bootstrap failed: {e}"),
+            }
         }
     }
 
@@ -211,9 +230,29 @@ impl EventHandler for Handler {
                 s.clone()
             }
             None => {
-                self.state
-                    .resolve_or_bind(cid, &self.config.default_session)
-                    .await
+                // Orchestrator routing: if the user @-mentioned the bot
+                // in a channel that's NOT a known worker thread, send
+                // the turn to `main_session` regardless of any prior
+                // channel binding. Mentions inside a worker's thread
+                // still route to that worker via the binding so the
+                // user can interrupt / supplement mid-task. Empty
+                // main_session disables this — bot behaves as before.
+                let prefer_main = mentioned
+                    && !self.config.main_session.is_empty()
+                    && !self.state.is_worker_thread(cid).await;
+                if prefer_main {
+                    self.state.bind(cid, self.config.main_session.clone()).await;
+                    self.state.set_main_home(cid).await;
+                    tracing::debug!(
+                        "@-mention routed to main_session={} (channel {cid} marked as home)",
+                        self.config.main_session
+                    );
+                    self.config.main_session.clone()
+                } else {
+                    self.state
+                        .resolve_or_bind(cid, &self.config.default_session)
+                        .await
+                }
             }
         };
 

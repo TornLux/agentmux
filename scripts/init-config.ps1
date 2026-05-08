@@ -95,6 +95,36 @@ $content = @'
 # cwd does not depend on which directory you happened to be in
 # when you ran `.\agentmux start`.
 # default_cwd = "G:\\projects\\my-main-repo"
+
+# --- Tool-approval gate -------------------------------------------------
+# "off" (default since 0.3.4) lets every tool call through without asking.
+# "ask" re-enables hook-pretool's classifier and the Discord/tray approval
+# round-trip — set this only if you want a second human-in-the-loop layer
+# on top of claude's own --dangerously-skip-permissions.
+# tool_approval = "off"
+
+# --- Orchestrator workflow (Phase 1 of boss/worker) ---------------------
+# Name of the session that acts as the orchestrator. Empty (default) =
+# no orchestration; sessions behave as plain claude instances. Non-empty:
+# at startup broker injects docs/orchestrator-prompt.md as a [SYSTEM:
+# orchestrator-bootstrap] block into this session, teaching it to
+# dispatch work to other sessions via /sessions/:caller/dispatch.
+# Skipped on resumed sessions — the prompt is already in the conversation
+# history.
+#
+# Set this via `.\agentmux orchestrator` so discord.toml gets the matching
+# value too.
+# main_session = "default"
+
+# Per-session cap on simultaneous in-flight dispatches. Prevents a runaway
+# orchestrator from spawning unbounded workers. 0 = unlimited.
+# max_active_dispatches_per_session = 5
+
+# Wall-clock deadline (seconds) for a dispatched task; broker auto-fails
+# the callback if the worker hasn't emitted assistant_message by then.
+# 30 minutes is comfortable for most coding turns; raise for long builds
+# or research tasks.
+# dispatch_timeout_secs = 1800
 '@
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

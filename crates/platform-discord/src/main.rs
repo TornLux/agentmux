@@ -17,6 +17,7 @@ mod ansi;
 mod attachments;
 mod broker;
 mod config;
+mod dashboard;
 mod handler;
 mod progress;
 mod slash;
@@ -28,7 +29,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serenity::all::{
-    ChannelId, CreateMessage, EditMessage, GatewayIntents, Http, MessageId,
+    AutoArchiveDuration, ChannelId, ChannelType, CreateMessage, CreateThread, EditMessage,
+    GatewayIntents, Http, MessageId,
 };
 use serenity::Client;
 use tracing::{info, warn};
@@ -84,7 +86,17 @@ async fn main() -> Result<()> {
         | GatewayIntents::GUILD_MESSAGE_REACTIONS
         | GatewayIntents::DIRECT_MESSAGE_REACTIONS;
 
-    let handler = Handler::new(config.clone(), broker_client.clone(), bot_state.clone());
+    let dashboard = if config.dashboard_channel_id != 0 {
+        Some(dashboard::Dashboard::new(config.dashboard_channel_id))
+    } else {
+        None
+    };
+    let handler = Handler::new(
+        config.clone(),
+        broker_client.clone(),
+        bot_state.clone(),
+        dashboard,
+    );
 
     let mut client = Client::builder(&token, intents)
         .event_handler(handler)
@@ -197,9 +209,87 @@ async fn relay_event_to_discord(
                 .unwrap_or(serde_json::Value::Null);
             relay_tool_progress(http, state, &session_name, tool_name, &tool_input).await;
         }
+        "session_created" => {
+            handle_session_created(http, config, state, event).await;
+        }
         other => {
             tracing::debug!("ws event ignored: type={other}");
         }
+    }
+}
+
+/// React to broker's `session_created` event when it includes a
+/// `desired_thread_parent`: create a Discord thread under that parent
+/// channel, bind the new thread to the new session, and post a short
+/// welcome message so the channel sidebar shows the task immediately.
+///
+/// If `desired_thread_parent` is missing/0, do nothing — bare session
+/// creation (e.g. from `agentmux new`) doesn't need a thread.
+///
+/// Falls back to `worker_thread_parent` from discord.toml when broker's
+/// event doesn't carry an explicit parent. This covers the case where
+/// the orchestrator dispatches without setting one and the user wants a
+/// global "all worker threads live in #workers" policy.
+async fn handle_session_created(
+    http: &Arc<Http>,
+    config: &DiscordConfig,
+    state: &Arc<BotState>,
+    event: &serde_json::Value,
+) {
+    let session_name = event
+        .get("session_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    if session_name == "?" {
+        return;
+    }
+
+    let parent_id = event
+        .get("desired_thread_parent")
+        .and_then(|v| v.as_u64())
+        .filter(|n| *n != 0)
+        .unwrap_or(config.worker_thread_parent);
+    if parent_id == 0 {
+        tracing::debug!(
+            "session_created session={session_name}: no thread parent (event=0, config=0); skipping thread"
+        );
+        return;
+    }
+
+    let parent = ChannelId::new(parent_id);
+    // Thread name = session name. Discord caps at 100 chars; our
+    // session names cap at 32 already, so no truncation needed.
+    let builder = CreateThread::new(format!("agentmux:{session_name}"))
+        .kind(ChannelType::PublicThread)
+        .auto_archive_duration(AutoArchiveDuration::OneWeek);
+    let thread = match parent.create_thread(http, builder).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("create_thread under {parent_id} for session={session_name}: {e}");
+            return;
+        }
+    };
+    let tid = thread.id.get();
+    state.mark_worker_thread(tid).await;
+    state.bind(tid, session_name.clone()).await;
+    info!(
+        "thread {tid} created for session={session_name} under parent={parent_id}"
+    );
+
+    // Welcome message — also acts as the first message users can reply
+    // to in the thread (which reply-thread routing then bounces back
+    // to this worker).
+    let welcome = format!(
+        "🧵 thread for session **{session_name}** — type here to send input \
+         (or `!interrupt` to Ctrl+C), reactions on bot replies still work"
+    );
+    if let Err(e) = thread
+        .id
+        .send_message(http, CreateMessage::new().content(welcome))
+        .await
+    {
+        warn!("welcome message in thread {tid}: {e}");
     }
 }
 
@@ -468,11 +558,23 @@ async fn send_fresh_chunks(
 /// Prefer a channel currently bound to this session (any of them, if
 /// multiple are bound — first wins). Fall back to `channel_ids[0]` so
 /// unsolicited events from never-bound sessions still surface.
+///
+/// Special case: if `session_name` is the configured main orchestrator
+/// AND we have a recorded `main_home` (from the most recent @-mention),
+/// route there. Otherwise the orchestrator's callback-driven turns
+/// would land in whatever channel happens to be at the top of its
+/// HashMap binding iteration — possibly a stale channel the user
+/// hasn't visited in days. Conscious "follow the user" behaviour.
 async fn pick_channel(
     config: &DiscordConfig,
     state: &Arc<BotState>,
     session_name: &str,
 ) -> Option<ChannelId> {
+    if !config.main_session.is_empty() && session_name == config.main_session {
+        if let Some(home) = state.main_home().await {
+            return Some(ChannelId::new(home));
+        }
+    }
     let bound = state.channels_for(session_name).await;
     if let Some(c) = bound.first() {
         return Some(ChannelId::new(*c));
