@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -20,7 +20,7 @@ use bytes::Bytes;
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use serde::{Deserialize, Serialize};
 use shared::config::Config;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{error, info, warn};
 
 use crate::ringbuf::RingBuffer;
@@ -205,6 +205,14 @@ pub struct Session {
     orchestrator_bootstrapped: Mutex<bool>,
     last_activity: Mutex<Instant>,
     inner: Mutex<SessionInner>,
+    /// Watch channel for "claude TUI is ready to accept user input."
+    /// Set to `false` by `arm_boot_probe` whenever a fresh claude
+    /// child is spawned (create / resume / restart) and to `true` once
+    /// the readiness probe sees the TUI quiesce. `await_ready()` parks
+    /// callers on this; already-ready sessions return immediately.
+    /// Default `false` — sessions reconstructed Hibernated stay false
+    /// until the first resume() arms a probe.
+    boot_ready: watch::Sender<bool>,
     /// `Arc::new_cyclic` plumbing: lets `&self` methods that need to
     /// hand the session arc to a thread (PTY reader, crash watcher,
     /// resume()) recover an Arc<Self> without callers having to thread
@@ -258,6 +266,7 @@ impl Session {
         );
         session.start_pty(use_resume)?;
         *session.state.lock().unwrap() = SessionState::Idle;
+        session.arm_boot_probe();
         Ok(session)
     }
 
@@ -336,6 +345,7 @@ impl Session {
                 writer: None,
                 child: None,
             }),
+            boot_ready: watch::channel(false).0,
             self_weak: weak.clone(),
         });
 
@@ -359,6 +369,17 @@ impl Session {
     }
 
     fn start_pty(&self, use_resume: bool) -> Result<()> {
+        // Serialise claude child spawns: claude code reads-and-writes
+        // its own ~/.claude.json on startup without any file lock, so
+        // two children whose init IO overlaps can corrupt the JSON
+        // (one writes its full version, the other writes a slightly
+        // shorter version on top, leaving the first version's tail
+        // dangling → "JSON Parse error" on next launch). Spacing
+        // spawns by ~500 ms is well above the few-ms write window, so
+        // two children never share it. Cheap insurance against an
+        // upstream concurrency bug we can't fix from here.
+        enforce_spawn_throttle();
+
         let mut effective_argv = self.argv.clone();
         if use_resume {
             if let Some(id) = self.claude_session_id.lock().unwrap().clone() {
@@ -654,6 +675,7 @@ impl Session {
         self.touch_activity();
         self.start_pty(true)?;
         *self.state.lock().unwrap() = SessionState::Idle;
+        self.arm_boot_probe();
         Ok(())
     }
 
@@ -672,7 +694,64 @@ impl Session {
         // session id, just a fresh process.
         self.start_pty(true)?;
         *self.state.lock().unwrap() = SessionState::Idle;
+        self.arm_boot_probe();
         Ok(())
+    }
+
+    /// Block until the TUI is ready to receive a user-input burst.
+    /// Returns immediately for already-ready sessions (watch::borrow is
+    /// a cheap atomic load). Bounded by the readiness probe's MAX_WAIT
+    /// (10 s); after that the probe gives up and flips `boot_ready` to
+    /// true anyway, so a stuck TUI can't deadlock callers — see
+    /// `probe_tui_ready` for the timeout `warn!`.
+    pub async fn await_ready(&self) {
+        let mut rx = self.boot_ready.subscribe();
+        loop {
+            if *rx.borrow_and_update() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Reset `boot_ready` to false and spawn a probe task that flips it
+    /// to true once the TUI quiesces. Called from start_pty's three
+    /// entry points (create_and_start / resume / restart) — anywhere a
+    /// fresh claude child is brought up. Idempotent in spirit: if a
+    /// previous probe is still running when this fires (rapid restart),
+    /// both will eventually `send(true)` but only the first transition
+    /// matters for waiters.
+    fn arm_boot_probe(&self) {
+        // send_replace, not send: send returns Err when there are no
+        // alive receivers, and on the first spawn there are none yet
+        // (await_ready's subscribe happens later, on the first input).
+        // Err means the value isn't stored, leaving boot_ready stuck at
+        // its initial false forever. send_replace stores the value
+        // unconditionally, which is what we want for "publish current
+        // state for any future subscriber to read."
+        self.boot_ready.send_replace(false);
+        let weak = self.self_weak.clone();
+        tokio::spawn(async move {
+            let Some(session) = weak.upgrade() else { return };
+            match probe_tui_ready(&session).await {
+                ProbeOutcome::Ready { bytes, elapsed } => {
+                    info!(
+                        "session {}: TUI ready after {:?} ({} bytes)",
+                        session.name, elapsed, bytes
+                    );
+                }
+                ProbeOutcome::Timeout { bytes, elapsed } => {
+                    warn!(
+                        "session {}: readiness probe timed out after {:?} \
+                         ({} bytes); releasing waiters anyway",
+                        session.name, elapsed, bytes
+                    );
+                }
+            }
+            session.boot_ready.send_replace(true);
+        });
     }
 
     pub fn shutdown(&self) {
@@ -771,5 +850,81 @@ impl Session {
         let mut v: Vec<ClientInfo> = g.values().cloned().collect();
         v.sort_by_key(|c| c.viewer_id);
         v
+    }
+}
+
+/// Minimum gap between successive `claude` child spawns.
+/// See `start_pty`'s call site for the rationale.
+const MIN_SPAWN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Block until at least `MIN_SPAWN_INTERVAL` has passed since the last
+/// spawn observed by this process. Holds the mutex across the sleep so
+/// a burst of N concurrent callers serialises into N×500ms total
+/// (rather than each measuring from the same starting point and
+/// finishing simultaneously). `None` on first call = immediate proceed.
+/// Sync (std) primitives because `start_pty` itself is sync and called
+/// from a mix of contexts (broker startup, axum handlers, tokio
+/// spawn_blocking); a few hundred ms of thread blocking on the spawn
+/// path is acceptable since spawn is rare and the broker uses a
+/// multi-thread tokio runtime.
+fn enforce_spawn_throttle() {
+    static LAST_SPAWN: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    let lock = LAST_SPAWN.get_or_init(|| Mutex::new(None));
+    let mut g = lock.lock().unwrap();
+    if let Some(prev) = *g {
+        let elapsed = Instant::now().duration_since(prev);
+        if elapsed < MIN_SPAWN_INTERVAL {
+            std::thread::sleep(MIN_SPAWN_INTERVAL - elapsed);
+        }
+    }
+    *g = Some(Instant::now());
+}
+
+/// Outcome of a single readiness probe — whether the TUI quiesced
+/// within the budget or the probe gave up to keep callers from
+/// blocking forever.
+enum ProbeOutcome {
+    Ready { bytes: usize, elapsed: Duration },
+    Timeout { bytes: usize, elapsed: Duration },
+}
+
+/// Watch the session's PTY ring until claude's startup output settles
+/// into a "TUI fully drawn" state. The signal: ring has accumulated
+/// enough bytes to rule out an early-init sliver (so we don't return
+/// on the first silent gap during transcript loading) and *then*
+/// stays unchanged long enough to span claude's normal init pauses.
+///
+/// Thresholds tuned against `claude --resume` on Win11 + Rust release:
+///   * MIN_OUTPUT 500 — bare-minimum draw is ~7 KB; 500 rules out the
+///     first sub-1 KB stall
+///   * STABLE 1500 ms — observed init gaps ran up to ~1 s, so 1.5 s
+///     of quiet means the input box is mounted
+///   * MAX_WAIT 10 s — fallback so a stuck claude doesn't strand
+///     dispatch / IM forever
+async fn probe_tui_ready(session: &Session) -> ProbeOutcome {
+    const POLL: Duration = Duration::from_millis(100);
+    const STABLE: Duration = Duration::from_millis(1500);
+    const MIN_OUTPUT: usize = 500;
+    const MAX_WAIT: Duration = Duration::from_secs(10);
+
+    let start = Instant::now();
+    let mut last_size: usize = session.pty_out.ring.lock().unwrap().len();
+    let mut last_change = start;
+    loop {
+        tokio::time::sleep(POLL).await;
+        let now = Instant::now();
+        let size = session.pty_out.ring.lock().unwrap().len();
+        if size != last_size {
+            last_size = size;
+            last_change = now;
+        }
+        let stable_for = now.duration_since(last_change);
+        let elapsed = now.duration_since(start);
+        if size >= MIN_OUTPUT && stable_for >= STABLE {
+            return ProbeOutcome::Ready { bytes: size, elapsed };
+        }
+        if elapsed >= MAX_WAIT {
+            return ProbeOutcome::Timeout { bytes: size, elapsed };
+        }
     }
 }

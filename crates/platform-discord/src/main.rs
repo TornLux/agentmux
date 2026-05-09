@@ -29,8 +29,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serenity::all::{
-    AutoArchiveDuration, ChannelId, ChannelType, CreateMessage, CreateThread, EditMessage,
-    GatewayIntents, Http, MessageId,
+    AutoArchiveDuration, ChannelId, ChannelType, CreateForumPost, CreateMessage, CreateThread,
+    EditMessage, GatewayIntents, Http, MessageId,
 };
 use serenity::Client;
 use tracing::{info, warn};
@@ -260,16 +260,48 @@ async fn handle_session_created(
     let parent = ChannelId::new(parent_id);
     // Thread name = session name. Discord caps at 100 chars; our
     // session names cap at 32 already, so no truncation needed.
-    let builder = CreateThread::new(format!("agentmux:{session_name}"))
-        .kind(ChannelType::PublicThread)
-        .auto_archive_duration(AutoArchiveDuration::OneWeek);
-    let thread = match parent.create_thread(http, builder).await {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("create_thread under {parent_id} for session={session_name}: {e}");
-            return;
-        }
-    };
+    let title = format!("agentmux:{session_name}");
+    let welcome = format!(
+        "🧵 thread for session **{session_name}** — type here to send input \
+         (or `!interrupt` to Ctrl+C), reactions on bot replies still work"
+    );
+
+    // Discord has two distinct thread-creation endpoints:
+    //   * Forum / Media channels: POST /channels/:id/threads with a
+    //     `message` body — the starter post is mandatory.
+    //   * Text channels: POST /channels/:id/threads with just a name —
+    //     no starter message allowed/required.
+    // serenity exposes these as `create_forum_post` and `create_thread`.
+    // Forum is the documented design (one post per worker, archive after
+    // a week), so try that first; fall back to text-channel thread if
+    // the parent turns out to be a regular text channel and Discord
+    // rejects the forum-post call.
+    let forum_builder = CreateForumPost::new(
+        title.clone(),
+        CreateMessage::new().content(welcome.clone()),
+    )
+    .auto_archive_duration(AutoArchiveDuration::OneWeek);
+
+    let (thread, welcome_already_posted) =
+        match parent.create_forum_post(http, forum_builder).await {
+            Ok(t) => (t, true),
+            Err(forum_err) => {
+                // Parent isn't a forum channel — try the text-channel API.
+                let text_builder = CreateThread::new(title)
+                    .kind(ChannelType::PublicThread)
+                    .auto_archive_duration(AutoArchiveDuration::OneWeek);
+                match parent.create_thread(http, text_builder).await {
+                    Ok(t) => (t, false),
+                    Err(text_err) => {
+                        warn!(
+                            "create thread under {parent_id} for session={session_name}: \
+                             forum_post={forum_err}; create_thread={text_err}"
+                        );
+                        return;
+                    }
+                }
+            }
+        };
     let tid = thread.id.get();
     state.mark_worker_thread(tid).await;
     state.bind(tid, session_name.clone()).await;
@@ -277,19 +309,16 @@ async fn handle_session_created(
         "thread {tid} created for session={session_name} under parent={parent_id}"
     );
 
-    // Welcome message — also acts as the first message users can reply
-    // to in the thread (which reply-thread routing then bounces back
-    // to this worker).
-    let welcome = format!(
-        "🧵 thread for session **{session_name}** — type here to send input \
-         (or `!interrupt` to Ctrl+C), reactions on bot replies still work"
-    );
-    if let Err(e) = thread
-        .id
-        .send_message(http, CreateMessage::new().content(welcome))
-        .await
-    {
-        warn!("welcome message in thread {tid}: {e}");
+    if !welcome_already_posted {
+        // Text-channel thread path needs an explicit welcome message
+        // (forum-post path already attached it as the starter).
+        if let Err(e) = thread
+            .id
+            .send_message(http, CreateMessage::new().content(&welcome))
+            .await
+        {
+            warn!("welcome message in thread {tid}: {e}");
+        }
     }
 }
 

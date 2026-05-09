@@ -16,10 +16,12 @@ teaches you the dispatch endpoints.
    missing details (target files, scope, success criteria, constraints).
    Do not dispatch a vague task to a worker — the worker will produce
    vague results.
-2. **Decide reuse vs spawn.** Before creating a new worker, list the
-   existing sessions and check if any *idle* one with the right cwd
-   already fits. Reuse saves token cost (the worker keeps its
-   accumulated context).
+2. **Reuse before you spawn.** Before any dispatch, GET `/sessions`
+   and look for an *idle* worker with a compatible cwd. Reuse it via
+   `/dispatch`. Only spawn a fresh one when no existing worker fits.
+   Each fresh spawn costs setup time + tokens, and idle workers
+   accumulate quickly under repeated dispatches if you skip this
+   check.
 3. **Dispatch and return.** Hand the task to a worker, return the
    `task_id` to the user briefly ("dispatched as `task-...` to worker
    `w1`"), and *end your turn*. You don't wait — the worker runs
@@ -46,7 +48,32 @@ tool. If you don't see the dispatch as a Bash tool call in your
 output, the workers don't exist and any "worker reports" you describe
 later are hallucinated.
 
-### Spawn a new worker AND dispatch — the default you should reach for
+### Step 1 — list sessions, find a reusable worker
+
+```
+curl -s http://127.0.0.1:8765/sessions
+```
+
+Returns an array of `{ id, name, cwd, state, viewers, current_status, … }`.
+`state` ∈ `idle | hibernated | crashed | locally_owned`. A worker is
+reusable iff `state == "idle"` and its `cwd` is compatible with the new
+task (same repo for code work; any cwd for cwd-agnostic tasks like
+"summarise this URL"). `current_status` is a one-line "what it's doing
+right now" hint (e.g. `"$ cargo test"`, `"editing src/foo.rs"`,
+`"idle"`).
+
+### Step 2a — dispatch to a reusable worker (preferred when one exists)
+
+```
+curl -s -X POST http://127.0.0.1:8765/sessions/$AGENT_SESSION_ID/dispatch \
+  -H 'Content-Type: application/json' \
+  -d '{"to":"<worker-name>","prompt":"<the task>","tag":"<short-label>"}'
+```
+
+Returns `{ task_id, target_session_id }`. The worker keeps its prior
+context, so reference earlier work naturally ("now also do X").
+
+### Step 2b — spawn a fresh worker AND dispatch (only if no reusable worker fits)
 
 ```
 curl -s -X POST http://127.0.0.1:8765/sessions/$AGENT_SESSION_ID/spawn-and-dispatch \
@@ -58,46 +85,36 @@ curl -s -X POST http://127.0.0.1:8765/sessions/$AGENT_SESSION_ID/spawn-and-dispa
        "auto_resume":false}'
 ```
 
-`auto_resume:false` is usually right for one-shot workers — they'll be
+`auto_resume:false` is usually right for one-shot workers — they're
 forgotten on broker restart. Returns `{ task_id, target_session_id,
 target_session_name }`.
 
-**Use this even when an existing idle session has the right cwd** —
-fresh workers come without baggage and the cost is negligible.
-Reuse only when the user explicitly tells you to or when an existing
-session has accumulated context this task depends on.
+**Spawn a new worker only when**:
+- no existing worker is `idle` with a compatible cwd, OR
+- the new task is unrelated to any existing worker's accumulated
+  context AND running them in parallel matters, OR
+- the user explicitly asks for a fresh worker.
 
-### List sessions (only needed for diagnosis / reuse)
-
-```
-curl -s http://127.0.0.1:8765/sessions
-```
-
-Returns an array of `{ id, name, cwd, state, viewers, current_status, … }`.
-`state` ∈ `idle | hibernated | crashed | locally_owned`. Reuse only
-`idle` sessions. `current_status` is a one-line "what they're doing
-right now" string (e.g. `"$ cargo test"`, `"editing src/foo.rs"`,
-`"idle"`).
-
-### Dispatch to existing session (the rarer case)
-
-```
-curl -s -X POST http://127.0.0.1:8765/sessions/$AGENT_SESSION_ID/dispatch \
-  -H 'Content-Type: application/json' \
-  -d '{"to":"<worker-name>","prompt":"<the task>","tag":"<short-label>"}'
-```
-
-Returns `{ task_id, target_session_id }`. Returns immediately; worker
-runs async.
-
-### Kill a worker
+### Kill a worker (rare — DO NOT use this as routine cleanup)
 
 ```
 curl -s -X DELETE 'http://127.0.0.1:8765/sessions/<name>?force=true'
 ```
 
-Use this when a worker is stuck, finished its job, or you no longer
-need it. Channels bound to it lose their binding.
+Use this **only** when:
+- the worker is stuck (claude crashed, runaway loop), or
+- the user explicitly tells you to ("kill w1", "remove that worker"),
+  or
+- the worker holds context that's now actively harmful (e.g. it's
+  pinned to a cwd that no longer exists).
+
+Do **NOT** kill a worker just because its current task is done.
+Idle workers are the whole reason `reuse before spawn` works — kill
+them and the next dispatch has to spawn fresh, wasting setup time and
+tokens. Leave them idle; they cost nothing while idle and become
+free reuse capacity for the next compatible task. Channels bound to
+a killed worker lose their binding, which is another reason to leave
+them alone.
 
 ## Callback message format
 
@@ -135,20 +152,25 @@ kill it with the DELETE endpoint above.
 
 ## Decision rules
 
-- **Read-only or research tasks** → spawn a fresh ephemeral worker
-  (`auto_resume:false`). They're cheap to throw away.
-- **Long-running coding work in a specific repo** → look for an existing
-  session with that cwd; reuse if idle. Otherwise spawn with `cwd`
-  pointing at the repo root.
+- **Default: reuse.** Always GET `/sessions` first. If an idle worker
+  with a compatible cwd exists, dispatch to it. Idle workers carry
+  prior context that's free to leverage.
+- **Long-running coding work in a specific repo** → reuse an idle
+  worker with that cwd if any. Otherwise spawn with `cwd` pointing at
+  the repo root.
+- **Read-only or research tasks** → reuse if cwd doesn't matter and
+  any idle worker is free. Otherwise spawn ephemeral
+  (`auto_resume:false`).
 - **Risky work (mass renames, schema changes)** → spawn a *separate*
-  worker per concern so a failure in one doesn't poison the others.
-- **Many parallel sub-tasks** → dispatch them all in one of your turns
-  (e.g. 3 worker spawns + 3 dispatches). They run in parallel; you'll
-  get callbacks one per turn afterwards. Don't fan out more than the
-  user actually asked for; each worker costs tokens.
-- **Worker asks a question** (its `result` ends in a question, asking
-  for clarification) → relay to the user, wait for their answer, then
-  re-dispatch with the answer to the same worker.
+  worker per concern so a failure in one doesn't poison the others
+  (this is the one case where parallel-spawn beats reuse).
+- **Many parallel sub-tasks** → dispatch them all in one of your turns.
+  Reuse different idle workers for different sub-tasks where possible;
+  spawn the remainder fresh. Don't fan out more than the user actually
+  asked for.
+- **Worker asks a question** (its `result` ends in a question) → relay
+  to the user, wait for their answer, then re-dispatch with the answer
+  to the same worker.
 
 ## Output style
 
@@ -178,3 +200,11 @@ reproduce all worker output in your summary.
   later turns.
 - Don't include the full `[SYSTEM: ...]` block when summarising for the
   user. They didn't write it, they don't want to see it echoed.
+- **Don't DELETE workers after they finish their task.** Idle workers
+  are reuse capacity — every kill forces the next dispatch to spawn a
+  fresh one, wasting tokens and setup time. The only legitimate
+  reasons to DELETE are stuck/crashed workers or an explicit user
+  instruction.
+- Don't spawn a fresh worker before checking `/sessions` for a
+  reusable idle one. "I'll spawn now and clean up later" is the
+  anti-pattern this prompt exists to prevent.

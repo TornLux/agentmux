@@ -528,11 +528,9 @@ async fn main() -> Result<()> {
                 let main_name = main.name.clone();
                 let manager_for_save = manager.clone();
                 tokio::spawn(async move {
-                    let why = wait_until_claude_ready(&main_clone).await;
-                    info!(
-                        "orchestrator bootstrap → {}: claude ready ({why})",
-                        main_clone.name
-                    );
+                    // deliver_to_session → write_user_burst awaits the
+                    // session's boot_ready watch; no need for a
+                    // separate pre-wait here.
                     let prompt = format_orchestrator_bootstrap();
                     match deliver_to_session(&main_clone, &prompt).await {
                         Ok(_) => {
@@ -1724,48 +1722,6 @@ async fn http_event(
     "ok"
 }
 
-/// Waits until claude's PTY output settles into a "TUI fully drawn"
-/// state. The signal: the ring buffer has accumulated enough bytes to
-/// rule out an early-init sliver (so we don't return on the first
-/// silent gap during transcript loading) and *then* stays unchanged
-/// for long enough to span claude's normal init pauses.
-///
-/// Thresholds were tuned against `claude --resume` on Win11 + Rust
-/// release build:
-///   * MIN_OUTPUT 500 — a bare-minimum draw is ~7 KB; 500 is enough
-///     to rule out the first sub-1 KB stall
-///   * STABLE 1500 ms — observed init gaps ran up to ~1 s, so 1.5 s
-///     of quiet means the input box is mounted
-///   * MAX_WAIT 10 s — fallback so a stuck claude doesn't hang IM
-async fn wait_until_claude_ready(session: &Arc<session::Session>) -> String {
-    const POLL: Duration = Duration::from_millis(100);
-    const STABLE: Duration = Duration::from_millis(1500);
-    const MIN_OUTPUT: usize = 500;
-    const MAX_WAIT: Duration = Duration::from_secs(10);
-
-    let start = std::time::Instant::now();
-    let mut last_size: usize = session.pty_out.ring.lock().unwrap().len();
-    let mut last_change = start;
-
-    loop {
-        tokio::time::sleep(POLL).await;
-        let now = std::time::Instant::now();
-        let size = session.pty_out.ring.lock().unwrap().len();
-        if size != last_size {
-            last_size = size;
-            last_change = now;
-        }
-        let stable_for = now.duration_since(last_change);
-        let elapsed = now.duration_since(start);
-        if size >= MIN_OUTPUT && stable_for >= STABLE {
-            return format!("ring stable: {size} bytes after {elapsed:?}");
-        }
-        if elapsed >= MAX_WAIT {
-            return format!("max wait reached: {size} bytes after {elapsed:?}");
-        }
-    }
-}
-
 /// Diagnostic: returns the session's ring buffer snapshot as raw bytes.
 /// Pipe through `od -c` / `xxd` to see exactly what claude is rendering
 /// — useful when tracking down "input goes in but doesn't submit"
@@ -1916,9 +1872,8 @@ async fn http_input(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("resume: {e}")))?;
-
-        let why = wait_until_claude_ready(&session).await;
-        info!("/input post-resume readiness: {why}");
+        // resume() arms a fresh boot probe; write_user_burst's
+        // await_ready picks that up before the first byte goes in.
     }
 
     let text_bytes = body.text.into_bytes();
@@ -1935,25 +1890,58 @@ async fn http_input(
 /// HTTP `/input` path, the orchestrator's dispatch delivery, and the
 /// callback inject path so they all behave identically.
 ///
-/// claude code TUI groups bytes arriving in the same read() call (or
-/// within a short timing window for raw-mode terminals) as a single
-/// paste burst — when that burst ends in `\r` and contains embedded
-/// `\n`, the trailing `\r` is NOT treated as an Enter keystroke and
-/// the input never submits. The fix is to ensure the trailing `\r`
-/// arrives as a temporally-separate input event from the bulk of the
-/// text.
+/// Two independent timing hazards motivate two independent gates:
 ///
-/// The earlier implementation slept a fixed 30 ms — fine for short
-/// single-line Discord messages but **not enough for long multi-line
-/// orchestrator dispatches** (2-3 KB with embedded newlines): the
-/// trailing `\r` still landed inside claude's paste-burst window and
-/// the prompt sat unsubmitted in the input box. Replaced with an
-/// adaptive wait that polls the PTY output ring for a quiet period
-/// (claude's echo of the typed-in text settles → safe to send `\r`).
+/// 1. **Cold boot.** `await_ready` — claude's TUI may still be drawing
+///    startup banners and not yet have taken over stdin. Writing into
+///    that window leaves the prompt either eaten by banner output or
+///    stranded in pre-input limbo. Hits primarily on spawn-and-dispatch
+///    (caller created the session milliseconds ago) and on the first
+///    deliver after a resume. Already-ready sessions pay a single
+///    cheap atomic load.
+///
+/// 2. **Paste-burst grouping.** `wait_for_input_echo` — claude code's
+///    TUI groups bytes arriving in the same read() (or within a short
+///    timing window) into one paste. If that burst ends in `\r` while
+///    containing embedded `\n`, the trailing `\r` is treated as a soft
+///    newline rather than Enter, and input never submits. The fix is
+///    to ensure `\r` lands as a temporally-separate event after the
+///    text has finished echoing in the input box.
+///
+/// Earlier iterations used a fixed 30 ms sleep for #2 (broke on long
+/// multi-line dispatches) and had no #1 gate at all (broke on the
+/// spawn-and-dispatch path). Both are now adaptive: poll the PTY ring
+/// for a quiet stretch, with a fallback timeout so a stuck TUI can't
+/// strand callers indefinitely.
 async fn write_user_burst(session: &Arc<Session>, text_bytes: &[u8], append_enter: bool) {
+    // First gate: claude TUI must have finished booting (banners drawn,
+    // input box has taken over stdin). Cheap for already-ready sessions
+    // — watch::borrow returns immediately when boot_ready is true.
+    // Critical for the spawn-and-dispatch path where deliver fires
+    // milliseconds after the claude child was spawned and the TUI is
+    // still rendering startup banners; without this the prompt would
+    // race the input box and end up either eaten by banner output or
+    // sitting unsubmitted with the trailing \r consumed by claude's
+    // paste-burst grouping.
+    session.await_ready().await;
+
     let has_text = !text_bytes.is_empty();
     if has_text {
-        session.write_to_pty(text_bytes);
+        const CHUNK_SIZE: usize = 800;
+        const CHUNK_GAP: Duration = Duration::from_millis(150);
+        if text_bytes.len() <= CHUNK_SIZE {
+            session.write_to_pty(text_bytes);
+        } else {
+            let mut start = 0;
+            while start < text_bytes.len() {
+                let end = (start + CHUNK_SIZE).min(text_bytes.len());
+                session.write_to_pty(&text_bytes[start..end]);
+                start = end;
+                if start < text_bytes.len() {
+                    tokio::time::sleep(CHUNK_GAP).await;
+                }
+            }
+        }
     }
     if append_enter {
         if has_text {
@@ -2318,8 +2306,8 @@ async fn deliver_to_session(session: &Arc<Session>, text: &str) -> Result<()> {
             .await
             .context("resume task join")?
             .context("resume")?;
-        let why = wait_until_claude_ready(session).await;
-        info!("deliver post-resume readiness for {}: {why}", session.name);
+        // resume() arms a fresh boot probe; write_user_burst's
+        // await_ready picks that up before the first byte goes in.
     }
     write_user_burst(session, text.as_bytes(), true).await;
     Ok(())
